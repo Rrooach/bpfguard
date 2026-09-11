@@ -1,0 +1,23 @@
+[package]
+name = "bpf-state-observer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.67"
+license = "GPL-2.0-only"
+
+[[bin]]
+name = "bpf-state-observer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.66"
+clap = { version = "=3.2.23", features = ["derive"] }
+libc = "=0.2.137"
+serde = { version = "=1.0.147", features = ["derive"] }
+serde_json = "=1.0.87"
+sha2 = "=0.10.6"
+bpf-observer-schema = { path = "../schema" }
+bpf-observer-comparator = { path = "../comparator" }
+bpf-observer-oracle = { package = "bpf-observer-state-oracle", path = "../state-oracle" }
+bpf-observer-recorder = { path = "../recorder" }
+bpf-harness-auth = { path = "../harness-auth" }

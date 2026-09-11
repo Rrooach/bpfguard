@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://allox.local/schemas/bpf-state-observer/harness-evidence-v1.json",
+  "title": "BPF State Observer quiescence evidence",
+  "description": "Diagnostic input shape only in v0.1; observerd downgrades all unbound HARNESS_ENFORCED files to UNKNOWN.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "basis",
+    "contract_id",
+    "checks",
+    "exclusive_actor_attribution"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "QUIESCENT_WITHIN_MODEL",
+        "NOT_QUIESCENT",
+        "UNKNOWN"
+      ]
+    },
+    "basis": {
+      "enum": [
+        "HARNESS_ENFORCED",
+        "OBSERVED_ONLY",
+        "ASSUMED"
+      ]
+    },
+    "contract_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "passed",
+          "evidence"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "exclusive_actor_attribution": {
+      "type": "boolean"
+    },
+    "authentication": {
+      "description": "Signed run-bound transcript from the live Host harness channel. A static caller-provided file remains diagnostic even when this field is present.",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "basis": {
+            "const": "HARNESS_ENFORCED"
+          }
+        },
+        "required": [
+          "basis"
+        ]
+      },
+      "then": {
+        "properties": {
+          "contract_id": {
+            "const": "exclusive-vm-v1"
+          },
+          "checks": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

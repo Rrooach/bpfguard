@@ -1,0 +1,45 @@
+{
+  "event_interfaces": [
+    "BPF_USER_SYSCALL"
+  ],
+  "allowed_bpf_commands": [
+    0,
+    2,
+    3,
+    5,
+    6,
+    7,
+    8,
+    9,
+    21,
+    22,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    34
+  ],
+  "object_types": [
+    "PROGRAM",
+    "MAP",
+    "LINK"
+  ],
+  "map_content_types": [
+    "ARRAY",
+    "HASH",
+    "PERCPU_ARRAY",
+    "PERCPU_HASH"
+  ],
+  "map_ids": [
+    1234
+  ],
+  "bpffs_roots": [],
+  "attachment_targets": [],
+  "budget": {
+    "max_map_entries": 4096,
+    "max_map_bytes": 16777216,
+    "per_map_deadline_ms": 5000
+  }
+}

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/schema",
+    "crates/state-oracle",
+    "crates/recorder",
+    "crates/comparator",
+    "crates/observerd",
+    "crates/harness-auth",
+]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

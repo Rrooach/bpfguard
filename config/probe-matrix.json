@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "status": "DOCUMENTED_NOT_RUNTIME_BOUND",
+  "target": {
+    "source_commit": "50d05c7c76c96b90462f24debacca971d2e86713",
+    "source_describe": "v7.3-rc2-99-g50d05c7c76c9",
+    "event_interface": "BPF_USER_SYSCALL"
+  },
+  "implemented_probes": [
+    {
+      "name": "raw_syscalls_sys_enter",
+      "tracepoint": "raw_syscalls/sys_enter",
+      "stage": "SYSCALL_ATTEMPTED",
+      "fields": [
+        "schema_version",
+        "kind",
+        "flags",
+        "command",
+        "attr_size",
+        "run_epoch",
+        "event_seq",
+        "ktime_ns",
+        "cgroup_id",
+        "pid_tgid"
+      ],
+      "argument_provenance": "RAW_SYSCALL_REGISTERS"
+    },
+    {
+      "name": "raw_syscalls_sys_exit",
+      "tracepoint": "raw_syscalls/sys_exit",
+      "stage": "COMMAND_COMPLETED",
+      "fields": [
+        "schema_version",
+        "kind",
+        "flags",
+        "command",
+        "attr_size",
+        "run_epoch",
+        "event_seq",
+        "related_attempt_seq",
+        "ktime_ns",
+        "cgroup_id",
+        "pid_tgid",
+        "return_value"
+      ],
+      "argument_provenance": "PENDING_RAW_SYSCALL_CORRELATION"
+    }
+  ],
+  "runtime_self_test": {
+    "native_abi": "REQUIRED",
+    "compat_abis": "NOT_IMPLEMENTED"
+  },
+  "not_implemented_probes": [
+    "security_bpf",
+    "map_create",
+    "map_update_elem",
+    "map_delete_elem",
+    "bpf_map_do_batch",
+    "map_freeze",
+    "bpf_prog_load",
+    "bpf_obj_pin",
+    "bpf_obj_get",
+    "bpf_prog_attach",
+    "bpf_prog_detach",
+    "link_create",
+    "link_update",
+    "link_detach"
+  ],
+  "excluded_interfaces": [
+    "BPFFS_VFS_MUTATION",
+    "FD_LIFECYCLE",
+    "SCM_RIGHTS",
+    "PIDFD_GETFD",
+    "NETLINK",
+    "IOCTL",
+    "PERF_EVENT",
+    "KERNEL_INTERNAL_BPF"
+  ]
+}

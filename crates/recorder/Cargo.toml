@@ -1,0 +1,15 @@
+[package]
+name = "bpf-observer-recorder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.67"
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "=1.0.66"
+bpf-observer-schema = { path = "../schema" }
+crc32fast = "=1.3.2"
+libbpf-sys = "=1.0.4"
+libc = "=0.2.137"
+serde_json = "=1.0.87"
+sha2 = "=0.10.6"

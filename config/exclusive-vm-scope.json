@@ -1,0 +1,30 @@
+{
+  "event_interfaces": [
+    "BPF_USER_SYSCALL"
+  ],
+  "allowed_bpf_commands": [
+    0,
+    2
+  ],
+  "object_types": [
+    "PROGRAM",
+    "MAP",
+    "LINK"
+  ],
+  "map_content_types": [
+    "ARRAY",
+    "HASH",
+    "PERCPU_ARRAY",
+    "PERCPU_HASH"
+  ],
+  "map_ids": [],
+  "bpffs_roots": [
+    "/sys/fs/bpf/bpf-state-observer-exclusive-e2e"
+  ],
+  "attachment_targets": [],
+  "budget": {
+    "max_map_entries": 4096,
+    "max_map_bytes": 16777216,
+    "per_map_deadline_ms": 5000
+  }
+}

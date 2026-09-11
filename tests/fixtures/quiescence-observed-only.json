@@ -1,0 +1,18 @@
+{
+  "status": "UNKNOWN",
+  "basis": "OBSERVED_ONLY",
+  "contract_id": null,
+  "checks": [
+    {
+      "name": "cgroup_empty",
+      "passed": true,
+      "evidence": "fixture observation only; no trusted harness enforcement"
+    },
+    {
+      "name": "in_flight_bpf_barrier_complete",
+      "passed": false,
+      "evidence": "fixture has no enforcement evidence"
+    }
+  ],
+  "exclusive_actor_attribution": false
+}

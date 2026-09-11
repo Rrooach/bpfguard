@@ -1,0 +1,99 @@
+{
+  "contract_id": "exclusive-vm-v1",
+  "schema_version": 1,
+  "implementation_status": "AUTHENTICATED_FOUR_PHASE_FINAL_ACK_PRODUCER_IMPLEMENTED",
+  "authenticated_protocol": {
+    "protocol_version": 1,
+    "signature": "ED25519_DOMAIN_SEPARATED_LENGTH_PREFIXED_DETERMINISTIC_STRUCT_V1",
+    "transport": "HOST_UNIX_SOCKET_TO_GUEST_VIRTIO_SERIAL",
+    "private_key_location": "HOST_ONLY",
+    "exclusive_lease": "PRE_S0_THROUGH_FINAL",
+    "ordered_phases": [
+      "PRE_S0",
+      "S0_COMMITTED",
+      "PRE_S1",
+      "FINAL"
+    ],
+    "replay_policy": "FRESH_32_BYTE_NONCE_ORDERED_ONE_SHOT_WORKLOADS_AND_NO_OVERLAPPING_SESSION",
+    "delivery_ack": "GUEST_VERIFIED_FINAL_ACK_BOUND_TO_CANONICAL_FINAL_RESPONSE_SHA256",
+    "signed_run_binding_fields": [
+      "nonce_hex",
+      "run_id",
+      "run_epoch",
+      "cgroup_id",
+      "cgroup_path",
+      "boot_id",
+      "kernel_identity",
+      "observer_sha256",
+      "recorder_sha256",
+      "scope_sha256",
+      "observer_exclusions_sha256",
+      "workload_argv",
+      "workload_executable_sha256",
+      "s0_snapshot_id",
+      "s1_snapshot_id"
+    ],
+    "signed_response_identity_fields": [
+      "policy_id",
+      "policy_sha256",
+      "key_fingerprint_sha256"
+    ],
+    "exact_workload_authorization_fields": [
+      "run_id",
+      "run_epoch",
+      "cgroup_path",
+      "argv",
+      "executable_sha256"
+    ],
+    "observer_exclusions_derivation": "MEASURED_OBSERVER_RECORDER_OWNED_V1",
+    "signed_final_fields": [
+      "s0_sha256",
+      "s1_sha256",
+      "health_sha256",
+      "canary_health_sha256",
+      "raw_events_wal_sha256",
+      "raw_events_jsonl_sha256",
+      "workload_stdout_sha256",
+      "workload_stderr_sha256",
+      "workload_exit_code",
+      "workload_signal",
+      "outside_cgroup_syscall_attempted",
+      "recorder_drain_complete",
+      "producer_barrier_complete",
+      "wal_durable",
+      "in_flight_bpf_barrier_complete"
+    ]
+  },
+  "required_checks": [
+    "exclusive_vm",
+    "no_other_bpf_actors",
+    "no_external_bpf_fds",
+    "scm_rights_blocked",
+    "pidfd_getfd_blocked",
+    "writable_map_mmap_blocked",
+    "cgroup_empty",
+    "attachment_dependency_closure_complete",
+    "special_map_values_excluded",
+    "prog_test_run_blocked",
+    "new_bpf_loaders_blocked",
+    "in_flight_bpf_barrier_complete"
+  ],
+  "safe_default": {
+    "status": "UNKNOWN",
+    "basis": "OBSERVED_ONLY",
+    "exclusive_actor_attribution": false
+  },
+  "static_input_policy": {
+    "harness_evidence_is_diagnostic_only": true,
+    "caller_supplied_harness_enforced_is_downgraded": true
+  },
+  "unchanged_requires": {
+    "status": "QUIESCENT_WITHIN_MODEL",
+    "basis": "HARNESS_ENFORCED",
+    "authenticated_four_phase_transcript": true,
+    "external_public_key_policy_id_policy_digest_and_kernel_identity": true,
+    "successful_normal_workload_exit": true,
+    "all_required_checks_passed": true,
+    "semantic_limit": "NO_ENDPOINT_DELTA_WITHIN_SCOPE_NOT_NO_TRANSIENT_OPERATION"
+  }
+}
