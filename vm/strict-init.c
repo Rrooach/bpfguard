@@ -1008,16 +1008,25 @@ static unsigned int userspace_process_count(void)
 	proc = opendir("/proc");
 	if (!proc)
 		fatal("open /proc for process census: %s", strerror(errno));
-	while ((entry = readdir(proc)) != NULL) {
+	for (;;) {
 		char path[128];
 		char stat_line[4096];
 		char *after_comm;
 		char state;
 		unsigned long flags;
-		const char *cursor = entry->d_name;
+		const char *cursor;
 		int descriptor;
 		ssize_t length;
 
+		errno = 0;
+		entry = readdir(proc);
+		if (!entry) {
+			if (errno)
+				fatal("enumerate /proc for process census: %s",
+				      strerror(errno));
+			break;
+		}
+		cursor = entry->d_name;
 		if (!*cursor)
 			continue;
 		while (*cursor && isdigit((unsigned char)*cursor))
@@ -1048,7 +1057,8 @@ static unsigned int userspace_process_count(void)
 		if (!(flags & PF_KTHREAD))
 			count++;
 	}
-	closedir(proc);
+	if (closedir(proc) < 0)
+		fatal("close /proc process census: %s", strerror(errno));
 	return count;
 }
 
@@ -1700,19 +1710,27 @@ int main(int argc, char **argv)
 			strerror(errno));
 		success = false;
 	}
-	if (!append_report(status_descriptor, "result=%s\n",
-			   success ? "PASS" : "FAIL")) {
+	/* PASS is the final completion marker. An I/O error while persisting it can
+	 * leave media ambiguous, so the Host must additionally require the console
+	 * PASS marker emitted only after this fsync and close both succeed. */
+	if (success) {
+		if (!append_report(status_descriptor, "result=PASS\n") ||
+		    fsync(status_descriptor) < 0) {
+			dprintf(STDERR_FILENO,
+				"strict-init: persist PASS completion marker failed: %s\n",
+				strerror(errno));
+			success = false;
+		}
+	} else if (!append_report(status_descriptor, "result=FAIL\n") ||
+		   fsync(status_descriptor) < 0) {
 		dprintf(STDERR_FILENO,
-			"strict-init: append completion marker failed\n");
-		success = false;
+			"strict-init: could not persist FAIL completion marker\n");
 	}
-	if (fsync(status_descriptor) < 0) {
-		dprintf(STDERR_FILENO,
-			"strict-init: sync completion marker failed: %s\n",
+	if (close(status_descriptor) < 0) {
+		dprintf(STDERR_FILENO, "strict-init: close final report failed: %s\n",
 			strerror(errno));
 		success = false;
 	}
-	close(status_descriptor);
 	dprintf(STDOUT_FILENO, "strict-init: strict suite %s\n",
 		success ? "PASS" : "FAIL");
 	power_off_forever();

@@ -374,3 +374,4 @@ Details:
 - [Authenticated strict VM E2E validation](docs/vm-strict-e2e-validation-2026-09-11.md)
 - [Authenticated harness evidence](docs/harness-evidence.md)
 - [VM requirements](vm/README.md)
+- [Codex + DeepSeek diagnostic collection VM](experiments/codex-deepseek/README.md)

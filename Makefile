@@ -39,6 +39,11 @@ STRICT_INIT_BINARY := $(OUTPUT)/vm/strict-init
 STRICT_GUEST_RUNNER := vm/guest-strict-e2e.sh
 STRICT_INIT_CFLAGS ?= -Os -std=c11 -Wall -Wextra -Werror -static
 
+AGENT_LAUNCHER_SOURCE := experiments/codex-deepseek/vm/codex-task-launcher.c
+AGENT_LAUNCHER_BINARY := $(OUTPUT)/agent-collection/codex-task-launcher
+AGENT_LAUNCHER_CFLAGS ?= -Os -std=c11 -Wall -Wextra -Werror -static
+AGENT_VALIDATOR_BINARY := $(CARGO_TARGET_DIR)/release/agent-collection-assert
+
 VM_KERNEL_OUTPUT ?= $(OUTPUT)/vm-kernel
 VM_KERNEL_JOBS ?= $(shell nproc)
 VM_SSH_PORT ?= 10022
@@ -46,7 +51,8 @@ VM_SSH_PORT ?= 10022
 .DEFAULT_GOAL := all
 
 .PHONY: all release check check-all test fmt-check clippy bpf workloads \
-	vm-strict vm-strict-check vm-kernel vm-e2e clean help dirs
+	vm-strict vm-strict-check agent-collection-launcher \
+	agent-collection-check vm-kernel vm-e2e clean help dirs
 
 all: dirs
 	$(CARGO_ENV) $(CARGO) build --workspace --locked
@@ -56,7 +62,7 @@ release: dirs
 
 check: fmt-check test
 
-check-all: check clippy bpf workloads vm-strict-check
+check-all: check clippy bpf workloads vm-strict-check agent-collection-check
 
 test: dirs
 	$(CARGO_ENV) $(CARGO) test --workspace --locked
@@ -76,6 +82,16 @@ vm-strict: $(STRICT_INIT_BINARY)
 vm-strict-check: $(STRICT_INIT_BINARY)
 	$(STRICT_INIT_BINARY) --self-test
 	bash -n $(STRICT_GUEST_RUNNER)
+
+agent-collection-launcher: $(AGENT_LAUNCHER_BINARY)
+
+agent-collection-check: $(AGENT_LAUNCHER_BINARY)
+	$(CARGO_ENV) $(CARGO) build --release --locked --bin agent-collection-assert
+	$(AGENT_LAUNCHER_BINARY) --self-test
+	$(AGENT_VALIDATOR_BINARY) --self-test
+	bash -n experiments/codex-deepseek/vm/fetch-model-catalog.sh
+	bash -n experiments/codex-deepseek/vm/guest-run-suite.sh
+	bash -n experiments/codex-deepseek/vm/run-collection.sh
 
 vm-kernel:
 	VM_KERNEL_JOBS="$(VM_KERNEL_JOBS)" vm/build-e2e-kernel.sh \
@@ -112,6 +128,10 @@ $(OUTPUT)/workloads/%: workloads/%.c $(WORKLOAD_COMMON_HEADERS) | dirs
 $(STRICT_INIT_BINARY): $(STRICT_INIT_SOURCE) | dirs
 	TMPDIR=$(BUILD_TMPDIR) $(CC) $(STRICT_INIT_CFLAGS) $< -o $@
 
+$(AGENT_LAUNCHER_BINARY): $(AGENT_LAUNCHER_SOURCE) $(WORKLOAD_COMMON_HEADERS) | dirs
+	mkdir -p $(dir $@)
+	TMPDIR=$(BUILD_TMPDIR) $(CC) $(AGENT_LAUNCHER_CFLAGS) $< -o $@
+
 clean:
 	@test "$(abspath $(OUTPUT))" = "$(CURDIR_ABS)/.output" || { \
 		echo 'refusing clean: OUTPUT must be the project-local .output directory' >&2; \
@@ -129,6 +149,7 @@ help:
 	@echo '  bpf        build the self-contained raw-syscall recorder object'
 	@echo '  workloads  build dependency-free fixture workloads'
 	@echo '  vm-strict  build the static exclusive-boot PID1 supervisor'
+	@echo '  agent-collection-check  build/check the Codex collection VM helpers'
 	@echo '  vm-kernel  build the disposable x86 smoke-test kernel'
 	@echo '  vm-e2e     run the two-boot authenticated exclusive-VM KVM gate'
 	@echo '  clean      remove only this project build output'

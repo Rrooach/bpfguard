@@ -1,0 +1,6 @@
+This is a measurement task. Run exactly this one command once using the shell
+tool, and do not run any other command or tool:
+
+/opt/bpf-state-observer/map-lifecycle --ephemeral --exclusive-contract
+
+If and only if it exits successfully, reply with exactly EPHEMERAL_MAP_OK.

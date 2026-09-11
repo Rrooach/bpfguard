@@ -1,0 +1,20 @@
+{
+  "event_interfaces": [
+    "BPF_USER_SYSCALL"
+  ],
+  "allowed_bpf_commands": [],
+  "object_types": [
+    "PROGRAM",
+    "MAP",
+    "LINK"
+  ],
+  "map_content_types": [],
+  "map_ids": [],
+  "bpffs_roots": [],
+  "attachment_targets": [],
+  "budget": {
+    "max_map_entries": 65536,
+    "max_map_bytes": 67108864,
+    "per_map_deadline_ms": 5000
+  }
+}

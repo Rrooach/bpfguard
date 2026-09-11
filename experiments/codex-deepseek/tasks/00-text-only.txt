@@ -1,0 +1,4 @@
+This is a measurement task. Do not call any tool or run any command. Reply with
+exactly this token and nothing else:
+
+TEXT_ONLY_OK

@@ -1,0 +1,8 @@
+This is a measurement task. In the current workspace, create a regular file
+named artifact.txt whose exact contents are this one line, including its final
+newline:
+
+codex-collection-ok
+
+Use a local tool to create the file, verify its contents, and do not create or
+modify any other workspace file. Then reply with exactly FILE_WRITE_OK.
