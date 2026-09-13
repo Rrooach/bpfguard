@@ -13,13 +13,48 @@ mismatch, or unbound evidence always forbids `UNCHANGED_WITHIN_SCOPE`. With no
 confirmed delta the result is `INCONCLUSIVE`; a reliable delta may still yield
 `CHANGED_WITHIN_SCOPE` while separate completeness axes remain incomplete.
 
+The binary also exposes a deliberately separate `observe-effects` mode. It
+records selected filesystem, network, namespace, kernel-control, security, and
+I/O syscall attempts/results from one exact cgroup. Those records are useful
+operation history, but are **not** a whole-kernel state diff and never support
+an `UNCHANGED_WITHIN_SCOPE` claim by themselves. Optional, independently scoped
+BPF-object and filesystem path-tree S0/S1 confirmers publish separate
+per-domain results; they do not create an aggregate whole-system verdict. See
+the [system-effect recorder guide](docs/system-effects-observer.md).
+The framework-independent implementation boundary and follow-up work are kept
+in the
+[system-effects roadmap](docs/system-effects-roadmap.md).
+
 ## What is implemented
 
 - A raw-syscall eBPF recorder for native `bpf(2)` entry and exit, filtered by
   exact cgroup ID and run epoch.
+- An independent, policy-driven `observe-effects` recorder with `control`,
+  `balanced`, and `full` profiles. Its global fast path rejects unselected
+  syscalls after one policy-Map lookup; only selected operations from a
+  registered cgroup allocate pending state or publish ring-buffer events.
+- Two narrow kernel object-resolution opt-ins: selected successful native file
+  opens with exactly one `file_open` join, and those opens plus the VFS
+  `struct file` for positive-byte native write-family results observed by
+  `file_permission` (including pipefs/socketfs pseudo-files, but not socket
+  endpoints or persistent-state proof). Missing required joins, `O_PATH`, and
+  duplicate stacked-filesystem open hooks fail evidence closed. These are
+  explicitly
+  `kernel-file-open-partial` and
+  `kernel-file-open-write-partial`; there is no general kernel-object or socket
+  resolution mode.
+- Optional, independently verified S0/S1 endpoint confirmation for BPF objects
+  and for bounded generic filesystem path trees. Filesystem capture covers the
+  explicit roots and selected metadata/content/symlink/xattr fields only. The
+  observe outcome and verifier report expose a per-domain `state_domains`
+  vector rather than promoting either result to a whole-system verdict.
+- A bounded delegation-ledger protocol and structural validator. No delegation
+  broker, request signer/authenticator, helper-cgroup runtime, manifest
+  integration, or broker-to-syscall causal chain is implemented.
 - A non-LRU pending-call table, monotonic event sequences, explicit drop and
   pairing counters, a framed checksummed WAL, and a JSONL derived stream.
-  The callback queue is capped at 4096 records and a run at 262144 records;
+  Both callback queues are capped at 4096 records. The BPF-state recorder caps
+  a run at 262144 records; the system-effect recorder caps it at 1000000.
   WAL, JSONL, snapshots, manifests, and workload output also have byte caps.
 - A pre-run, no-side-effect native `bpf()` canary that must traverse the loaded
   probes, cgroup filter, ring buffer, decoder, and durable WAL end to end.
@@ -49,9 +84,9 @@ confirmed delta the result is `INCONCLUSIVE`; a reliable delta may still yield
   `verify-run` checks the manifest, both raw event streams, event
   pairing/accounting, snapshot identity, and recomputes the verdict.
 
-Five Rust library crates separate schema, state capture, event recording,
-comparison, and authenticated harness protocol. A sixth workspace crate,
-`crates/observerd`, coordinates a run.
+Seven Rust library crates separate schema, BPF and filesystem state capture,
+BPF and general-effect event recording, comparison, and authenticated harness
+protocol. An eighth workspace crate, `crates/observerd`, coordinates a run.
 
 ## Deliberately not implemented yet
 
@@ -70,6 +105,21 @@ comparison, and authenticated harness protocol. A sixth workspace crate,
   orchestrator's responsibility.
 - Target-specific attachment queries, compat-ABI canaries, FD-lifetime/VFS
   event capture, writable-Map-mmap tracking, and kernel-internal writers.
+- Kernel object resolution beyond selected opens and selected positive-byte
+  write-family VFS file identities. Rename, unlink, setattr, mmap/io_uring,
+  socket endpoints, and delegated-daemon targets are not kernel-resolved by
+  the current producer.
+- Authentication or enforcement of a filesystem actor/quiescence contract in
+  `observe-effects`. A supplied contract is external input that the observer
+  validates and exact-matches during verification; the observer does not check
+  its signature or prove that its `exclusive_writer_enforced` and quiescence
+  assertions happened.
+- A delegation broker or runtime causal chain. The library validator cannot
+  create, sign, authenticate, collect, or attach a delegation ledger to an
+  `observe-effects` run.
+- Standalone workload credential isolation or evidence-directory write
+  isolation. Mode `0700` on a newly created directory is not protection from a
+  workload that inherits the observer caller's identity or capabilities.
 - Automatic recovery after an uncatchable daemon death. The direct workload
   child gets `PR_SET_PDEATHSIG(SIGKILL)`, but descendants still require VM or
   service-manager cleanup.
@@ -85,23 +135,31 @@ Generated output stays below `.output/`.
 make
 make release
 make bpf
+make system-effects-bpf
 make workloads
 make check
 make check-all
 make clippy
 make vm-kernel
+make overhead-check
 ```
 
 The authenticated strict QEMU gate is a separate opt-in target because it
 requires a maintained raw rootfs and root SSH key for its provisioning boot.
 See the [VM E2E instructions](vm/README.md) and the
 [strict validation record](docs/vm-strict-e2e-validation-2026-09-11.md).
+The paired overhead microbenchmark is also opt-in because it boots KVM and
+retains hundreds of MiB of raw evidence. See the
+[overhead benchmark instructions](experiments/overhead/README.md) and the
+[latest validation record](experiments/overhead/VALIDATION.md).
 
 The workspace declares Rust 1.67 and pins `Cargo.lock`. A current stable Rust
 toolchain is recommended. The recorder build defaults to `clang-14` and the
 x86 BPF target; override `CLANG` and `BPF_ARCH` for the target architecture.
-The recorder uses the fixed `raw_syscalls` tracepoint ABI and does not require
-CO-RE or `vmlinux.h`.
+The native `bpf(2)` state recorder uses the fixed `raw_syscalls` tracepoint
+ABI and does not require CO-RE or `vmlinux.h`. The system-effect recorder's
+two partial kernel file-object modes are different: they use CO-RE BPF LSM
+hooks and require readable kernel BTF plus an active `bpf` LSM.
 
 ## Runtime prerequisites
 
@@ -114,7 +172,8 @@ requires effective `CAP_SYS_ADMIN`: global `BPF_*_GET_NEXT_ID` and
 - raw-syscall tracepoints;
 - a recorder object built for the target architecture;
 - bpffs only when `bpffs_roots` is non-empty;
-- an output directory the workload cannot modify.
+- an output parent that an external launcher makes inaccessible to the
+  workload after the observer has opened it.
 
 Authenticated mode additionally requires a dedicated Host harness process,
 the raw 32-byte trusted public key in the Guest, and a bidirectional Guest
@@ -123,9 +182,13 @@ policy digest, and kernel/rootfs identity must come from the trusted launcher,
 not from the workload or run directory.
 
 The coordinator does not create a user/mount namespace or drop its own UID and
-capabilities before `exec`. The final prerequisite must therefore be enforced
-by the VM launcher or service manager; merely choosing a pathname is not an
-access-control boundary.
+capabilities before `exec`, and it records
+`workload_privilege_isolation_enforced=false` and
+`evidence_write_isolation_enforced=false`. These prerequisites must therefore
+be enforced by the VM launcher or service manager; merely choosing a pathname
+or relying on the observer-created mode-`0700` directory is not an
+access-control boundary. Without that external isolation, the supported threat
+model is a cooperative workload only.
 
 Run the read-only preflight first. It performs real global program/Map/Link
 enumeration smoke calls rather than checking capability bits alone. Its
@@ -138,6 +201,172 @@ load, attach, or cgroup-interface check fails:
 BIN=.output/cargo-target/release/bpf-state-observer
 sudo "$BIN" doctor --recorder-object .output/recorder.bpf.o
 ```
+
+## Observe selected system-effect operations
+
+Build the general recorder, establish the recorder digest through a trusted
+build/distribution path, and run one workload in a new output directory:
+
+```sh
+make release system-effects-bpf workloads
+EFFECT_OBJECT=$(realpath .output/system_effects.bpf.o)
+# Local smoke-test convenience only; production must provision this digest
+# independently of the object being checked.
+TRUSTED_EFFECT_SHA256=$(sha256sum "$EFFECT_OBJECT" | awk '{print $1}')
+
+sudo "$BIN" observe-effects \
+  --recorder-object "$EFFECT_OBJECT" \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --output-dir /var/lib/bpf-observer/effects/example-1 \
+  --run-id example-effects-1 \
+  --profile balanced \
+  -- \
+  .output/workloads/system-effects-smoke /tmp/system-effects-smoke-1
+
+sudo "$BIN" verify-effects \
+  --run-dir /var/lib/bpf-observer/effects/example-1 \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --expected-profile balanced \
+  --expected-object-resolution user-input
+```
+
+For event-time VFS identity on selected opens and positive-byte native
+`write`/`pwrite64`/`writev`/`pwritev`/`pwritev2` results that reach
+`file_permission`, select the
+explicit mode on both collection and verification (and use `balanced` or
+`full`, since `control` omits the write data path):
+
+```sh
+sudo "$BIN" doctor \
+  --recorder-object "$EFFECT_OBJECT" \
+  --object-resolution kernel-file-open-write-partial
+
+sudo "$BIN" observe-effects \
+  --recorder-object "$EFFECT_OBJECT" \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --output-dir /var/lib/bpf-observer/effects/write-objects-1 \
+  --run-id write-objects-1 \
+  --profile balanced \
+  --object-resolution kernel-file-open-write-partial \
+  -- /bin/sh -c "printf data > /tmp/observer-write-object"
+
+sudo "$BIN" verify-effects \
+  --run-dir /var/lib/bpf-observer/effects/write-objects-1 \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --expected-profile balanced \
+  --expected-object-resolution kernel-file-open-write-partial
+```
+
+This mode requires readable kernel BTF and active BPF LSM. It never falls back
+to pathname or FD-number guesses. A file-hook join that is ambiguous or fails
+object reads makes the evidence incomplete. A missing required object join also
+makes it incomplete; this includes `O_PATH`, whose flags are not yet captured
+in the replay ABI, and open paths that invoke multiple stacked-filesystem
+`file_open` hooks. Pipefs and socketfs objects reached through `write(2)` are
+valid VFS `FILE_OBJECT` identities, but they are not `SOCKET_OBJECT` endpoint
+evidence and do not prove persistent file state.
+
+Add `--bpf-state-scope config/default-scope.json` to `observe-effects` when a
+separate BPF-object S0/S1 confirmation is required, and pass the same trusted
+file back to `verify-effects` as
+`--expected-bpf-state-scope config/default-scope.json`. This writes
+`bpf-state-s0.json`, `bpf-state-s1.json`, and `bpf-state-verdict.json`, all
+hash-bound by the effects manifest and recomputed by `verify-effects`. It can
+confirm a final BPF delta, but standalone mode deliberately reports an empty
+diff as `INCONCLUSIVE` because it lacks the authenticated exclusive-VM
+contract. The syscall JSONL remains operation history, not a state diff.
+
+The Linux-first standalone path can also capture a bounded filesystem path
+tree at S0 and S1. The
+[`filesystem-scope.example.json`](config/filesystem-scope.example.json) scope
+stores exact path bytes, so validate it and derive the run-bound snapshot IDs
+before launch. This example enables the filesystem and BPF confirmers together;
+their S1 captures are sequential, not one atomic whole-system snapshot:
+
+```sh
+FS_SCOPE=$(realpath config/filesystem-scope.example.json)
+BPF_SCOPE=$(realpath config/default-scope.json)
+FS_ROOT=/tmp/bpf-observer-workspace
+RUN_ID=effects-filesystem-1
+RUN_EPOCH=1
+RUN_DIR=/var/lib/bpf-observer/effects/$RUN_ID
+
+sudo install -d -m 0700 "$FS_ROOT"
+
+"$BIN" filesystem-scope-info \
+  --scope "$FS_SCOPE" \
+  --run-id "$RUN_ID" \
+  --run-epoch "$RUN_EPOCH"
+
+sudo "$BIN" observe-effects \
+  --recorder-object "$EFFECT_OBJECT" \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --output-dir "$RUN_DIR" \
+  --run-id "$RUN_ID" \
+  --run-epoch "$RUN_EPOCH" \
+  --profile balanced \
+  --object-resolution user-input \
+  --bpf-state-scope "$BPF_SCOPE" \
+  --filesystem-state-scope "$FS_SCOPE" \
+  -- /bin/sh -c "printf '%s\\n' observed > '$FS_ROOT/result.txt'"
+
+sudo "$BIN" verify-effects \
+  --run-dir "$RUN_DIR" \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --expected-profile balanced \
+  --expected-object-resolution user-input \
+  --expected-bpf-state-scope "$BPF_SCOPE" \
+  --expected-filesystem-state-scope "$FS_SCOPE"
+```
+
+Complete, same-environment snapshots with a typed difference report
+`endpoint_difference=OBSERVED_DIFFERENT` and
+`state_verdict=CHANGED_WITHIN_SCOPE`; this confirms only bounded endpoint-state
+difference, while causal attribution remains `NOT_ESTABLISHED`. Identical
+snapshots report `OBSERVED_IDENTICAL` but the filesystem `state_verdict` remains
+`INCONCLUSIVE`: cgroup empty/frozen does not establish that no external actor
+wrote the scoped tree or that both non-atomic walks were quiescent.
+
+`filesystem-scope-info` only validates the scope and prints its SHA-256 and
+the exact S0/S1 IDs used by the static v1 actor/quiescence assertion. It does
+not generate, authenticate, or enforce that assertion. A caller may pass one as
+`--filesystem-actor-contract`; verification must then receive the identical
+external file as `--expected-filesystem-actor-contract`. Even when all three
+booleans are true, its status is `ASSERTED_NOT_AUTHENTICATED`, the report marks
+the input `EXTERNAL_EXACT_INPUT_NOT_AUTHENTICATED_BY_OBSERVER`, and it cannot
+authorize `UNCHANGED_WITHIN_SCOPE`. Its `evidence_sha256` is syntax-checked but
+not authenticated or matched to enforcement evidence. A future signed
+supervisor contract must add freshness and bind boot, cgroup, and real barrier
+evidence before strong negative filesystem verdicts become reachable.
+
+Both commands return `state_domains`: `filesystem` and `bpf` reflect only
+their enabled confirmer, local network configuration, sysctl, mounts, modules,
+and keyrings remain `NOT_CONFIRMED`, and remote network effect is
+`NOT_CONFIRMABLE`. Consumers must keep this vector intact; there is no rule
+that folds it into “system changed,” “system unchanged,” or rollback `CLEAN`.
+
+Use `control` (the CLI default) for the lowest-volume control/metadata signal,
+select `balanced` explicitly when file writes and network sends matter, and
+select `full` only when the additional noisy `mmap`/`mprotect`, sync, `ioctl`,
+`prctl`, and `setsockopt` interfaces are required. The exact policy used is
+written to `system-effects.policy.json`; never infer coverage from a profile
+name alone.
+`verify-effects` requires the externally trusted object digest, expected
+profile, expected object-resolution mode, and every externally selected
+confirmer scope. It verifies the closed six-file operation set plus exactly the
+declared extensions: three BPF files, three filesystem files, and, when
+present, one copied filesystem actor-contract file. It checks hashes, WAL
+framing and CRC, decoded JSONL, sequence/pairing, frozen policy, health
+counters, snapshots, comparisons, and coverage claims; its successful report
+still says `coverage_complete=false`,
+`causal_attribution_complete=false`, and
+`operation_events_are_state_diff=false`.
+See the [full guide](docs/system-effects-observer.md) for artifact semantics,
+coverage gaps, inspection commands, and the paired overhead benchmark. The
+[current privileged-VM functional validation](docs/system-effects-validation-2026-09-13.md)
+records the exact-build object, filesystem, and fail-closed gates. The
+[2026-09-12 validation](docs/system-effects-validation-2026-09-12.md) retains
+the paired overhead measurements.
 
 ## Observe one workload
 
@@ -375,3 +604,7 @@ Details:
 - [Authenticated harness evidence](docs/harness-evidence.md)
 - [VM requirements](vm/README.md)
 - [Codex + DeepSeek diagnostic collection VM](experiments/codex-deepseek/README.md)
+- [Observer overhead benchmark](experiments/overhead/README.md)
+- [Observer overhead validation](experiments/overhead/VALIDATION.md)
+- [System-effect recorder guide](docs/system-effects-observer.md)
+- [System-effect recorder overhead benchmark](experiments/system-effects-overhead/README.md)

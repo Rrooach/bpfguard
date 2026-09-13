@@ -3,9 +3,14 @@
 mod atomic_file;
 mod cgroup;
 mod doctor;
+mod effects_run;
+mod effects_supervisor;
+mod effects_supervisor_protocol;
+mod effects_verify;
 mod environment;
 mod harness;
 mod input;
+mod object_resolution;
 mod run;
 mod verification;
 
@@ -16,7 +21,9 @@ use bpf_observer_schema::{
     ClaimScope, EvidenceHealth, QuiescenceReport, Snapshot, StateVerdict, MAX_HEALTH_JSON_BYTES,
     MAX_MANIFEST_JSON_BYTES, MAX_SNAPSHOT_JSON_BYTES,
 };
+use bpf_observer_system_effects::PolicyProfile;
 use clap::{ArgEnum, Parser, Subcommand};
+use object_resolution::ObjectResolutionMode;
 use serde::Serialize;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -56,6 +63,11 @@ enum Commands {
         /// Write the report atomically instead of printing it to stdout.
         #[clap(long, parse(from_os_str))]
         output: Option<PathBuf>,
+
+        /// Required strength of object evidence. Both partial kernel modes
+        /// fail closed unless their exact hook/WAL/verifier pipeline is available.
+        #[clap(long, arg_enum, default_value = "user-input")]
+        object_resolution: ObjectResolutionMode,
     },
 
     /// Capture one explicitly scoped state snapshot.
@@ -173,6 +185,138 @@ enum Commands {
         workload: Vec<OsString>,
     },
 
+    /// Record selected Agent system-effect operations from one exact cgroup.
+    /// This is operation evidence, not a whole-kernel state diff.
+    ObserveEffects {
+        #[clap(long, parse(from_os_str))]
+        recorder_object: PathBuf,
+
+        #[clap(long)]
+        expected_recorder_sha256: String,
+
+        /// New output directory; it must not already exist.
+        #[clap(long, parse(from_os_str))]
+        output_dir: PathBuf,
+
+        #[clap(
+            long,
+            parse(from_os_str),
+            default_value = "/sys/fs/cgroup/bpf-state-observer-effects"
+        )]
+        cgroup_root: PathBuf,
+
+        #[clap(long)]
+        run_id: Option<String>,
+
+        #[clap(long, default_value_t = 1)]
+        run_epoch: u64,
+
+        /// control minimizes data-path events; balanced includes write/send;
+        /// full also records noisy ambiguous interfaces such as ioctl/mmap.
+        #[clap(long, default_value = "control")]
+        profile: PolicyProfile,
+
+        #[clap(long, default_value_t = 30_000)]
+        timeout_ms: u64,
+
+        #[clap(long, default_value_t = 5_000)]
+        drain_timeout_ms: u64,
+
+        /// `user-input` retains bounded syscall-entry bytes. The explicit
+        /// `kernel-file-open-partial` mode resolves selected file opens;
+        /// `kernel-file-open-write-partial` additionally resolves the VFS
+        /// `struct file` for positive-byte write/pwrite/writev-family results
+        /// observed by the hook, including pseudo-files but not socket
+        /// endpoints. Kernel modes refuse to launch unless their exact
+        /// BTF/BPF-LSM hook pipeline is available.
+        #[clap(long, arg_enum, default_value = "user-input")]
+        object_resolution: ObjectResolutionMode,
+
+        /// Explicit BPF ClaimScope for optional S0/S1 final-state confirmation.
+        /// Without this flag only operation history is collected.
+        #[clap(long, parse(from_os_str))]
+        bpf_state_scope: Option<PathBuf>,
+
+        /// Explicit filesystem path-tree scope for optional bounded S0/S1
+        /// endpoint confirmation. The scope is disabled when omitted.
+        #[clap(long, parse(from_os_str))]
+        filesystem_state_scope: Option<PathBuf>,
+
+        /// Caller-supplied actor/quiescence contract, bound to this run,
+        /// epoch, filesystem scope, and both filesystem snapshot IDs. The
+        /// Observer checks exact binding but does not authenticate its issuer.
+        #[clap(long, parse(from_os_str))]
+        filesystem_actor_contract: Option<PathBuf>,
+
+        /// Finalize diagnostic artifacts even when event transport is incomplete.
+        #[clap(long)]
+        allow_incomplete_transport: bool,
+
+        /// Workload and arguments. A double-dash separator is required.
+        #[clap(last = true, required = true)]
+        workload: Vec<OsString>,
+    },
+
+    /// Validate a filesystem scope and derive its exact run/snapshot binding.
+    #[clap(name = "filesystem-scope-info")]
+    FilesystemScopeInfo {
+        #[clap(long, parse(from_os_str))]
+        scope: PathBuf,
+
+        #[clap(long)]
+        run_id: String,
+
+        #[clap(long, default_value_t = 1)]
+        run_epoch: u64,
+    },
+
+    /// Internal per-run recorder peer launched by the Allox daemon.
+    #[clap(name = "supervise-effects")]
+    SuperviseEffects {
+        /// Trusted recorder object path. Digest and profile come only from START.
+        #[clap(long, parse(from_os_str))]
+        recorder_object: PathBuf,
+
+        /// Maximum recorder drain interval after verified FINISH quiescence.
+        #[clap(long, default_value_t = 5_000)]
+        drain_timeout_ms: u64,
+    },
+
+    /// Verify a finalized system-effect run and its complete artifact set.
+    VerifyEffects {
+        #[clap(long, parse(from_os_str))]
+        run_dir: PathBuf,
+
+        /// Externally trusted recorder object SHA-256.
+        #[clap(long)]
+        expected_recorder_sha256: String,
+
+        /// Externally selected policy profile for this run.
+        #[clap(long)]
+        expected_profile: PolicyProfile,
+
+        /// Externally selected object-evidence strength; never trusted from
+        /// the run manifest alone.
+        #[clap(long, arg_enum)]
+        expected_object_resolution: ObjectResolutionMode,
+
+        /// Externally trusted ClaimScope required when the run contains BPF
+        /// state confirmation artifacts.
+        #[clap(long, parse(from_os_str))]
+        expected_bpf_state_scope: Option<PathBuf>,
+
+        /// Externally trusted filesystem scope required when the run contains
+        /// filesystem endpoint confirmation artifacts.
+        #[clap(long, parse(from_os_str))]
+        expected_filesystem_state_scope: Option<PathBuf>,
+
+        /// Caller-supplied exact actor contract required when the run contains
+        /// its corresponding artifact. Equality is checked, but the Observer
+        /// does not authenticate its issuer.
+        #[clap(long, parse(from_os_str))]
+        expected_filesystem_actor_contract: Option<PathBuf>,
+    },
+
     /// Verify a finalized run manifest, artifact digests, event streams, and verdict.
     VerifyRun {
         #[clap(long, parse(from_os_str))]
@@ -222,7 +366,13 @@ fn main() -> Result<()> {
             recorder_object,
             cgroup_root,
             output,
-        } => command_doctor(recorder_object.as_deref(), &cgroup_root, output.as_deref()),
+            object_resolution,
+        } => command_doctor(
+            recorder_object.as_deref(),
+            &cgroup_root,
+            output.as_deref(),
+            object_resolution,
+        ),
         Commands::Snapshot {
             scope,
             phase,
@@ -298,6 +448,125 @@ fn main() -> Result<()> {
             })?;
             print_json(&outcome)
         }
+        Commands::ObserveEffects {
+            recorder_object,
+            expected_recorder_sha256,
+            output_dir,
+            cgroup_root,
+            run_id,
+            run_epoch,
+            profile,
+            timeout_ms,
+            drain_timeout_ms,
+            object_resolution,
+            bpf_state_scope,
+            filesystem_state_scope,
+            filesystem_actor_contract,
+            allow_incomplete_transport,
+            workload,
+        } => {
+            // Do this before effects_run creates an output directory or a
+            // cgroup. Unsupported evidence strength must have no workload or
+            // evidence-side effects.
+            let capability = object_resolution::inspect(object_resolution, Some(&recorder_object));
+            object_resolution::require_available(&capability)?;
+            let outcome = effects_run::observe(effects_run::ObserveRequest {
+                recorder_object,
+                expected_recorder_sha256,
+                output_dir,
+                cgroup_root,
+                run_id,
+                run_epoch,
+                profile,
+                timeout_ms,
+                drain_timeout_ms,
+                object_resolution_mode: object_resolution,
+                allow_incomplete_transport,
+                bpf_state_scope,
+                filesystem_state_scope,
+                filesystem_actor_contract,
+                workload,
+            })?;
+            print_json(&outcome)
+        }
+        Commands::FilesystemScopeInfo {
+            scope,
+            run_id,
+            run_epoch,
+        } => {
+            run::validate_run_id(&run_id)?;
+            if run_epoch == 0 {
+                anyhow::bail!("run_epoch must be nonzero");
+            }
+            let scope: bpf_observer_filesystem_confirmer::FilesystemScope = input::read_json(
+                &scope,
+                bpf_observer_filesystem_confirmer::HARD_MAX_SCOPE_JSON_BYTES,
+            )
+            .context("read filesystem scope")?;
+            scope.validate().context("validate filesystem scope")?;
+            print_json(&FilesystemScopeInfoReport {
+                protocol_version:
+                    bpf_observer_filesystem_confirmer::FILESYSTEM_CONFIRMATION_PROTOCOL_VERSION,
+                run_id: run_id.clone(),
+                run_epoch,
+                scope_sha256: scope.sha256()?,
+                s0_snapshot_id: effects_run::filesystem_snapshot_id(&run_id, run_epoch, "S0"),
+                s1_snapshot_id: effects_run::filesystem_snapshot_id(&run_id, run_epoch, "S1"),
+                actor_contract_authentication: "EXTERNAL_TO_OBSERVER",
+            })
+        }
+        Commands::SuperviseEffects {
+            recorder_object,
+            drain_timeout_ms,
+        } => effects_supervisor::serve(effects_supervisor::ServeRequest {
+            recorder_object,
+            drain_timeout_ms,
+        }),
+        Commands::VerifyEffects {
+            run_dir,
+            expected_recorder_sha256,
+            expected_profile,
+            expected_object_resolution,
+            expected_bpf_state_scope,
+            expected_filesystem_state_scope,
+            expected_filesystem_actor_contract,
+        } => {
+            let expected_scope = expected_bpf_state_scope
+                .as_deref()
+                .map(|path| input::read_json(path, MAX_MANIFEST_JSON_BYTES))
+                .transpose()
+                .context("read externally trusted BPF state scope")?;
+            let expected_filesystem_scope = expected_filesystem_state_scope
+                .as_deref()
+                .map(|path| {
+                    input::read_json(
+                        path,
+                        bpf_observer_filesystem_confirmer::HARD_MAX_SCOPE_JSON_BYTES,
+                    )
+                })
+                .transpose()
+                .context("read externally trusted filesystem state scope")?;
+            let expected_filesystem_contract = expected_filesystem_actor_contract
+                .as_deref()
+                .map(|path| {
+                    input::read_json(
+                        path,
+                        bpf_observer_filesystem_confirmer::HARD_MAX_ACTOR_CONTRACT_JSON_BYTES,
+                    )
+                })
+                .transpose()
+                .context("read caller-supplied filesystem actor contract")?;
+            let report = effects_verify::verify_run(
+                &run_dir,
+                &expected_recorder_sha256,
+                expected_profile,
+                expected_object_resolution,
+                expected_scope.as_ref(),
+                expected_filesystem_scope.as_ref(),
+                expected_filesystem_contract.as_ref(),
+            )?;
+            print_json(&report)
+        }
         Commands::VerifyRun {
             run_dir,
             expected_recorder_sha256,
@@ -333,6 +602,18 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct FilesystemScopeInfoReport {
+    protocol_version: u32,
+    run_id: String,
+    run_epoch: u64,
+    scope_sha256: String,
+    s0_snapshot_id: String,
+    s1_snapshot_id: String,
+    actor_contract_authentication: &'static str,
+}
+
 fn command_recorder_canary() -> Result<()> {
     // BPF_MAP_CREATE with a null attribute and zero size is rejected by the
     // kernel before it can create state, while still traversing the native
@@ -345,8 +626,9 @@ fn command_doctor(
     recorder_object: Option<&Path>,
     cgroup_root: &Path,
     output: Option<&Path>,
+    object_resolution_mode: ObjectResolutionMode,
 ) -> Result<()> {
-    let report = doctor::inspect(recorder_object, cgroup_root);
+    let report = doctor::inspect(recorder_object, cgroup_root, object_resolution_mode);
     if let Some(path) = output {
         atomic_file::write_json_atomic(path, &report)?;
     } else {

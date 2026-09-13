@@ -1,0 +1,28 @@
+{
+  "protocol_version": 1,
+  "roots": [
+    {
+      "path_bytes_hex": "2f746d702f6270662d6f627365727665722d776f726b7370616365"
+    }
+  ],
+  "capture": {
+    "regular_file_content": "SHA256",
+    "symlinks": "TARGET_BYTES",
+    "xattrs": "NAMES_AND_VALUE_SHA256",
+    "cross_filesystems": "SAME_DEVICE_ONLY"
+  },
+  "limits": {
+    "max_entries": 16384,
+    "max_total_path_bytes": 16777216,
+    "max_file_content_bytes": 4194304,
+    "max_total_content_bytes": 67108864,
+    "max_xattr_list_bytes": 262144,
+    "max_xattrs_per_entry": 128,
+    "max_total_xattrs": 65536,
+    "max_xattr_value_bytes": 1048576,
+    "max_total_xattr_bytes": 16777216,
+    "max_symlink_target_bytes": 4096,
+    "max_depth": 64,
+    "deadline_ms": 30000
+  }
+}

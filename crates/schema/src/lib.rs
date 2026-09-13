@@ -29,6 +29,8 @@ pub const MAX_RAW_JSONL_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_RECORDED_EVENTS: u64 = 262_144;
 pub const MAX_WORKLOAD_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_GENERIC_JSON_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SYSTEM_EFFECT_SMALL_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILESYSTEM_ACTOR_CONTRACT_JSON_BYTES: u64 = 64 * 1024;
 
 pub fn artifact_size_limit(name: &str) -> Option<u64> {
     match name {
@@ -40,6 +42,16 @@ pub fn artifact_size_limit(name: &str) -> Option<u64> {
         "raw-events.bin" => Some(MAX_RAW_WAL_BYTES),
         "raw-events.jsonl" => Some(MAX_RAW_JSONL_BYTES),
         "workload.stderr" | "workload.stdout" => Some(MAX_WORKLOAD_OUTPUT_BYTES),
+        "system-effects.manifest.json"
+        | "system-effects.policy.json"
+        | "system-effects.health.json" => Some(MAX_SYSTEM_EFFECT_SMALL_JSON_BYTES),
+        "bpf-state-s0.json"
+        | "bpf-state-s1.json"
+        | "bpf-state-verdict.json"
+        | "filesystem-state-s0.json"
+        | "filesystem-state-s1.json"
+        | "filesystem-state-comparison.json" => Some(MAX_GENERIC_JSON_BYTES),
+        "filesystem-actor-contract.json" => Some(MAX_FILESYSTEM_ACTOR_CONTRACT_JSON_BYTES),
         _ => None,
     }
 }

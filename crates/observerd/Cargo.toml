@@ -12,12 +12,15 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "=1.0.66"
 clap = { version = "=3.2.23", features = ["derive"] }
+crc32fast = "=1.3.2"
 libc = "=0.2.137"
 serde = { version = "=1.0.147", features = ["derive"] }
 serde_json = "=1.0.87"
 sha2 = "=0.10.6"
 bpf-observer-schema = { path = "../schema" }
 bpf-observer-comparator = { path = "../comparator" }
+bpf-observer-filesystem-confirmer = { path = "../filesystem-confirmer" }
 bpf-observer-oracle = { package = "bpf-observer-state-oracle", path = "../state-oracle" }
 bpf-observer-recorder = { path = "../recorder" }
+bpf-observer-system-effects = { path = "../system-effects-recorder" }
 bpf-harness-auth = { path = "../harness-auth" }

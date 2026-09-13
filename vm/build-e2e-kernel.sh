@@ -6,24 +6,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_DIR="$(cd -P -- "${SCRIPT_DIR}/.." && pwd -P)"
 KERNEL_ROOT="$(cd -P -- "${PROJECT_DIR}/../../.." && pwd -P)"
-OUTPUT_DIR="${PROJECT_DIR}/.output/vm-kernel"
+BUILD_TMPDIR="${PROJECT_DIR}/.output/tmp"
+mkdir -p "$BUILD_TMPDIR"
+export TMPDIR="$BUILD_TMPDIR"
+OUTPUT_DIR=""
 VM_KERNEL_JOBS="${VM_KERNEL_JOBS:-$(nproc)}"
+VM_KERNEL_PROFILE="baseline"
+PAHOLE_BIN="${PAHOLE:-pahole}"
 OUTPUT_MARKER_NAME=.bpf-state-observer-vm-kernel-output
 OUTPUT_MARKER_MAGIC=bpf-state-observer-vm-kernel-output-v1
 
 usage()
 {
 	cat <<EOF
-Usage: $0 [--output-dir DIR] [--jobs N]
+Usage: $0 [--profile baseline|effects-object] [--output-dir DIR] [--jobs N]
 
 Build an x86-64 acceptance-test bzImage from this Linux source tree. The
-result starts with x86_64_defconfig, merges the Observer requirements and the
-disposable-VM overlay, disables BTF and BPF_PRELOAD, and builds out of tree.
+default baseline starts with x86_64_defconfig, merges the Observer requirements
+and disposable-VM overlay, disables BTF/BPF_PRELOAD, and builds out of tree.
+
+The effects-object profile adds a final, explicit BTF+BPF-LSM overlay for the
+sleepable file_open object-resolution E2E. It requires pahole >= 1.22; select a
+non-system binary with PAHOLE=/absolute/path/to/pahole.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--profile)
+		VM_KERNEL_PROFILE="${2:-}"
+		shift 2
+		;;
 	--output-dir)
 		OUTPUT_DIR="${2:-}"
 		shift 2
@@ -44,16 +57,25 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+case "$VM_KERNEL_PROFILE" in
+baseline|effects-object) ;;
+*)
+	echo "--profile must be baseline or effects-object" >&2
+	exit 2
+	;;
+esac
 [[ "$VM_KERNEL_JOBS" =~ ^[1-9][0-9]*$ ]] || {
 	echo "--jobs must be a positive integer" >&2
 	exit 2
 }
-[[ -n "$OUTPUT_DIR" ]] || {
-	echo "--output-dir must not be empty" >&2
-	exit 2
-}
+if [[ -z "$OUTPUT_DIR" ]]; then
+	if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+		OUTPUT_DIR="${PROJECT_DIR}/.output/vm-kernel-effects"
+	else
+		OUTPUT_DIR="${PROJECT_DIR}/.output/vm-kernel"
+	fi
+fi
 OUTPUT_DIR="$(realpath -m -- "$OUTPUT_DIR")"
-BUILD_TMPDIR="${PROJECT_DIR}/.output/tmp"
 
 path_is_within()
 {
@@ -106,15 +128,33 @@ else
 	}
 fi
 
-mkdir -p "$BUILD_TMPDIR"
+if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+	PAHOLE_BIN="$(command -v -- "$PAHOLE_BIN")" || {
+		echo "effects-object profile requires an executable pahole" >&2
+		exit 1
+	}
+	PAHOLE_VERSION="$("${KERNEL_ROOT}/scripts/pahole-version.sh" "$PAHOLE_BIN")"
+	[[ "$PAHOLE_VERSION" =~ ^[0-9]+$ ]] && (( 10#$PAHOLE_VERSION >= 122 )) || {
+		echo "effects-object profile requires pahole >= 1.22" >&2
+		exit 1
+	}
+fi
 
-TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" O="$OUTPUT_DIR" x86_64_defconfig
+TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" O="$OUTPUT_DIR" \
+	PAHOLE="$PAHOLE_BIN" x86_64_defconfig
 cp "$OUTPUT_DIR/.config" "$OUTPUT_DIR/e2e-defconfig.base"
-"${KERNEL_ROOT}/scripts/kconfig/merge_config.sh" -m -O "$OUTPUT_DIR" \
-	"$OUTPUT_DIR/e2e-defconfig.base" \
-	"${SCRIPT_DIR}/bpf-state-observer.config" \
+CONFIG_FRAGMENTS=(
+	"$OUTPUT_DIR/e2e-defconfig.base"
+	"${SCRIPT_DIR}/bpf-state-observer.config"
 	"${SCRIPT_DIR}/e2e-x86.config"
-TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" O="$OUTPUT_DIR" olddefconfig
+)
+if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+	CONFIG_FRAGMENTS+=("${SCRIPT_DIR}/effects-object-x86.config")
+fi
+"${KERNEL_ROOT}/scripts/kconfig/merge_config.sh" -m -O "$OUTPUT_DIR" \
+	"${CONFIG_FRAGMENTS[@]}"
+TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" O="$OUTPUT_DIR" \
+	PAHOLE="$PAHOLE_BIN" olddefconfig
 
 for setting in \
 	CONFIG_BPF_SYSCALL=y \
@@ -135,12 +175,39 @@ for setting in \
 	}
 done
 grep -qx '# CONFIG_BPF_PRELOAD is not set' "$OUTPUT_DIR/.config"
-if grep -qx 'CONFIG_DEBUG_INFO_BTF=y' "$OUTPUT_DIR/.config"; then
-	echo "acceptance kernel unexpectedly retained CONFIG_DEBUG_INFO_BTF=y" >&2
+if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+	for setting in \
+		CONFIG_BPF_LSM=y \
+		CONFIG_SECURITY=y \
+		CONFIG_SECURITYFS=y \
+		CONFIG_OVERLAY_FS=y \
+		CONFIG_DEBUG_INFO=y \
+		CONFIG_DEBUG_INFO_BTF=y; do
+		grep -qx "$setting" "$OUTPUT_DIR/.config" || {
+			echo "effects-object config omitted required setting: $setting" >&2
+			exit 1
+		}
+	done
+	LSM_LIST="$(sed -n 's/^CONFIG_LSM="\(.*\)"$/\1/p' "$OUTPUT_DIR/.config")"
+	[[ ",$LSM_LIST," == *,bpf,* ]] || {
+		echo "effects-object config does not activate bpf in CONFIG_LSM" >&2
+		exit 1
+	}
+elif grep -qx 'CONFIG_DEBUG_INFO_BTF=y' "$OUTPUT_DIR/.config"; then
+	echo "baseline acceptance kernel unexpectedly retained CONFIG_DEBUG_INFO_BTF=y" >&2
 	exit 1
 fi
 
 TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" \
-	O="$OUTPUT_DIR" -j "$VM_KERNEL_JOBS" bzImage
+	O="$OUTPUT_DIR" PAHOLE="$PAHOLE_BIN" -j "$VM_KERNEL_JOBS" bzImage
 
-sha256sum "$OUTPUT_DIR/arch/x86/boot/bzImage" "$OUTPUT_DIR/.config"
+if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+	readelf -S "$OUTPUT_DIR/vmlinux" | grep -q '\.BTF' || {
+		echo "effects-object vmlinux has no .BTF section" >&2
+		exit 1
+	}
+	sha256sum "$OUTPUT_DIR/arch/x86/boot/bzImage" \
+		"$OUTPUT_DIR/vmlinux" "$OUTPUT_DIR/.config"
+else
+	sha256sum "$OUTPUT_DIR/arch/x86/boot/bzImage" "$OUTPUT_DIR/.config"
+fi

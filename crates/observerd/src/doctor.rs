@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+use crate::{
+    cgroup,
+    object_resolution::{self, ObjectResolutionCapability, ObjectResolutionMode},
+};
+
 use serde::Serialize;
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -14,6 +19,7 @@ const MAX_RECORDER_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 pub struct DoctorReport {
     pub ready_for_runtime: bool,
     pub checks: Vec<DoctorCheck>,
+    pub object_resolution: ObjectResolutionCapability,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,13 +37,14 @@ pub enum CheckStatus {
     Fail,
 }
 
-pub fn inspect(bpf_object: Option<&Path>, cgroup_root: &Path) -> DoctorReport {
+pub fn inspect(
+    bpf_object: Option<&Path>,
+    cgroup_root: &Path,
+    object_resolution_mode: ObjectResolutionMode,
+) -> DoctorReport {
+    let object_resolution = object_resolution::inspect(object_resolution_mode, bpf_object);
     let mut checks = vec![
-        exists_check(
-            "cgroup_v2",
-            Path::new("/sys/fs/cgroup/cgroup.controllers"),
-            true,
-        ),
+        cgroup_v2_filesystem_check(Path::new("/sys/fs/cgroup")),
         any_exists_check(
             "raw_syscalls_sys_enter",
             &[
@@ -60,6 +67,7 @@ pub fn inspect(bpf_object: Option<&Path>, cgroup_root: &Path) -> DoctorReport {
         inventory_access_check(),
         tracepoint_perf_access_check(),
         cgroup_root_check(cgroup_root),
+        object_resolution_mode_check(&object_resolution),
     ];
     if let Some(object) = bpf_object {
         checks.push(recorder_object_check(object));
@@ -68,6 +76,19 @@ pub fn inspect(bpf_object: Option<&Path>, cgroup_root: &Path) -> DoctorReport {
     DoctorReport {
         ready_for_runtime,
         checks,
+        object_resolution,
+    }
+}
+
+fn object_resolution_mode_check(capability: &ObjectResolutionCapability) -> DoctorCheck {
+    DoctorCheck {
+        name: "selected_object_resolution_mode".into(),
+        status: if capability.selected_mode_available {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail: object_resolution::selected_mode_detail(capability),
     }
 }
 
@@ -101,28 +122,44 @@ fn recorder_object_check(path: &Path) -> DoctorCheck {
         if machine != 247 {
             return Err(format!("ELF e_machine is {machine}, expected EM_BPF (247)"));
         }
-        for symbol in [
+        let bpf_state_symbols = [
             b"trace_bpf_enter\0".as_slice(),
             b"trace_bpf_exit\0".as_slice(),
             b"recorder_config\0".as_slice(),
             b"run_states\0".as_slice(),
             b"pending_calls\0".as_slice(),
             b"events\0".as_slice(),
-        ] {
-            if !bytes.windows(symbol.len()).any(|window| window == symbol) {
-                return Err(format!(
-                    "ELF is missing expected symbol {:?}",
-                    String::from_utf8_lossy(&symbol[..symbol.len() - 1])
-                ));
-            }
+        ];
+        let system_effect_symbols = [
+            b"trace_effect_enter\0".as_slice(),
+            b"trace_effect_exit\0".as_slice(),
+            b"effect_policy\0".as_slice(),
+            b"effect_runs\0".as_slice(),
+            b"effect_pending\0".as_slice(),
+            b"effect_events\0".as_slice(),
+        ];
+        let has_all = |symbols: &[&[u8]]| {
+            symbols
+                .iter()
+                .all(|symbol| bytes.windows(symbol.len()).any(|window| window == *symbol))
+        };
+        if has_all(&bpf_state_symbols) || has_all(&system_effect_symbols) {
+            Ok(())
+        } else {
+            Err(
+                "ELF has neither the complete BPF-state nor system-effect recorder symbol set"
+                    .to_owned(),
+            )
         }
-        Ok(())
     })();
     match result {
         Ok(()) => DoctorCheck {
             name: "recorder_object".into(),
             status: CheckStatus::Pass,
-            detail: format!("{} is an EM_BPF ELF with expected symbols", path.display()),
+            detail: format!(
+                "{} is an EM_BPF ELF with a supported recorder symbol set",
+                path.display()
+            ),
         },
         Err(error) => DoctorCheck {
             name: "recorder_object".into(),
@@ -238,8 +275,7 @@ fn cgroup_root_check(path: &Path) -> DoctorCheck {
     let mut existing = Some(path);
     while let Some(candidate) = existing {
         if candidate.exists() {
-            let on_v2 = candidate.join("cgroup.controllers").exists()
-                || candidate.join("cgroup.events").exists();
+            let on_v2 = cgroup::is_cgroup2_filesystem(candidate).unwrap_or(false);
             let freezer = candidate.join("cgroup.freeze").exists();
             let kill = candidate.join("cgroup.kill").exists();
             let c_path = CString::new(candidate.as_os_str().as_bytes());
@@ -272,6 +308,23 @@ fn cgroup_root_check(path: &Path) -> DoctorCheck {
         name: "cgroup_root_access".into(),
         status: CheckStatus::Fail,
         detail: format!("no existing ancestor for {}", path.display()),
+    }
+}
+
+fn cgroup_v2_filesystem_check(path: &Path) -> DoctorCheck {
+    let filesystem_is_v2 = cgroup::is_cgroup2_filesystem(path).unwrap_or(false);
+    let controllers = path.join("cgroup.controllers").is_file();
+    DoctorCheck {
+        name: "cgroup_v2".into(),
+        status: if filesystem_is_v2 && controllers {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        detail: format!(
+            "{} (cgroup2_statfs={filesystem_is_v2}, controllers_interface={controllers})",
+            path.display()
+        ),
     }
 }
 
@@ -385,7 +438,11 @@ mod tests {
 
     #[test]
     fn report_has_required_checks() {
-        let report = inspect(None, Path::new("/sys/fs/cgroup/bpf-state-observer"));
+        let report = inspect(
+            None,
+            Path::new("/sys/fs/cgroup/bpf-state-observer"),
+            ObjectResolutionMode::UserInput,
+        );
         assert!(report.checks.iter().any(|check| check.name == "cgroup_v2"));
         assert!(report
             .checks
@@ -399,11 +456,52 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "raw_syscalls_perf_access"));
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "selected_object_resolution_mode"));
+        assert!(report.object_resolution.selected_mode_available);
+    }
+
+    #[test]
+    fn kernel_object_resolution_makes_doctor_fail_closed() {
+        for mode in [
+            ObjectResolutionMode::KernelFileOpenPartial,
+            ObjectResolutionMode::KernelFileOpenWritePartial,
+        ] {
+            let report = inspect(None, Path::new("/sys/fs/cgroup/bpf-state-observer"), mode);
+            let check = report
+                .checks
+                .iter()
+                .find(|check| check.name == "selected_object_resolution_mode")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Fail);
+            assert!(!report.ready_for_runtime);
+            assert!(!report.object_resolution.kernel_file_open_partial.available);
+            assert!(
+                !report
+                    .object_resolution
+                    .kernel_file_open_write_partial
+                    .available
+            );
+        }
     }
 
     #[test]
     fn rejects_a_regular_non_bpf_file_as_recorder() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert_eq!(recorder_object_check(&path).status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn cgroup_preflight_does_not_trust_marker_names_on_a_normal_filesystem() {
+        assert_eq!(
+            cgroup_v2_filesystem_check(Path::new("/tmp")).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            cgroup_root_check(Path::new("/tmp/fake-cgroup")).status,
+            CheckStatus::Fail
+        );
     }
 }

@@ -3,6 +3,8 @@ members = [
     "crates/schema",
     "crates/state-oracle",
     "crates/recorder",
+    "crates/system-effects-recorder",
+    "crates/filesystem-confirmer",
     "crates/comparator",
     "crates/observerd",
     "crates/harness-auth",

@@ -16,8 +16,11 @@ pub fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> 
     let before = file
         .metadata()
         .with_context(|| format!("inspect JSON input {}", path.display()))?;
-    if !before.file_type().is_file() {
-        bail!("JSON input {} is not a regular file", path.display());
+    if !before.file_type().is_file() || before.nlink() != 1 {
+        bail!(
+            "JSON input {} must be a singly linked regular file",
+            path.display()
+        );
     }
     if before.len() > max_bytes {
         bail!(
@@ -49,4 +52,35 @@ pub fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> 
         bail!("JSON input {} changed while it was read", path.display());
     }
     serde_json::from_slice(&bytes).with_context(|| format!("parse JSON input {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn rejects_hardlinked_trust_input() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "bpf-observer-input-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let first = directory.join("scope.json");
+        let second = directory.join("scope-alias.json");
+        fs::write(&first, b"{}\n").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let result = read_json::<serde_json::Value>(&first, 1024);
+
+        let _ = fs::remove_file(&second);
+        let _ = fs::remove_file(&first);
+        let _ = fs::remove_dir(&directory);
+        assert!(result.is_err());
+    }
 }

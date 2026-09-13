@@ -2,10 +2,11 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::CString;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,6 +17,7 @@ pub struct ManagedCgroup {
     path: PathBuf,
     owned: bool,
     id: u64,
+    identity_handle: Option<File>,
 }
 
 impl ManagedCgroup {
@@ -23,15 +25,33 @@ impl ManagedCgroup {
         ensure_cgroup_v2(root)?;
         fs::create_dir_all(root)
             .with_context(|| format!("create cgroup root {}", root.display()))?;
+        let root_metadata = fs::symlink_metadata(root)
+            .with_context(|| format!("inspect cgroup root {}", root.display()))?;
+        if !root_metadata.file_type().is_dir() {
+            bail!("cgroup root {} must be a real directory", root.display());
+        }
+        ensure_exact_cgroup_v2(root)
+            .with_context(|| format!("validate cgroup root {}", root.display()))?;
         let path = root.join(run_id);
         fs::create_dir(&path).with_context(|| format!("create run cgroup {}", path.display()))?;
+        if let Err(error) = ensure_exact_cgroup_v2(&path) {
+            return Err(with_creation_cleanup(
+                &path,
+                error.context(format!(
+                    "validate newly-created run cgroup {}",
+                    path.display()
+                )),
+            ));
+        }
 
         // The recorder currently matches one exact cgroup ID. Forbid a delegated
         // subtree so descendants cannot silently escape that filter.
-        if let Err(error) = fs::write(path.join("cgroup.max.depth"), b"0\n") {
-            let primary =
-                anyhow!(error).context(format!("set cgroup.max.depth=0 for {}", path.display()));
-            return Err(with_creation_cleanup(&path, primary));
+        for interface in ["cgroup.max.depth", "cgroup.max.descendants"] {
+            if let Err(error) = fs::write(path.join(interface), b"0\n") {
+                let primary =
+                    anyhow!(error).context(format!("set {interface}=0 for {}", path.display()));
+                return Err(with_creation_cleanup(&path, primary));
+            }
         }
         if !path.join("cgroup.freeze").is_file() || !path.join("cgroup.kill").is_file() {
             return Err(with_creation_cleanup(
@@ -59,23 +79,122 @@ impl ManagedCgroup {
                 anyhow!("kernel returned an invalid cgroup inode ID"),
             ));
         }
+        let identity_handle = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&path)
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let primary = anyhow!(error).context(format!(
+                    "anchor newly-created run cgroup {}",
+                    path.display()
+                ));
+                return Err(with_creation_cleanup(&path, primary));
+            }
+        };
+        if let Err(error) = ensure_cgroup_v2_handle(&identity_handle) {
+            return Err(with_creation_cleanup(
+                &path,
+                error.context(format!("validate anchored run cgroup {}", path.display())),
+            ));
+        }
+        let anchored = match identity_handle.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let primary = anyhow!(error)
+                    .context(format!("inspect anchored run cgroup {}", path.display()));
+                return Err(with_creation_cleanup(&path, primary));
+            }
+        };
+        let path_metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let primary = anyhow!(error).context(format!(
+                    "reinspect newly-created run cgroup {}",
+                    path.display()
+                ));
+                return Err(with_creation_cleanup(&path, primary));
+            }
+        };
+        if !anchored.file_type().is_dir()
+            || anchored.dev() != path_metadata.dev()
+            || anchored.ino() != path_metadata.ino()
+            || anchored.ino() != id
+        {
+            return Err(with_creation_cleanup(
+                &path,
+                anyhow!("newly-created run cgroup changed while its identity was anchored"),
+            ));
+        }
         Ok(Self {
             path,
             owned: true,
             id,
+            identity_handle: Some(identity_handle),
         })
     }
 
-    #[cfg(test)]
     pub fn open_existing(path: &Path) -> Result<Self> {
-        ensure_cgroup_v2(path)?;
-        let id = fs::metadata(path)
-            .with_context(|| format!("stat cgroup {}", path.display()))?
-            .ino();
+        if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
+            bail!("existing cgroup path must be absolute and contain no NUL byte");
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect existing cgroup {}", path.display()))?;
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "existing cgroup {} must be a real directory",
+                path.display()
+            );
+        }
+        let canonical = fs::canonicalize(path)
+            .with_context(|| format!("canonicalize existing cgroup {}", path.display()))?;
+        if canonical != path {
+            bail!("existing cgroup path {} is not canonical", path.display());
+        }
+        ensure_exact_cgroup_v2(path)?;
+        if path
+            .parent()
+            .map(|parent| ensure_exact_cgroup_v2(parent).is_err())
+            .unwrap_or(true)
+        {
+            bail!("refusing to supervise a cgroup v2 hierarchy root");
+        }
+        for interface in [
+            "cgroup.events",
+            "cgroup.procs",
+            "cgroup.freeze",
+            "cgroup.max.depth",
+            "cgroup.max.descendants",
+        ] {
+            if !path.join(interface).is_file() {
+                bail!(
+                    "existing cgroup {} lacks required interface {interface}",
+                    path.display()
+                );
+            }
+        }
+        let id = metadata.ino();
+        if id == 0 {
+            bail!("kernel returned an invalid existing cgroup inode ID");
+        }
+        let identity_handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+            .with_context(|| format!("anchor existing cgroup {}", path.display()))?;
+        let anchored = identity_handle.metadata()?;
+        if !anchored.file_type().is_dir()
+            || anchored.dev() != metadata.dev()
+            || anchored.ino() != metadata.ino()
+        {
+            bail!("existing cgroup changed while its identity was anchored");
+        }
         Ok(Self {
             path: path.to_path_buf(),
             owned: false,
             id,
+            identity_handle: Some(identity_handle),
         })
     }
 
@@ -87,9 +206,101 @@ impl ManagedCgroup {
         &self.path
     }
 
+    /// Revalidate an externally-owned cgroup without mutating it. A trusted
+    /// external runtime can use this at both registration and finalization so
+    /// a removed/recreated path cannot silently inherit the accepted binding.
+    pub fn verify_identity(&self, expected_id: u64) -> Result<()> {
+        if expected_id == 0 || self.id != expected_id {
+            bail!(
+                "existing cgroup ID {} does not match expected ID {expected_id}",
+                self.id
+            );
+        }
+        let metadata = fs::symlink_metadata(&self.path)
+            .with_context(|| format!("reinspect existing cgroup {}", self.path.display()))?;
+        if !metadata.file_type().is_dir() || metadata.ino() != self.id {
+            bail!(
+                "existing cgroup path {} changed identity",
+                self.path.display()
+            );
+        }
+        if let Some(handle) = self.identity_handle.as_ref() {
+            ensure_cgroup_v2_handle(handle).context("validate anchored cgroup filesystem")?;
+            let anchored = handle
+                .metadata()
+                .context("reinspect anchored existing cgroup")?;
+            if !anchored.file_type().is_dir()
+                || anchored.dev() != metadata.dev()
+                || anchored.ino() != metadata.ino()
+            {
+                bail!(
+                    "existing cgroup path {} no longer matches its anchored identity",
+                    self.path.display()
+                );
+            }
+        }
+        ensure_exact_cgroup_v2(&self.path)
+    }
+
+    /// Require the no-descendant leaf contract established by the external
+    /// runtime before target code is resumed.
+    pub fn verify_leaf_seal(&self) -> Result<()> {
+        self.verify_identity(self.id)?;
+        for name in ["cgroup.max.depth", "cgroup.max.descendants"] {
+            let value = fs::read_to_string(self.path.join(name))
+                .with_context(|| format!("read {}/{}", self.path.display(), name))?;
+            if value.trim() != "0" {
+                bail!(
+                    "existing cgroup {} is not sealed: {name} is {:?}",
+                    self.path.display(),
+                    value.trim()
+                );
+            }
+        }
+        for entry in fs::read_dir(&self.path)
+            .with_context(|| format!("enumerate cgroup leaf {}", self.path.display()))?
+        {
+            let entry = entry?;
+            if entry
+                .file_type()
+                .with_context(|| format!("inspect cgroup leaf entry {}", entry.path().display()))?
+                .is_dir()
+            {
+                bail!(
+                    "existing cgroup {} contains child cgroup {} despite the leaf contract",
+                    self.path.display(),
+                    entry.path().display()
+                );
+            }
+        }
+        // Bind the seal reads and child enumeration to the same anchored
+        // cgroup identity accepted at the start of this check.
+        self.verify_identity(self.id)
+    }
+
+    /// Independently confirm the producer barrier claimed by FINISH.
+    pub fn verify_empty_frozen(&self, expected_id: u64) -> Result<()> {
+        self.verify_identity(expected_id)?;
+        self.verify_leaf_seal()?;
+        let events = self.events()?;
+        if events.populated || !events.frozen {
+            bail!(
+                "existing cgroup {} is not empty and frozen (populated={}, frozen={})",
+                self.path.display(),
+                events.populated,
+                events.frozen
+            );
+        }
+        // Re-stat after reading cgroup.events to bind the barrier to the same
+        // directory identity across the complete check.
+        self.verify_identity(expected_id)
+    }
+
     pub fn configure_child(&self, command: &mut Command) -> Result<()> {
-        let procs = CString::new(self.path.join("cgroup.procs").as_os_str().as_bytes())
-            .map_err(|_| anyhow!("cgroup path contains a NUL byte"))?;
+        self.verify_identity(self.id)?;
+        self.verify_leaf_seal()?;
+        let procs = self.open_interface("cgroup.procs", libc::O_WRONLY)?;
+        self.verify_identity(self.id)?;
         let expected_parent = unsafe { libc::getpid() };
         unsafe {
             command.pre_exec(move || {
@@ -111,7 +322,7 @@ impl ManagedCgroup {
                 if libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                move_self_to_cgroup(&procs)
+                move_self_to_cgroup(procs.as_raw_fd())
             });
         }
         Ok(())
@@ -126,11 +337,9 @@ impl ManagedCgroup {
     /// stopped before it can execute there, closing the drain/S1 re-entry
     /// window. The caller keeps the recorder registration until after S1.
     pub fn freeze_empty(&self, timeout: Duration) -> Result<()> {
-        if self.populated()? {
-            bail!("refusing to freeze a populated run cgroup");
-        }
-        fs::write(self.path.join("cgroup.freeze"), b"1\n")
-            .with_context(|| format!("freeze run cgroup {}", self.path.display()))?;
+        self.verify_identity(self.id)?;
+        self.verify_leaf_seal()?;
+        self.write_interface("cgroup.freeze", b"1\n")?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .context("cgroup freeze timeout exceeds monotonic clock range")?;
@@ -143,6 +352,7 @@ impl ManagedCgroup {
                         self.path.display()
                     );
                 }
+                self.verify_identity(self.id)?;
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -153,14 +363,12 @@ impl ManagedCgroup {
     }
 
     fn events(&self) -> Result<CgroupEvents> {
-        let events = fs::read_to_string(self.path.join("cgroup.events"))
-            .with_context(|| format!("read {}/cgroup.events", self.path.display()))?;
+        let events = self.read_interface("cgroup.events", 4096)?;
         parse_cgroup_events(&events)
     }
 
     pub fn kill_all(&self) -> Result<()> {
-        fs::write(self.path.join("cgroup.kill"), b"1\n")
-            .with_context(|| format!("kill tasks in cgroup {}", self.path.display()))
+        self.write_interface("cgroup.kill", b"1\n")
     }
 
     /// Best-effort failure fencing with a bounded, reported result. Success
@@ -227,6 +435,15 @@ impl ManagedCgroup {
                         self.path.display()
                     );
                 }
+                if let Some(handle) = self.identity_handle.as_ref() {
+                    let anchored = handle.metadata().context("reinspect owned cgroup anchor")?;
+                    if anchored.dev() != metadata.dev() || anchored.ino() != metadata.ino() {
+                        bail!(
+                            "owned cgroup path {} no longer matches its anchor",
+                            self.path.display()
+                        );
+                    }
+                }
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -234,6 +451,47 @@ impl ManagedCgroup {
                 Err(error).with_context(|| format!("inspect owned cgroup {}", self.path.display()))
             }
         }
+    }
+
+    fn open_interface(&self, name: &str, access: libc::c_int) -> Result<File> {
+        let anchor = self
+            .identity_handle
+            .as_ref()
+            .context("cgroup identity has no anchored directory handle")?;
+        let name = CString::new(name).context("cgroup interface name contains NUL")?;
+        let fd = unsafe {
+            libc::openat(
+                anchor.as_raw_fd(),
+                name.as_ptr(),
+                access | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error()).with_context(|| {
+                format!("open anchored cgroup interface {}", name.to_string_lossy())
+            });
+        }
+        // SAFETY: openat returned a new owned descriptor on success.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn read_interface(&self, name: &str, maximum_bytes: u64) -> Result<String> {
+        let mut file = self.open_interface(name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read anchored cgroup interface {name}"))?;
+        if bytes.len() as u64 > maximum_bytes {
+            bail!("cgroup interface {name} exceeds its read bound");
+        }
+        String::from_utf8(bytes).with_context(|| format!("cgroup interface {name} is not UTF-8"))
+    }
+
+    fn write_interface(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let mut file = self.open_interface(name, libc::O_WRONLY)?;
+        file.write_all(bytes)
+            .with_context(|| format!("write anchored cgroup interface {name}"))
     }
 }
 
@@ -300,21 +558,58 @@ impl Drop for ManagedCgroup {
 fn ensure_cgroup_v2(path: &Path) -> Result<()> {
     let mut cursor = Some(path);
     while let Some(candidate) = cursor {
-        if candidate.join("cgroup.controllers").exists() || candidate.join("cgroup.events").exists()
-        {
-            return Ok(());
+        if candidate.exists() {
+            let metadata = fs::symlink_metadata(candidate)
+                .with_context(|| format!("inspect cgroup ancestor {}", candidate.display()))?;
+            if !metadata.file_type().is_dir() {
+                bail!(
+                    "nearest existing cgroup ancestor {} is not a real directory",
+                    candidate.display()
+                );
+            }
+            return ensure_exact_cgroup_v2(candidate).with_context(|| {
+                format!(
+                    "nearest existing ancestor {} is not on cgroup v2",
+                    candidate.display()
+                )
+            });
         }
         cursor = candidate.parent();
     }
     bail!("{} is not on a cgroup v2 hierarchy", path.display())
 }
 
-unsafe fn move_self_to_cgroup(procs: &CString) -> io::Result<()> {
-    let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+fn ensure_exact_cgroup_v2(path: &Path) -> Result<()> {
+    if !is_cgroup2_filesystem(path)? {
+        bail!("existing path is not on a cgroup v2 filesystem");
     }
+    Ok(())
+}
 
+pub(crate) fn is_cgroup2_filesystem(path: &Path) -> Result<bool> {
+    let bytes = path.as_os_str().as_bytes();
+    let path = CString::new(bytes).map_err(|_| anyhow!("cgroup path contains a NUL byte"))?;
+    let mut status = unsafe { std::mem::zeroed::<libc::statfs>() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut status) } != 0 {
+        return Err(io::Error::last_os_error()).context("statfs existing cgroup");
+    }
+    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+    Ok(status.f_type == CGROUP2_SUPER_MAGIC)
+}
+
+fn ensure_cgroup_v2_handle(handle: &File) -> Result<()> {
+    let mut status = unsafe { std::mem::zeroed::<libc::statfs>() };
+    if unsafe { libc::fstatfs(handle.as_raw_fd(), &mut status) } != 0 {
+        return Err(io::Error::last_os_error()).context("fstatfs anchored cgroup");
+    }
+    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+    if status.f_type != CGROUP2_SUPER_MAGIC {
+        bail!("anchored path is not on a cgroup v2 filesystem");
+    }
+    Ok(())
+}
+
+unsafe fn move_self_to_cgroup(fd: libc::c_int) -> io::Result<()> {
     let mut digits = [0u8; 32];
     let mut position = digits.len() - 1;
     digits[position] = b'\n';
@@ -329,10 +624,8 @@ unsafe fn move_self_to_cgroup(procs: &CString) -> io::Result<()> {
     }
     let bytes = &digits[position..];
     let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
-    let saved = io::Error::last_os_error();
-    libc::close(fd);
     if written != bytes.len() as isize {
-        return Err(saved);
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -347,6 +640,42 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("cgroup v2"));
+    }
+
+    #[test]
+    fn create_preflight_rejects_fake_cgroup_markers_before_creating_a_child() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "bpf-observer-fake-cgroup-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let markers = [
+            "cgroup.controllers",
+            "cgroup.events",
+            "cgroup.freeze",
+            "cgroup.kill",
+            "cgroup.max.depth",
+            "cgroup.max.descendants",
+            "cgroup.procs",
+        ];
+        for marker in markers {
+            fs::write(root.join(marker), b"0\n").unwrap();
+        }
+
+        let error = ManagedCgroup::create(&root, "must-not-be-created")
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("not on cgroup v2"));
+        assert!(!root.join("must-not-be-created").exists());
+
+        for marker in markers {
+            fs::remove_file(root.join(marker)).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

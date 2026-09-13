@@ -1,8 +1,12 @@
 # Target VM requirements
 
-The current recorder uses fixed raw-syscall tracepoint layouts and does not
-consume BTF. It must still be runtime-tested on the experiment kernel. The
-daemon records the actual release, boot ID, optional BTF hash, and recorder
+The default recorder mode uses fixed raw-syscall tracepoint layouts and does
+not consume BTF. The explicit `kernel-file-open-partial` and
+`kernel-file-open-write-partial` modes additionally require BTF and an active
+BPF LSM; the latter also requires the non-sleepable `file_permission` hook and is
+accepted only when its symbol/load/attach gates pass. All modes must still be
+runtime-tested on the experiment kernel. The daemon records the actual release, boot ID,
+optional BTF hash, and recorder
 object hash. It enforces the recorder hash supplied by trusted policy, but does
 not yet enforce a complete expected kernel image/probe-matrix manifest.
 
@@ -73,6 +77,57 @@ consume it, and disables `CONFIG_BPF_PRELOAD` so kernel-created iterator Links
 cannot pollute the empty endpoint baseline. It enables the legacy ATA and E1000
 drivers expected by the raw Debian test image.
 
+Kernel-object tests use a separate profile; they do not silently strengthen or
+slow the default baseline:
+
+```sh
+make vm-effects-kernel \
+  VM_EFFECTS_PAHOLE=/absolute/path/to/pahole-1.22-or-newer \
+  VM_KERNEL_JOBS=8
+```
+
+This builds into `.output/vm-kernel-effects/` and applies
+[`effects-object-x86.config`](effects-object-x86.config) after the BTF-free
+overlay. The builder refuses the profile unless the effective configuration
+contains `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_BPF_LSM=y`, the required
+security/cgroup options, and a `CONFIG_LSM` list containing `bpf`. It also
+requires the resulting `vmlinux` to contain a `.BTF` section. Runtime
+acceptance still has to verify both a readable non-empty
+`/sys/kernel/btf/vmlinux` and `bpf` in `/sys/kernel/security/lsm`; a valid
+build alone is not proof that the booted kernel activated BPF LSM.
+
+## Allox supervisor protocol VM acceptance
+
+[`effects-supervisor-e2e.sh`](effects-supervisor-e2e.sh) exercises the
+production per-run sidecar against an already-created cgroup-v2 leaf. It sends
+`START` over the trusted private input channel, independently verifies the
+response-authenticated `READY`, moves the fixed workload into the leaf,
+enforces an empty-and-frozen barrier, sends exact-bound `FINISH`, and
+independently verifies the `FINALIZED` HMAC and manifest digest. Protocol v1
+does not request-MAC `START` or `FINISH`. The test also requires the exact
+five-file closed set. The script depends only on Bash, OpenSSL, and standard
+core utilities in the Guest.
+
+After copying the built Observer, recorder object, workload, and this script
+into a disposable privileged VM, run it with new absolute evidence and cgroup
+paths:
+
+```sh
+sudo vm/effects-supervisor-e2e.sh \
+  /opt/observer/bpf-state-observer \
+  /opt/observer/system_effects.bpf.o \
+  "$TRUSTED_EFFECT_SHA256" \
+  /var/lib/allox/audit/effects-run-1 \
+  /sys/fs/cgroup/allox/effects-run-1 \
+  /opt/observer/system-effects-smoke \
+  /tmp/system-effects-supervisor-1
+```
+
+The driver creates and later removes only the named cgroup; it retains the
+evidence directory and stderr diagnostic beside it. A PASS validates the real
+BPF load/attach and protocol/finalization path, but it emulates the Allox
+lifecycle and is not a full Workspace daemon/Bubblewrap integration test.
+
 The external provisioning image must satisfy all of the following:
 
 - a maintained raw x86-64 disk image that boots from `/dev/sda` with the
@@ -138,8 +193,8 @@ make O=/disk/build/observer-kernel -j8 bzImage
 ```
 
 Use tool versions satisfying `Documentation/process/changes.rst`. In
-particular, this source revision requires a newer pahole than 1.21 to generate
-BTF. Record SHA-256 for the resulting `vmlinux`, `.config`, and VM image.
+particular, this source revision requires pahole 1.22 or newer to generate BTF.
+Record SHA-256 for the resulting `vmlinux`, `.config`, and VM image.
 
 No LSM or command-handler probe is attached by this baseline. The supplied
 fragment enables BTF, BPF LSM, ftrace, and kprobes for later enrichment, but

@@ -74,7 +74,10 @@ The MVP does not claim:
 - atomic global snapshots;
 - detection of every BPF object-ID ABA sequence;
 - history reconstruction from JSONL or endpoint snapshots;
-- network, mount, process, filesystem, device, or host-side effect coverage;
+- whole-filesystem or general network, mount, process, device, or host-side
+  effect coverage; the system-effect extension confirms only explicitly
+  selected path-tree roots and fields and records only its declared syscall
+  interfaces;
 - checkpoint/restore or rollback correctness;
 - a global statement that the system is clean.
 
