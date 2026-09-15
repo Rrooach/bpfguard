@@ -298,11 +298,16 @@ sudo "$BIN" verify-effects \
 This mode requires readable kernel BTF and active BPF LSM. It never falls back
 to pathname or FD-number guesses. A file-hook join that is ambiguous or fails
 object reads makes the evidence incomplete. A missing required object join also
-makes it incomplete; this includes `O_PATH`, whose flags are not yet captured
-in the replay ABI, and open paths that invoke multiple stacked-filesystem
-`file_open` hooks. Pipefs and socketfs objects reached through `write(2)` are
-valid VFS `FILE_OBJECT` identities, but they are not `SOCKET_OBJECT` endpoint
-evidence and do not prove persistent file state.
+makes it incomplete. Selected opens are resolved at the sleepable
+`file_post_open` LSM hook, after filesystem open callbacks finish; this covers
+ordinary stackable-filesystem opens without relying on the version-private
+numeric value of `FMODE_BACKING`. The `O_PATH` and `O_TMPFILE` namei branches
+bypass this hook and therefore fail evidence closed in the current contract; a
+duplicate post-open hook is also fatal. The sleepable BPF LSM form requires an
+upstream Linux 6.11-or-newer hook ABI. Kernels without it fail load/attach
+before workload launch. Pipefs and socketfs objects reached through `write(2)`
+are valid VFS `FILE_OBJECT` identities, but they are not `SOCKET_OBJECT`
+endpoint evidence and do not prove persistent file state.
 
 For the expanded partial object contract, build and independently trust both
 ELFs. The separate lifecycle digest is mandatory on collection and
@@ -467,6 +472,9 @@ still says `coverage_complete=false`,
 `operation_events_are_state_diff=false`.
 See the [full guide](docs/system-effects-observer.md) for artifact semantics,
 coverage gaps, inspection commands, and the paired overhead benchmark. The
+[Terminal-Bench + Docker validation](docs/system-effects-validation-2026-09-15.md)
+records the four-task Harbor integration and the overlayfs object-resolution
+regression proof. The
 [current privileged-VM functional validation](docs/system-effects-validation-2026-09-13.md)
 records the exact-build object, filesystem, and fail-closed gates. The
 [2026-09-12 validation](docs/system-effects-validation-2026-09-12.md) retains
@@ -727,4 +735,5 @@ Details:
 - [Observer overhead benchmark](experiments/overhead/README.md)
 - [Observer overhead validation](experiments/overhead/VALIDATION.md)
 - [System-effect recorder guide](docs/system-effects-observer.md)
+- [Terminal-Bench + Docker Observer validation](docs/system-effects-validation-2026-09-15.md)
 - [System-effect recorder overhead benchmark](experiments/system-effects-overhead/README.md)

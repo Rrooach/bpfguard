@@ -1,0 +1,324 @@
+{
+  "schema_version": 1,
+  "selection_id": "terminal-bench-v4-observer-pilot-1",
+  "dataset": {
+    "name": "terminal-bench/terminal-bench",
+    "version": "4.0.0",
+    "git_repository": "https://github.com/harbor-framework/terminal-bench.git",
+    "git_tag": "v4.0.0",
+    "git_commit": "452bf305c6daa62fc59061d22133a7cbc7c1572e",
+    "dataset_manifest_path": "tasks/dataset.toml"
+  },
+  "source_input_hash_contract": {
+    "included_paths": [
+      "instruction.md",
+      "task.toml",
+      "environment/** regular files"
+    ],
+    "excluded_paths": [
+      "solution/**",
+      "tests/**",
+      "README.md",
+      ".gitignore"
+    ],
+    "path_basis": "POSIX path relative to the task directory",
+    "ordering": "LC_ALL=C bytewise ascending path",
+    "entry_encoding": "lowercase SHA-256 hex, two U+0020 bytes, relative path, U+000A",
+    "aggregate": "SHA-256 of the concatenated encoded entries"
+  },
+  "planned_count_assertion": {
+    "mode": "EXACT_COUNT_SET_AND_ORDER",
+    "planned_count": 4,
+    "resolved_task_count_must_equal": 4,
+    "resolved_task_names_must_equal_in_order": [
+      "terminal-bench/photonic-waveguide-routing",
+      "terminal-bench/cargo-flight-dispatch",
+      "terminal-bench/bun-sourcemap-leak",
+      "terminal-bench/html-js-filter"
+    ],
+    "resolved_task_names_must_be_unique": true,
+    "reject_additional_tasks": true,
+    "on_failure": "ABORT_BEFORE_ENVIRONMENT_BUILD"
+  },
+  "tasks": [
+    {
+      "order": 1,
+      "name": "terminal-bench/photonic-waveguide-routing",
+      "directory": "photonic-waveguide-routing",
+      "registry_digest": "sha256:3fd44f4fbc5b862bc1a0b098d3c1295387134edd238ed6f12f2c98ec13e2dccc",
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/v4.0.0/tasks/photonic-waveguide-routing",
+      "source_input_manifest_sha256": "b04508b623846f6b858e82e2e713f08a25cfa6b14ecde93fb5d0078bfdcf4945",
+      "source_inputs": [
+        {
+          "path": "environment/Dockerfile",
+          "sha256": "acfbce96479581637576c3694d691607b257521659b43b80cabeea5237479a47"
+        },
+        {
+          "path": "environment/check_routing.py",
+          "sha256": "9f6de6977cc225c5dfee1d0cd62039d16dc04c766d3c6d928b6dde4f5d95cce1"
+        },
+        {
+          "path": "environment/layout_spec.json",
+          "sha256": "fa9883e144ccbd9105fae275199a859cfc7e7b77e1b8bb5ec83792af574a87b7"
+        },
+        {
+          "path": "instruction.md",
+          "sha256": "4e980c5b49b1ce91f92d59e73d1b1b71b526a471c35e0fa0ecfe95b839388cb9"
+        },
+        {
+          "path": "task.toml",
+          "sha256": "b9e17fb3072bb5cf02b98acb2980e891b7a51615ac4dce386771a868d6be3f33"
+        }
+      ],
+      "environment": {
+        "base_image": "python:3.13-slim-bookworm",
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 600,
+        "verifier_timeout_sec": 300,
+        "verifier_environment_mode": "separate"
+      },
+      "ordered_risks": [
+        {
+          "order": 1,
+          "risk": "Cold image construction downloads pinned NumPy, SciPy, Shapely, and Rtree packages.",
+          "mitigation": "Pre-build and record the resulting image identity before the measured Agent phase."
+        },
+        {
+          "order": 2,
+          "risk": "Numerical libraries produce a comparatively mmap-heavy workload.",
+          "mitigation": "Use it as the low-to-medium event-volume pilot and retain drop counters."
+        }
+      ]
+    },
+    {
+      "order": 2,
+      "name": "terminal-bench/cargo-flight-dispatch",
+      "directory": "cargo-flight-dispatch",
+      "registry_digest": "sha256:2836dfe6eb2270fcbbfdb119c7cfae8495208a03a7fc691c2efff49bda5b3c61",
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/v4.0.0/tasks/cargo-flight-dispatch",
+      "source_input_manifest_sha256": "4f296c934c4e107c054f9db3625f64efb75d8dac730b24579fe49de7869ebc67",
+      "source_inputs": [
+        {
+          "path": "environment/Dockerfile",
+          "sha256": "72dd91548a3564b2f2158e1f34330186543dec08b4d36ee42909bb831962337a"
+        },
+        {
+          "path": "environment/aircraft.py",
+          "sha256": "7b2afc4273ea0b9046bf1e32b6a57a99a4ec5b073ed39f075beb4994cffa9de9"
+        },
+        {
+          "path": "environment/data/aircraft.json",
+          "sha256": "5042e4c7cabfc55453c4d3b13edf4cab4c2b2142d634e767f64b6eb175aca549"
+        },
+        {
+          "path": "environment/data/airports.json",
+          "sha256": "25bb33e33712e70b98158c14d7207fb17fdf870c678973b88a2b1ce85d65bde2"
+        },
+        {
+          "path": "environment/data/manifest.json",
+          "sha256": "e29b874389205274056b0044e03c2682e00b6c06909c9f1d2a386d97e9178f88"
+        },
+        {
+          "path": "environment/data/weather.json",
+          "sha256": "5b5b3caa0f93b0a6d1f2ecb58f1b0a89c2ca62ecf5bd85104dc6097fa31fa867"
+        },
+        {
+          "path": "environment/dispatch.py",
+          "sha256": "7a435b3a743a380728f41a4a4d2b25ff5b0305ca4ffdfa83162d72589a657bd8"
+        },
+        {
+          "path": "environment/navigation.py",
+          "sha256": "b7932e8f60649e22f106b3bf5b6c2542971a76d07a0f6202802651aebac1494e"
+        },
+        {
+          "path": "instruction.md",
+          "sha256": "a7b0333a36ba08895d4858a6f216de7802b4e584566149acbb2ccb4420be165d"
+        },
+        {
+          "path": "task.toml",
+          "sha256": "30d8d613c086cb5ab40d11955d78cde5eaa29fc9f36eed8da2e4a555512ff354"
+        }
+      ],
+      "environment": {
+        "base_image": "python:3.13-slim-bookworm",
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 1200,
+        "verifier_timeout_sec": 600,
+        "verifier_environment_mode": "separate"
+      },
+      "ordered_risks": [
+        {
+          "order": 1,
+          "risk": "The verifier performs apt or pip installation when the Agent leaves non-empty apt-packages.txt or requirements.txt files.",
+          "mitigation": "Require the Oracle pilot to leave both files empty; record any later Agent-requested dependency installation as network-bearing behavior."
+        },
+        {
+          "order": 2,
+          "risk": "The generated flight plan is outside the declared task artifact list and is regenerated by the verifier.",
+          "mitigation": "Treat Agent-phase /app source edits as observed effects and never attribute verifier regeneration to the Agent."
+        }
+      ]
+    },
+    {
+      "order": 3,
+      "name": "terminal-bench/bun-sourcemap-leak",
+      "directory": "bun-sourcemap-leak",
+      "registry_digest": "sha256:ac0b0f77da4e8f6c3904133033ec6d8591eb0d3f18205ab28104ea3cf2a5a07f",
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/v4.0.0/tasks/bun-sourcemap-leak",
+      "source_input_manifest_sha256": "c4b974aff791ca27751b2075df6e18c5c8c3ff7e06a93b5e88970790483a7f72",
+      "source_inputs": [
+        {
+          "path": "environment/Dockerfile",
+          "sha256": "8dda7dfc1bd31f452849fdf7988b3ffd1d9b5dd4b40d12875bcbf9a5849f3dba"
+        },
+        {
+          "path": "environment/package.json",
+          "sha256": "dfefc86ee050eab9b3c0324d719b51fbd29f06702dbbae71ff4dab1314a95751"
+        },
+        {
+          "path": "environment/scripts/release.ts",
+          "sha256": "8dfd40a037c4f449c28debb32a712ba2a50b8a46a73ce8bb3b6b246f1525d01e"
+        },
+        {
+          "path": "environment/src/client-entry.ts",
+          "sha256": "db036eddd423e72170d47b511f782174c07a1ec2716212a0dd852a458f0a0a48"
+        },
+        {
+          "path": "environment/src/client/format.ts",
+          "sha256": "f05db67381710f8024c7c7baca0f3af3ef60e2dcb192bc47a10212e072fcaa25"
+        },
+        {
+          "path": "environment/src/client/render.ts",
+          "sha256": "60eb0f1a90dbdd7cde4a403eb92746d9bb1b0e636b83ed6bf86a8f74a755e3d3"
+        },
+        {
+          "path": "environment/src/generated/prompt-template.ts",
+          "sha256": "5aae8dc45c2a89c0e6ba20464dc859728712fc998cc387cf70dda2b6cfd39ef8"
+        },
+        {
+          "path": "environment/src/server-entry.ts",
+          "sha256": "b9d0ad869b1a5849b887413470bb853b455f94cf7dba5c64055e52c66449a437"
+        },
+        {
+          "path": "environment/src/server/handler.ts",
+          "sha256": "c454d40b2487ff04e73f56b6cc971ffe025976237bd120e9d55a7d611353dfa3"
+        },
+        {
+          "path": "environment/src/server/secret.ts",
+          "sha256": "2ee24f65d3c87cf0584fa00b7b3f54985ee489463f4a5e7b085ddb335122acd2"
+        },
+        {
+          "path": "environment/tsconfig.json",
+          "sha256": "41e35842771a18524b665799342173e2939ffe85dc33d13610f2fe2eb33b4b39"
+        },
+        {
+          "path": "environment/visibility.json",
+          "sha256": "280fd52cc97291de640b59c2b17dbd1da4820b378586186b7ea78fd3faff17ef"
+        },
+        {
+          "path": "instruction.md",
+          "sha256": "665d8100ad29dd7fbf42e3ec5f00fbde8c04141183319deb30bd6722caf0f7a2"
+        },
+        {
+          "path": "task.toml",
+          "sha256": "d33774eabad9d50fab9d4c6872dc3fe5687bfc87da6b8b23d91a1253939825c7"
+        }
+      ],
+      "environment": {
+        "base_image": "oven/bun:1.2.15-debian",
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 600,
+        "verifier_timeout_sec": 600,
+        "verifier_environment_mode": "separate"
+      },
+      "ordered_risks": [
+        {
+          "order": 1,
+          "risk": "Bun release generation creates a high-volume mix of mmap, create, write, rename, and unlink activity.",
+          "mitigation": "Run only after lower-volume pilots and require zero recorder drops before accepting the observation."
+        },
+        {
+          "order": 2,
+          "risk": "The separate verifier repeatedly exercises hidden project variants and is not representative of the measured Agent phase.",
+          "mitigation": "Close the Observer at AGENT_END before Harbor starts verification."
+        }
+      ]
+    },
+    {
+      "order": 4,
+      "name": "terminal-bench/html-js-filter",
+      "directory": "html-js-filter",
+      "registry_digest": "sha256:832a5b309edca4f1a7c728da5f1ca530c2712f20a0b7f1db6d1bb6e3171a8866",
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/v4.0.0/tasks/html-js-filter",
+      "source_input_manifest_sha256": "cdca4755ced4ed21debd1f1d2aa3440c9f56550ac060f66cd3e54ee0fc2963c0",
+      "source_inputs": [
+        {
+          "path": "environment/Dockerfile",
+          "sha256": "3e5dec7c555b1ace7ebacf0fd57a6575760084e6c47f7c1dfc3064accca72dbb"
+        },
+        {
+          "path": "instruction.md",
+          "sha256": "bb76e0fdffe2b3ebf4f458729ab3b3e5a2360f593d24cd06f9235a111dce8a82"
+        },
+        {
+          "path": "task.toml",
+          "sha256": "7827b16c102b8d48d09061ce4251b3f1f6ecb4f4e9e4879a3f06b0db095df985"
+        }
+      ],
+      "environment": {
+        "base_image": "python:3.12-slim-bookworm",
+        "cpus": 2,
+        "memory_mb": 8192,
+        "storage_mb": 10240,
+        "gpus": 0,
+        "build_timeout_sec": 600,
+        "verifier_timeout_sec": 1800,
+        "verifier_environment_mode": "separate",
+        "verifier_base_image": "mcr.microsoft.com/playwright/python:v1.52.0-noble"
+      },
+      "ordered_risks": [
+        {
+          "order": 1,
+          "risk": "The Playwright/Chromium separate verifier is the heaviest and most startup-sensitive verifier in this pilot.",
+          "mitigation": "Run it last, pre-build its image, and report verifier infrastructure failures separately from Observer failures."
+        },
+        {
+          "order": 2,
+          "risk": "The verifier creates many temporary HTML files and browser processes.",
+          "mitigation": "Require Observer finalization at AGENT_END so verifier effects cannot enter Agent evidence."
+        }
+      ]
+    }
+  ],
+  "campaign_ordered_risks": [
+    {
+      "order": 1,
+      "risk": "A Harbor task-name filter that matches nothing can unintentionally run the full dataset.",
+      "mitigation": "Resolve full org-prefixed names and enforce the exact count, set, and order assertion before any build."
+    },
+    {
+      "order": 2,
+      "risk": "Using latest or independently resolving task packages can drift from the v4.0.0 dataset manifest.",
+      "mitigation": "Require the pinned tag, commit, registry digest, and source-input hashes together."
+    },
+    {
+      "order": 3,
+      "risk": "Cold Docker builds include registry and package-download effects unrelated to Agent execution.",
+      "mitigation": "Complete builds before AGENT_START and exclude build containers from the observed cgroup."
+    },
+    {
+      "order": 4,
+      "risk": "All selected tasks use a separate verifier whose processes must not be attributed to the Agent.",
+      "mitigation": "Finalize and offline-verify Observer evidence before Harbor begins the verifier phase."
+    }
+  ]
+}

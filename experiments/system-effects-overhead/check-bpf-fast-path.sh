@@ -117,17 +117,19 @@ done
 require_instruction_cap "$OBJECT" lsm/mmap_file 160
 require_instruction_cap "$OBJECT" lsm/file_mprotect 160
 
-# file_open can call bpf_d_path only after the pending-call gate. Keep the
-# complete global hook bounded and pin its first two helpers to PID identity
-# and pending-map lookup. file_permission delegates the same gate to its
-# out-of-line resolver. The expanded exit budget catches accidental growth in
-# the largest selected-syscall path.
-require_instruction_cap "$OBJECT" lsm.s/file_open 260
-file_open=$($OBJDUMP -d --no-show-raw-insn --section=lsm.s/file_open "$OBJECT")
-file_open_first_two=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 2 { exit }' \
-	<<< "$file_open")
-[[ "$file_open_first_two" == $'14\n1' ]] || {
-	echo "file_open no longer gates on PID and pending-map before object/path reads" >&2
+# file_post_open can call bpf_d_path only after the pending-call gate. Keep
+# the complete global hook bounded and pin its first two helpers to PID
+# identity and pending-map lookup. Using the post-open hook avoids duplicate
+# overlayfs backing-file callbacks without adding a version-private f_mode
+# test. file_permission delegates the same gate to its out-of-line resolver.
+# The expanded exit budget catches accidental growth in the largest selected
+# syscall path.
+require_instruction_cap "$OBJECT" lsm.s/file_post_open 260
+file_post_open=$($OBJDUMP -d --no-show-raw-insn --section=lsm.s/file_post_open "$OBJECT")
+file_post_open_first_two=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 2 { exit }' \
+	<<< "$file_post_open")
+[[ "$file_post_open_first_two" == $'14\n1' ]] || {
+	echo "file_post_open no longer gates on PID and pending-map before object/path reads" >&2
 	exit 1
 }
 require_symbol_instruction_cap "$OBJECT" record_file_permission 230

@@ -508,7 +508,7 @@ impl KernelEvent {
                     FILE_PATH_RESOLVED_AT_HOOK | FILE_PATH_UNAVAILABLE
                 )
             {
-                bail!("file_open object has a path quality not produced by the current hook");
+                bail!("file_post_open object has a path quality not produced by the current hook");
             }
             if is_extended_file_result && object.path_quality != FILE_PATH_NOT_REQUESTED {
                 bail!("extended file-object hook unexpectedly claims a path snapshot");
@@ -1497,7 +1497,9 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
                         PathResolutionQuality::ResolvedAtHook | PathResolutionQuality::Unavailable
                     ) =>
                 {
-                    bail!("file_open object has a path quality not produced by the current hook")
+                    bail!(
+                        "file_post_open object has a path quality not produced by the current hook"
+                    )
                 }
                 _ => {}
             }

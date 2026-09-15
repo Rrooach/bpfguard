@@ -27,9 +27,9 @@ and disposable-VM overlay, disables BTF/BPF_PRELOAD, and builds out of tree.
 
 The effects-object profile adds a final, explicit BTF+BPF-LSM overlay for the
 expanded VFS/socket/lifecycle object-resolution E2E, plus built-in nftables,
-virtual-link, and representative traffic-control support for endpoint-state
-confirmation. It requires pahole >= 1.22; select a non-system binary with
-PAHOLE=/absolute/path/to/pahole.
+virtual-link, representative traffic-control, and Docker/Harbor cgroup,
+bridge, conntrack and NAT support. It requires pahole >= 1.22; select a
+non-system binary with PAHOLE=/absolute/path/to/pahole.
 EOF
 }
 
@@ -184,11 +184,45 @@ if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
 		CONFIG_SECURITYFS=y \
 		CONFIG_SECURITY_PATH=y \
 		CONFIG_OVERLAY_FS=y \
+		CONFIG_MEMCG=y \
+		CONFIG_CGROUP_PIDS=y \
+		CONFIG_CPUSETS=y \
+		CONFIG_CFS_BANDWIDTH=y \
+		CONFIG_BLK_CGROUP=y \
+		CONFIG_BLK_DEV_THROTTLING=y \
+		CONFIG_BRIDGE=y \
+		CONFIG_BRIDGE_NETFILTER=y \
 		CONFIG_NETFILTER=y \
+		CONFIG_NETFILTER_ADVANCED=y \
 		CONFIG_NETFILTER_NETLINK=y \
+		CONFIG_NF_CONNTRACK=y \
+		CONFIG_NF_CT_NETLINK=y \
+		CONFIG_NF_NAT=y \
 		CONFIG_NF_TABLES=y \
 		CONFIG_NF_TABLES_INET=y \
 		CONFIG_NF_TABLES_NETDEV=y \
+		CONFIG_NFT_CT=y \
+		CONFIG_NFT_FIB=y \
+		CONFIG_NFT_FIB_IPV4=y \
+		CONFIG_NFT_FIB_IPV6=y \
+		CONFIG_NFT_FIB_INET=y \
+		CONFIG_NFT_NAT=y \
+		CONFIG_NFT_MASQ=y \
+		CONFIG_NFT_REDIR=y \
+		CONFIG_NFT_COMPAT=y \
+		CONFIG_NFT_REJECT=y \
+		CONFIG_NFT_REJECT_INET=y \
+		CONFIG_NFT_REJECT_IPV4=y \
+		CONFIG_NFT_REJECT_IPV6=y \
+		CONFIG_NETFILTER_XTABLES=y \
+		CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y \
+		CONFIG_NETFILTER_XT_MATCH_COMMENT=y \
+		CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y \
+		CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y \
+		CONFIG_NETFILTER_XT_MARK=y \
+		CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y \
+		CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y \
+		CONFIG_NETFILTER_XT_TARGET_REDIRECT=y \
 		CONFIG_IPV6_MULTIPLE_TABLES=y \
 		CONFIG_DUMMY=y \
 		CONFIG_VETH=y \

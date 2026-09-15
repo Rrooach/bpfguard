@@ -86,7 +86,7 @@ const PROGRAM_ENTER: &str = "trace_effect_enter";
 const PROGRAM_EXIT: &str = "trace_effect_exit";
 const PROGRAM_FILE_EXIT: &str = "trace_effect_file_exit";
 const PROGRAM_EXPANDED_EXIT: &str = "trace_effect_expanded_exit";
-const PROGRAM_FILE_OBJECT: &str = "trace_effect_file_object";
+const PROGRAM_FILE_OBJECT: &str = "trace_effect_file_post_open_object";
 const PROGRAM_FILE_PERMISSION: &str = "trace_effect_file_permission";
 const PROGRAM_ACCEPT_EXIT: &str = "trace_effect_do_accept_exit";
 const PROGRAM_INET_STATE: &str = "trace_effect_inet_sock_set_state";
@@ -1836,15 +1836,15 @@ pub fn coverage_gaps_for(
             "path captures are bounded user input, not kernel-resolved file identities".to_owned(),
         ),
         FileObjectResolutionMode::KernelFileOpenPartial => gaps.push(
-            "KERNEL_RESOLVED FILE_OBJECT covers successful selected native open/openat/openat2/creat results only when exactly one file_open join is observed; O_PATH/no-hook and duplicate stacked-filesystem opens fail evidence closed, while attempts, failed opens, other file operations, and all socket operations remain USER_INPUT_ONLY or UNRESOLVED"
+            "KERNEL_RESOLVED FILE_OBJECT covers successful selected ordinary native open/openat/openat2/creat results using file_post_open after filesystem open callbacks complete, including stackable-filesystem opens; O_PATH/O_TMPFILE and missing or duplicate post-open joins fail evidence closed, while attempts, failed opens, other file operations, and all socket operations remain USER_INPUT_ONLY or UNRESOLVED"
                 .to_owned(),
         ),
         FileObjectResolutionMode::KernelFileOpenWritePartial => gaps.push(
-            "KERNEL_RESOLVED FILE_OBJECT covers successful selected native open/openat/openat2/creat results with exactly one file_open join and positive-byte write/pwrite64/writev/pwritev/pwritev2 results with their required non-sleepable file_permission join; missing required hooks, O_PATH, and duplicate stacked-filesystem opens fail evidence closed; pipefs/socketfs FILE_OBJECT identities are not socket endpoints or persistent-state proof, and write identities deliberately have no kernel path snapshot"
+            "KERNEL_RESOLVED FILE_OBJECT covers successful selected ordinary native open/openat/openat2/creat results using file_post_open after filesystem open callbacks complete, including stackable-filesystem opens, plus positive-byte write/pwrite64/writev/pwritev/pwritev2 results with their required non-sleepable file_permission join; O_PATH/O_TMPFILE and missing or duplicate required joins fail evidence closed; pipefs/socketfs FILE_OBJECT identities are not socket endpoints or persistent-state proof, and write identities deliberately have no kernel path snapshot"
                 .to_owned(),
         ),
         FileObjectResolutionMode::KernelObjectExpandedPartial => gaps.push(
-            "KERNEL_OBJECT_EXPANDED resolves create parent directories, hard-link source inodes in the destination mount, unlink/rmdir targets, chmod/chown targets (including fchmodat2), mountless xattr inodes with bounded attribute-name capture, rename sources, eligible file-backed MAP_SHARED+PROT_WRITE mmap targets, and single shared file-backed VMA mprotect(PROT_WRITE) requests; it also resolves bind/connect requested socket endpoints, successful accept/accept4 accepted-socket peers, and a separately verified AF_INET/AF_INET6 TCP accept/transition/destroy stream. Hard-link destination children, rename destinations, other created children, actual dirty-page writes after mmap/mprotect, multi-VMA or anonymous/private mprotect targets, non-INET/TCP socket state, io_uring, SCM_RIGHTS provenance, and delegated effects remain explicitly outside this partial contract"
+            "KERNEL_OBJECT_EXPANDED resolves successful selected ordinary opens to the final user-visible file through file_post_open after filesystem callbacks complete (including stackable-filesystem opens), create parent directories, hard-link source inodes in the destination mount, unlink/rmdir targets, chmod/chown targets (including fchmodat2), mountless xattr inodes with bounded attribute-name capture, rename sources, eligible file-backed MAP_SHARED+PROT_WRITE mmap targets, and single shared file-backed VMA mprotect(PROT_WRITE) requests; it also resolves bind/connect requested socket endpoints, successful accept/accept4 accepted-socket peers, and a separately verified AF_INET/AF_INET6 TCP accept/transition/destroy stream. O_PATH/O_TMPFILE, missing or duplicate post-open joins, hard-link destination children, rename destinations, other created children, actual dirty-page writes after mmap/mprotect, multi-VMA or anonymous/private mprotect targets, non-INET/TCP socket state, io_uring, SCM_RIGHTS provenance, and delegated effects remain explicitly outside this partial contract"
                 .to_owned(),
         ),
     }
@@ -2126,7 +2126,7 @@ fn attach_tracepoint(
 fn attach_lsm(resources: &mut KernelResources, program_name: &str) -> Result<()> {
     let program = find_program(resources.object, program_name)?;
     let link = unsafe { libbpf::bpf_program__attach_lsm(program) };
-    check_pointer(link.cast(), "attach system-effect BPF LSM file_open")?;
+    check_pointer(link.cast(), "attach system-effect BPF LSM file_post_open")?;
     resources.links.push(link);
     Ok(())
 }

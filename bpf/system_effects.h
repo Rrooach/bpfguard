@@ -156,7 +156,7 @@ struct effect_event {
 };
 
 /* Kernel-resolved FILE_OBJECT data is emitted only by the opt-in BPF
- * LSM/alternate exit pair. file_open may add a point-in-time path snapshot;
+ * LSM/alternate exit pair. file_post_open may add a point-in-time path snapshot;
  * the non-sleepable file_permission hook deliberately does not. The
  * boot-scoped mount/device/inode fields are the object identity.
  */

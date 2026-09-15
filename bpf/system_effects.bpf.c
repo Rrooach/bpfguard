@@ -984,8 +984,15 @@ int trace_effect_exit(struct effect_sys_exit *ctx)
  * lookup precedes every file/path field read and the comparatively expensive
  * path rendering helper.
  */
-SEC("lsm.s/file_open")
-int BPF_PROG(trace_effect_file_object, struct file *file, int ret)
+/* file_post_open runs after the filesystem ->open callback.  Unlike
+ * file_open, it is not re-entered by overlayfs backing_file_open(), whose
+ * internal vfs_open() deliberately bypasses this path-level post hook.  The
+ * object captured here is therefore the struct file returned to the caller,
+ * without relying on the version-private numeric value of FMODE_BACKING.
+ */
+SEC("lsm.s/file_post_open")
+int BPF_PROG(trace_effect_file_post_open_object, struct file *file, int mask,
+	     int ret)
 {
 	struct effect_object_config *config;
 	struct effect_pending_call *pending;
@@ -1003,6 +1010,7 @@ int BPF_PROG(trace_effect_file_object, struct file *file, int ret)
 	long error = 0;
 
 	(void)ctx;
+	(void)mask;
 	if (ret)
 		return ret;
 	pid_tgid = bpf_get_current_pid_tgid();
@@ -2427,10 +2435,11 @@ int trace_effect_expanded_exit(struct effect_sys_exit *ctx)
 		return 0;
 	}
 	/* A successful selected open or positive-byte selected write is required to
-	 * have traversed its declared object hook. In particular, O_PATH currently
-	 * lies outside this closed resolver contract: until its disposition is
-	 * captured and independently replayed, a missing file_open join is fatal
-	 * rather than guessed to be a legitimate partial result.
+	 * have traversed its declared object hook. In particular, O_PATH and
+	 * O_TMPFILE currently lie outside this closed resolver contract because
+	 * their namei branches bypass file_post_open. Until their disposition is
+	 * captured and independently replayed, a missing join is fatal rather than
+	 * guessed to be a legitimate partial result.
 	 */
 	if (!object_present &&
 	    !(pending.flags & (EFFECT_F_OBJECT_JOIN_AMBIGUOUS |

@@ -346,13 +346,17 @@ therefore emitted only as `USER_INPUT_ONLY` or `UNRESOLVED`.
 
 `--object-resolution kernel-file-open-partial` is a narrow, explicit opt-in.
 For a successful selected native `open`, `openat`, `openat2`, or `creat` result
-with exactly one `file_open` join, a sleepable BPF LSM hook records the actual
-VFS object as boot-scoped mount/device/inode/generation/superblock identity. It also records
-an at-most-127-byte path snapshot with explicit `RESOLVED_AT_HOOK` or
-`UNAVAILABLE` quality. `O_PATH` does not traverse this hook and its disposition
-is not encoded in the replay ABI, so it is currently unsupported and fails
-evidence closed rather than being guessed from a missing join.
-Stacked/re-entrant duplicate open hooks are likewise fatal. Failed opens, attempts, rename,
+with a `file_post_open` join, a sleepable BPF LSM hook records the final
+user-visible VFS object as boot-scoped
+mount/device/inode/generation/superblock identity. It also records an
+at-most-127-byte path snapshot with explicit `RESOLVED_AT_HOOK` or
+`UNAVAILABLE` quality. This hook runs after filesystem open callbacks, so
+ordinary stackable-filesystem opens are covered without relying on the
+version-private numeric value of `FMODE_BACKING`; a duplicate post-open hook
+remains a fatal ambiguity. `O_PATH` and `O_TMPFILE` use namei branches that
+bypass `file_post_open`, so they currently fail evidence closed. The sleepable
+BPF LSM form requires the upstream Linux 6.11-or-newer hook ABI; unavailable
+hooks fail load/attach before workload launch. Failed opens, attempts, rename,
 unlink, FD operations, and all socket operations remain `USER_INPUT_ONLY` or
 `UNRESOLVED`; this mode is not a general `kernel` resolution claim.
 
@@ -510,7 +514,7 @@ separate bounded path observation. Path quality's closed schema vocabulary
 reserves `NOT_REQUESTED`, `RESOLVED_AT_HOOK`, `TRUNCATED_AT_HOOK`,
 `UNAVAILABLE`, and `UNSTABLE_AT_HOOK`. The current attested producer/verifier
 contract permits only `RESOLVED_AT_HOOK` with 1..=127 bytes or `UNAVAILABLE`
-on `file_open`, and only `NOT_REQUESTED` on `file_permission`; it rejects the
+on `file_post_open`, and only `NOT_REQUESTED` on `file_permission`; it rejects the
 reserved variants for those operations. The closed schema allows a future
 producer up to 512 bytes, and its `RESOLVED_AT_HOOK`, `TRUNCATED_AT_HOOK`, and
 `UNSTABLE_AT_HOOK` variants may carry canonical raw hex, a derived display
@@ -664,7 +668,7 @@ carries a fixed resolver selector into the per-thread pending record;
 `file_permission(MAY_WRITE)` stores one bounded `FILE_OBJECT` joined to that
 exact attempt. Because this LSM hook is non-sleepable, its frame contains
 an event-time kernel-derived mount/device/inode tuple with
-`path.quality=NOT_REQUESTED`; only the sleepable `file_open` hook renders a
+`path.quality=NOT_REQUESTED`; only the sleepable `file_post_open` hook renders a
 kernel path snapshot. Inode generation is optional, so this tuple does not
 exclude inode reuse or prove lifetime-stable identity. The independent verifier
 recomputes eligibility from the attested operation and externally expected
@@ -807,7 +811,9 @@ Build the two `/tmp` helpers first as shown in the
 its analyzer. An event count includes both attempt and result records, so the
 reported denominator is persisted records, not logical syscalls.
 
-The current-build privileged-VM functional record is
+The four-task Harbor + real-Docker integration record is
+[`system-effects-validation-2026-09-15.md`](system-effects-validation-2026-09-15.md).
+The current-build standalone privileged-VM functional record is
 [`system-effects-validation-2026-09-13.md`](system-effects-validation-2026-09-13.md).
 The latest 12-block measurement record remains
 [`system-effects-validation-2026-09-12.md`](system-effects-validation-2026-09-12.md).

@@ -16,7 +16,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
-const CAPABILITY_SCHEMA_VERSION: u32 = 4;
+const CAPABILITY_SCHEMA_VERSION: u32 = 5;
 const MAX_BPF_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 const KERNEL_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 const ACTIVE_LSMS_PATH: &str = "/sys/kernel/security/lsm";
@@ -33,17 +33,17 @@ const PROCESS_LIFECYCLE_PIPELINE_IMPLEMENTED: bool = true;
 const REQUIRED_FILE_OPEN_HOOK_ABI_SYMBOLS: [&[u8]; 5] = [
     b"effect_object_config\0",
     b"effect_file_objects\0",
-    b"lsm.s/file_open\0",
-    b"trace_effect_file_object\0",
+    b"lsm.s/file_post_open\0",
+    b"trace_effect_file_post_open_object\0",
     b"trace_effect_file_exit\0",
 ];
 
 const REQUIRED_FILE_OPEN_WRITE_HOOK_ABI_SYMBOLS: [&[u8]; 7] = [
     b"effect_object_config\0",
     b"effect_file_objects\0",
-    b"lsm.s/file_open\0",
+    b"lsm.s/file_post_open\0",
     b"lsm/file_permission\0",
-    b"trace_effect_file_object\0",
+    b"trace_effect_file_post_open_object\0",
     b"trace_effect_file_permission\0",
     b"trace_effect_file_exit\0",
 ];
@@ -163,20 +163,20 @@ const REQUIRED_EXPANDED_BTF_TYPES_AND_FIELDS: [&str; 41] = [
 ];
 
 const REQUIRED_FILE_OPEN_HOOK_FAMILIES: [&str; 3] = [
-    "sleepable BPF LSM file_open hook for selected open/openat/openat2/creat calls; a missing hook result (including unsupported O_PATH) or a duplicate stacked-filesystem hook fails evidence closed",
+    "sleepable BPF LSM file_post_open hook for selected ordinary open/openat/openat2/creat calls; it runs after stackable-filesystem backing opens and records the final user-visible struct file, while O_PATH/O_TMPFILE, a missing hook, or a duplicate post-open hook fail evidence closed",
     "raw_syscalls/sys_enter and raw_syscalls/sys_exit correlation",
     "exact cgroup-v2 ID filtering before object reads or event publication",
 ];
 
 const REQUIRED_FILE_OPEN_WRITE_HOOK_FAMILIES: [&str; 4] = [
-    "sleepable BPF LSM file_open hook for selected open/openat/openat2/creat calls; a missing hook result (including unsupported O_PATH) or a duplicate stacked-filesystem hook fails evidence closed",
+    "sleepable BPF LSM file_post_open hook for selected ordinary open/openat/openat2/creat calls; it runs after stackable-filesystem backing opens and records the final user-visible struct file, while O_PATH/O_TMPFILE, a missing hook, or a duplicate post-open hook fail evidence closed",
     "non-sleepable BPF LSM file_permission(MAY_WRITE) hook for positive-byte native write/pwrite64/writev/pwritev/pwritev2 VFS struct file identity, including pipefs/socketfs pseudo-files; missing required hook evidence fails closed, this is not socket-endpoint or persistent-state evidence, and path rendering is not requested on this hook",
     "raw_syscalls/sys_enter and raw_syscalls/sys_exit correlation",
     "exact cgroup-v2 ID and selected resolver filtering before object reads or event publication",
 ];
 
 const REQUIRED_EXPANDED_HOOK_FAMILIES: [&str; 7] = [
-    "file_open and file_permission object hooks",
+    "file_post_open resolves the final user-visible object after stackable-filesystem backing opens, while file_permission resolves selected positive-byte writes",
     "path/inode BPF LSM hooks for create, unlink, rename, setattr, and xattr evidence",
     "mmap_file BPF LSM hook for selected file-backed shared writable mappings and file_mprotect BPF LSM hook for single shared file-backed VMA write-permission requests; anonymous/private/multi-VMA cases fail closed or are explicitly unsupported",
     "socket_connect and socket_bind BPF LSM hooks with socket-cookie/netns/requested-endpoint evidence",
@@ -315,7 +315,7 @@ pub fn selected_mode_detail(capability: &ObjectResolutionCapability) -> String {
                 .to_owned()
         }
         ObjectResolutionMode::KernelFileOpenPartial if capability.selected_mode_available => {
-            "KERNEL_FILE_OPEN_PARTIAL prerequisites and its attested hook/WAL/verifier pipeline are available; selected opens that traverse exactly one file_open hook receive identity, while missing hooks (including unsupported O_PATH) and duplicate stacked-filesystem hooks fail evidence closed; no other operation receives kernel-resolved identity"
+            "KERNEL_FILE_OPEN_PARTIAL prerequisites and its attested hook/WAL/verifier pipeline are available; selected ordinary opens receive the final user-visible file identity from file_post_open after stackable-filesystem backing opens complete; O_PATH/O_TMPFILE and missing or duplicate post-open hooks fail evidence closed; no other operation receives kernel-resolved identity"
                 .to_owned()
         }
         ObjectResolutionMode::KernelFileOpenPartial => format!(
@@ -325,7 +325,7 @@ pub fn selected_mode_detail(capability: &ObjectResolutionCapability) -> String {
         ObjectResolutionMode::KernelFileOpenWritePartial
             if capability.selected_mode_available =>
         {
-            "KERNEL_FILE_OPEN_WRITE_PARTIAL prerequisites and its attested file_open+file_permission/WAL/verifier pipeline are available; selected opens that traverse exactly one file_open hook and positive-byte selected writes seen by file_permission resolve to VFS FILE_OBJECT, including pipefs/socketfs pseudo-files; every missing required hook (including unsupported O_PATH) and duplicate stacked-filesystem open hook fails evidence closed, and none of this establishes socket endpoints or persistent state"
+            "KERNEL_FILE_OPEN_WRITE_PARTIAL prerequisites and its attested file_post_open+file_permission/WAL/verifier pipeline are available; selected ordinary opens receive the final user-visible file after stackable-filesystem backing opens complete, and positive-byte selected writes seen by file_permission resolve to VFS FILE_OBJECT, including pipefs/socketfs pseudo-files; O_PATH/O_TMPFILE and every missing or duplicate required hook fail evidence closed, and none of this establishes socket endpoints or persistent state"
                 .to_owned()
         }
         ObjectResolutionMode::KernelFileOpenWritePartial => format!(
@@ -336,7 +336,7 @@ pub fn selected_mode_detail(capability: &ObjectResolutionCapability) -> String {
                 .join("; ")
         ),
         ObjectResolutionMode::KernelObjectExpandedPartial if capability.selected_mode_available => {
-            "KERNEL_OBJECT_EXPANDED_PARTIAL has the attested path/inode/mmap/mprotect/socket, accepted-socket/TCP-state, and separate fork/exec/exit lifecycle hook/WAL/verifier pipelines; lifecycle evidence is capped at PARTIAL because schema v2 has no authoritative S0 task ledger or cgroup-entry enrollment stream; create hooks identify only the parent (hard-link identifies its source inode in the destination mount), rename identifies only the source, mmap and single-shared-file-VMA mprotect identify permission channels rather than later dirty-page writes, bind/connect identify the kernel-copied requested endpoint, and accept identifies the post-do_accept peer endpoint for AF_INET/AF_INET6 TCP only"
+            "KERNEL_OBJECT_EXPANDED_PARTIAL has the attested file_post_open/path/inode/mmap/mprotect/socket, accepted-socket/TCP-state, and separate fork/exec/exit lifecycle hook/WAL/verifier pipelines; selected ordinary opens receive the final user-visible file after stackable-filesystem backing opens complete, while O_PATH/O_TMPFILE fail evidence closed; lifecycle evidence is capped at PARTIAL because schema v2 has no authoritative S0 task ledger or cgroup-entry enrollment stream; create hooks identify only the parent (hard-link identifies its source inode in the destination mount), rename identifies only the source, mmap and single-shared-file-VMA mprotect identify permission channels rather than later dirty-page writes, bind/connect identify the kernel-copied requested endpoint, and accept identifies the post-do_accept peer endpoint for AF_INET/AF_INET6 TCP only"
                 .to_owned()
         }
         ObjectResolutionMode::KernelObjectExpandedPartial => format!(
@@ -387,7 +387,7 @@ fn inspect_impl(
             hook_families: &REQUIRED_FILE_OPEN_HOOK_FAMILIES,
             btf_types_and_fields: &REQUIRED_BTF_TYPES_AND_FIELDS,
             missing_recorder_hook_message:
-                "the selected recorder ELF lacks the complete file_open object hook ABI",
+                "the selected recorder ELF lacks the complete file_post_open object hook ABI",
             process_lifecycle_hook_abi_required: false,
             process_lifecycle_hook_abi_present: false,
         },
@@ -403,7 +403,7 @@ fn inspect_impl(
             hook_families: &REQUIRED_FILE_OPEN_WRITE_HOOK_FAMILIES,
             btf_types_and_fields: &REQUIRED_BTF_TYPES_AND_FIELDS,
             missing_recorder_hook_message:
-                "the selected recorder ELF lacks the complete file_open+file_permission object hook ABI",
+                "the selected recorder ELF lacks the complete file_post_open+file_permission object hook ABI",
             process_lifecycle_hook_abi_required: false,
             process_lifecycle_hook_abi_present: false,
         },
@@ -618,7 +618,7 @@ mod tests {
         let error = require_available(&capability).unwrap_err().to_string();
         assert!(error.contains("refused before workload launch"));
         assert!(error.contains("does not prove that bpf is active"));
-        assert!(error.contains("lacks the complete file_open object hook ABI"));
+        assert!(error.contains("lacks the complete file_post_open object hook ABI"));
         assert!(
             capability
                 .kernel_file_open_partial
@@ -704,9 +704,8 @@ mod tests {
             &lsms,
         );
         assert!(!write.selected_mode_available);
-        assert!(
-            write.kernel_file_open_write_partial.blockers[0].contains("file_open+file_permission")
-        );
+        assert!(write.kernel_file_open_write_partial.blockers[0]
+            .contains("file_post_open+file_permission"));
 
         fs::write(
             &recorder,
@@ -774,7 +773,7 @@ mod tests {
             .kernel_object_expanded_partial
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("file_open+file_permission")));
+            .any(|blocker| blocker.contains("file_post_open+file_permission")));
 
         fs::write(&lifecycle, REQUIRED_LIFECYCLE_HOOK_ABI_SYMBOLS.concat()).unwrap();
         let complete = inspect_at_with_lifecycle(
