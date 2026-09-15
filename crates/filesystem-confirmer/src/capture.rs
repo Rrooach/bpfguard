@@ -8,12 +8,125 @@ use std::ffi::{CString, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
+const DIRECTORY_BUFFER_BYTES: usize = 32 * 1024;
+const LINUX_DIRENT64_NAME_OFFSET: usize = 19;
+
+struct NoAtimeReadDir {
+    directory: File,
+    buffer: Vec<u8>,
+    offset: usize,
+    filled: usize,
+    finished: bool,
+}
+
+impl NoAtimeReadDir {
+    fn open(path: &Path) -> io::Result<Self> {
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "directory path contains NUL")
+        })?;
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOATIME,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            directory: unsafe { File::from_raw_fd(fd) },
+            buffer: vec![0; DIRECTORY_BUFFER_BYTES],
+            offset: 0,
+            filled: 0,
+            finished: false,
+        })
+    }
+
+    fn metadata(&self) -> io::Result<Metadata> {
+        self.directory.metadata()
+    }
+
+    fn fail(&mut self, message: &'static str) -> Option<io::Result<OsString>> {
+        self.finished = true;
+        Some(Err(io::Error::new(io::ErrorKind::InvalidData, message)))
+    }
+}
+
+impl Iterator for NoAtimeReadDir {
+    type Item = io::Result<OsString>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            if self.offset == self.filled {
+                let count = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        self.directory.as_raw_fd(),
+                        self.buffer.as_mut_ptr(),
+                        self.buffer.len(),
+                    )
+                };
+                if count < 0 {
+                    self.finished = true;
+                    return Some(Err(io::Error::last_os_error()));
+                }
+                if count == 0 {
+                    self.finished = true;
+                    return None;
+                }
+                let Ok(count) = usize::try_from(count) else {
+                    return self.fail("getdents64 returned an invalid byte count");
+                };
+                if count > self.buffer.len() {
+                    return self.fail("getdents64 exceeded its supplied buffer");
+                }
+                self.offset = 0;
+                self.filled = count;
+            }
+
+            if self.filled - self.offset < LINUX_DIRENT64_NAME_OFFSET {
+                return self.fail("getdents64 returned a truncated record header");
+            }
+            let record_length =
+                u16::from_ne_bytes([self.buffer[self.offset + 16], self.buffer[self.offset + 17]])
+                    as usize;
+            if record_length <= LINUX_DIRENT64_NAME_OFFSET
+                || record_length > self.filled - self.offset
+            {
+                return self.fail("getdents64 returned an invalid record length");
+            }
+            let name_start = self.offset + LINUX_DIRENT64_NAME_OFFSET;
+            let record_end = self.offset + record_length;
+            self.offset = record_end;
+            let name_field = &self.buffer[name_start..record_end];
+            let Some(nul) = name_field.iter().position(|byte| *byte == 0) else {
+                return self.fail("getdents64 name is not NUL terminated");
+            };
+            let name = &name_field[..nul];
+            if name.is_empty() {
+                return self.fail("getdents64 returned an empty name");
+            }
+            if name == b"." || name == b".." {
+                continue;
+            }
+            return Some(Ok(OsString::from_vec(name.to_vec())));
+        }
+    }
+}
 
 struct RootCaptureResult {
     status: RootCaptureStatus,
@@ -40,6 +153,44 @@ impl RootCaptureResult {
 }
 
 pub fn capture(scope: &FilesystemScope, request: &CaptureRequest) -> Result<FilesystemSnapshot> {
+    capture_internal(
+        scope,
+        request,
+        MountNamespaceCaptureSource::CurrentProcess,
+        None,
+        None,
+    )
+}
+
+/// Capture after a trusted caller entered a retained mount namespace. The
+/// current namespace inode is checked here so provenance cannot be labelled
+/// retained while resolving roots in a different namespace.
+pub fn capture_in_retained_mount_namespace(
+    scope: &FilesystemScope,
+    request: &CaptureRequest,
+    expected_mount_namespace_inode: u64,
+    expected_mount_root_device: u64,
+    expected_mount_root_inode: u64,
+) -> Result<FilesystemSnapshot> {
+    if expected_mount_namespace_inode == 0 || expected_mount_root_inode == 0 {
+        bail!("expected retained mount namespace/root identity must be non-zero");
+    }
+    capture_internal(
+        scope,
+        request,
+        MountNamespaceCaptureSource::RetainedFileDescriptor,
+        Some(expected_mount_namespace_inode),
+        Some((expected_mount_root_device, expected_mount_root_inode)),
+    )
+}
+
+fn capture_internal(
+    scope: &FilesystemScope,
+    request: &CaptureRequest,
+    mount_namespace_capture_source: MountNamespaceCaptureSource,
+    expected_mount_namespace_inode: Option<u64>,
+    expected_mount_root_identity: Option<(u64, u64)>,
+) -> Result<FilesystemSnapshot> {
     scope.validate()?;
     request.validate()?;
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -49,12 +200,12 @@ pub fn capture(scope: &FilesystemScope, request: &CaptureRequest) -> Result<File
     if boot_id.is_empty() {
         bail!("kernel returned an empty boot ID");
     }
-    let mount_namespace_inode = fs::metadata("/proc/self/ns/mnt")
-        .context("inspect mount namespace for filesystem snapshot")?
-        .ino();
-    if mount_namespace_inode == 0 {
-        bail!("kernel returned an invalid mount namespace inode");
-    }
+    let (mount_namespace_inode, mount_root_identity) = resolve_mount_capture_identity(
+        mount_namespace_capture_source,
+        expected_mount_namespace_inode,
+        expected_mount_root_identity,
+        current_process_mount_identity,
+    )?;
     let captured_unix_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
@@ -118,6 +269,9 @@ pub fn capture(scope: &FilesystemScope, request: &CaptureRequest) -> Result<File
         captured_unix_ns,
         boot_id,
         mount_namespace_inode,
+        mount_namespace_capture_source,
+        mount_root_device: mount_root_identity.0,
+        mount_root_inode: mount_root_identity.1,
         scope: scope.clone(),
         scope_sha256: scope.sha256()?,
         roots,
@@ -129,6 +283,76 @@ pub fn capture(scope: &FilesystemScope, request: &CaptureRequest) -> Result<File
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+fn current_process_mount_identity() -> Result<(u64, (u64, u64))> {
+    let mount_namespace_inode = fs::metadata("/proc/thread-self/ns/mnt")
+        .context("inspect mount namespace for filesystem snapshot")?
+        .ino();
+    let mount_root = fs::metadata("/proc/thread-self/root")
+        .context("inspect root object for filesystem snapshot")?;
+    Ok((mount_namespace_inode, (mount_root.dev(), mount_root.ino())))
+}
+
+fn resolve_mount_capture_identity<F>(
+    source: MountNamespaceCaptureSource,
+    expected_namespace_inode: Option<u64>,
+    expected_root_identity: Option<(u64, u64)>,
+    current_process_identity: F,
+) -> Result<(u64, (u64, u64))>
+where
+    F: FnOnce() -> Result<(u64, (u64, u64))>,
+{
+    let identity = match source {
+        MountNamespaceCaptureSource::CurrentProcess => {
+            if expected_namespace_inode.is_some() || expected_root_identity.is_some() {
+                bail!("current-process capture unexpectedly carries retained identities");
+            }
+            current_process_identity()?
+        }
+        MountNamespaceCaptureSource::RetainedFileDescriptor => {
+            let namespace_inode = expected_namespace_inode
+                .context("retained capture lacks its namespace capability identity")?;
+            let expected_root = expected_root_identity
+                .context("retained capture lacks its root capability identity")?;
+            // The caller has already fstat/nsfs-validated the retained namespace
+            // FD, entered it with setns(2), and chrooted through the retained
+            // O_PATH root.  Do not consult /proc/thread-self here: a procfs
+            // mounted for a child PID namespace cannot represent this Host-PID-
+            // namespace observer thread.  stat("/") instead proves that chroot
+            // installed the exact retained root object.
+            let root = fs::metadata("/").context("inspect installed retained mount root")?;
+            let observed_root = (root.dev(), root.ino());
+            if observed_root != expected_root {
+                bail!("current root object does not match retained target root capability");
+            }
+            (namespace_inode, observed_root)
+        }
+    };
+    if identity.0 == 0 || (identity.1).1 == 0 {
+        bail!("kernel returned an invalid mount namespace/root identity");
+    }
+    Ok(identity)
+}
+
+#[cfg(test)]
+mod mount_identity_tests {
+    use super::*;
+
+    #[test]
+    fn retained_identity_never_consults_proc_thread_self() {
+        let root = fs::metadata("/").expect("stat current root");
+        let expected_root = (root.dev(), root.ino());
+        let identity = resolve_mount_capture_identity(
+            MountNamespaceCaptureSource::RetainedFileDescriptor,
+            Some(41),
+            Some(expected_root),
+            || panic!("retained capture must not consult current-process procfs identity"),
+        )
+        .expect("resolve retained identity without procfs self lookup");
+
+        assert_eq!(identity, (41, expected_root));
+    }
 }
 
 struct CaptureState<'a> {
@@ -326,7 +550,7 @@ impl<'a> CaptureState<'a> {
         root_device: u64,
         entry_index: usize,
     ) {
-        let iterator = match fs::read_dir(path) {
+        let iterator = match NoAtimeReadDir::open(path) {
             Ok(iterator) => iterator,
             Err(error) => {
                 self.record_io_error(
@@ -340,6 +564,33 @@ impl<'a> CaptureState<'a> {
                 return;
             }
         };
+        match iterator.metadata() {
+            Ok(metadata)
+                if metadata.dev() == self.entries[entry_index].device
+                    && metadata.ino() == self.entries[entry_index].inode => {}
+            Ok(_) => {
+                self.record_synthetic_error(
+                    root_index,
+                    relative,
+                    CaptureOperation::StabilityCheck,
+                    CaptureErrorClass::Other,
+                    None,
+                );
+                self.entries[entry_index].traversal = TraversalStatus::Incomplete;
+                return;
+            }
+            Err(error) => {
+                self.record_io_error(
+                    root_index,
+                    relative,
+                    CaptureOperation::StabilityCheck,
+                    &error,
+                    None,
+                );
+                self.entries[entry_index].traversal = TraversalStatus::Incomplete;
+                return;
+            }
+        }
         let remaining = self
             .scope
             .limits
@@ -365,7 +616,7 @@ impl<'a> CaptureState<'a> {
                     return;
                 }
             };
-            names.push(item.file_name());
+            names.push(item);
             if names.len() as u64 > remaining {
                 self.record_limit(
                     root_index,
@@ -1043,7 +1294,10 @@ fn classify_type(metadata: &Metadata) -> FilesystemEntryType {
 fn open_regular_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        // Never silently turn observation into an atime mutation. If the
+        // caller lacks permission for O_NOATIME, the content observation is
+        // recorded incomplete by the existing open-error path.
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOATIME)
         .open(path)
 }
 

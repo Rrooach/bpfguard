@@ -77,7 +77,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "bpf-observer-deployment"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.6",
+]
+
+[[package]]
+name = "bpf-observer-deployment-observer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bpf-observer-comparator",
+ "bpf-observer-deployment",
+ "bpf-observer-filesystem-confirmer",
+ "bpf-observer-linux-state-confirmers",
+ "bpf-observer-schema",
+ "bpf-observer-state-oracle",
+ "bpf-observer-system-effects",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.6",
+]
+
+[[package]]
 name = "bpf-observer-filesystem-confirmer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.6",
+]
+
+[[package]]
+name = "bpf-observer-linux-state-confirmers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -149,6 +192,7 @@ dependencies = [
  "bpf-harness-auth",
  "bpf-observer-comparator",
  "bpf-observer-filesystem-confirmer",
+ "bpf-observer-linux-state-confirmers",
  "bpf-observer-recorder",
  "bpf-observer-schema",
  "bpf-observer-state-oracle",

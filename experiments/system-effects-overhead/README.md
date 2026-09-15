@@ -41,12 +41,12 @@ limitation must be retained in any result report.
 
 ## Build and local smoke check
 
-No existing Makefile is changed.  Run:
+Run:
 
 ```sh
 bash experiments/system-effects-overhead/check.sh
 bash experiments/system-effects-overhead/check-bpf-fast-path.sh \
-  .output/system_effects.bpf.o
+  .output/system_effects.bpf.o .output/process_lifecycle.bpf.o
 ```
 
 The check compiles the two small C helpers in a temporary directory and tests
@@ -54,10 +54,13 @@ the workload and wrapper protocol.  `passthrough-wrapper.sh` is only a wiring
 fixture: it reports zero events and therefore cannot produce an accepted
 event-cost result.
 
-The compiled-BPF check pins two low-cost global off-path invariants for the
-project's clang/LLVM 14 build: `file_permission` remains a 12-instruction
-filtering wrapper with no stack work on the read/off path, and `sys_enter`
-performs its policy-Map lookup before any wide event-structure initialization.
+The compiled-BPF check pins low-cost global off-path invariants for the
+project's clang/LLVM 14 build. `file_permission` remains a 12-instruction
+filtering wrapper with no stack work on the read/off path, `sys_enter`
+performs its policy-Map lookup before any wide event-structure initialization,
+the expanded path/xattr/socket/mmap wrappers stay below explicit instruction
+caps, and every global lifecycle hook performs only the current-cgroup helper
+and run-Map lookup before touching task state.
 It is a regression gate, not a runtime latency measurement; the paired VM
 benchmark below remains authoritative for end-to-end overhead.
 
@@ -113,24 +116,40 @@ BPF_STATE_OBSERVER_EFFECTS_SHA256      trusted lowercase object SHA-256
 BPF_STATE_OBSERVER_EFFECTS_PROFILE     control|balanced|full (default balanced)
 BPF_STATE_OBSERVER_EFFECTS_OBJECT_RESOLUTION
                                         user-input|kernel-file-open-partial|
-                                        kernel-file-open-write-partial
+                                        kernel-file-open-write-partial|
+                                        kernel-object-expanded-partial
                                         (default user-input)
+BPF_STATE_OBSERVER_LIFECYCLE_OBJECT     absolute process_lifecycle.bpf.o;
+                                        required only by expanded mode
+BPF_STATE_OBSERVER_LIFECYCLE_SHA256     trusted lowercase lifecycle-object
+                                        SHA-256; required only by expanded mode
 ```
 
 That `balanced` default belongs to this benchmark adapter, not to the Observer
 CLI (whose low-overhead default is `control`). The file-effect benchmark needs
 `balanced` so its write operations create the event-count denominator.
-Object-resolution mode is part of `collector_identity`, so results from the
+Object-resolution mode and both object digests are part of
+`collector_identity`, so results from the
 raw syscall path, the global BPF-LSM file-open hook, and the additional global
-`file_permission` hook cannot be mixed in one batch. Each partial-kernel mode
+`file_permission`/expanded/lifecycle hooks cannot be mixed in one batch. Each partial-kernel mode
 must first pass `doctor` on a BTF+BPF-LSM kernel. In particular, an open-only
 result is not evidence for write-partial overhead; run and report that mode as
 a separate experiment.
 
+For `kernel-object-expanded-partial`, the adapter additionally rejects a
+missing, lossy, unbound, non-terminal, or internally inconsistent lifecycle
+stream. `bytes_persisted` includes both recorder streams. The formal per-event
+denominator remains the system-effect stream; `lifecycle_events_persisted` is
+reported separately because fork/exec/exit events have a different cost and
+must not be silently mixed into that denominator.
+
 The optional `BPF_STATE_OBSERVER_EFFECTS_CGROUP_ROOT`,
 `BPF_STATE_OBSERVER_EFFECTS_TIMEOUT_MS`, and
 `BPF_STATE_OBSERVER_EFFECTS_DRAIN_TIMEOUT_MS` variables override the runtime
-defaults. The adapter accepts only `COMPLETE`, lossless, drained evidence. Its
+defaults. The adapter accepts only `COMPLETE`, lossless system-effect transport
+and, when enabled, `COMPLETE` socket-state transport. Lifecycle schema v2 must
+instead report its honest `PARTIAL` enrollment status while remaining
+lossless, drained, and terminal for the admitted events. The system-effect
 event count includes both attempt and result records; `bytes_persisted` is the
 combined WAL and JSONL size. It retains the unchanged Observer evidence below
 `DIR/evidence` and writes benchmark-only `metrics.json` beside it.
@@ -162,9 +181,14 @@ export BPF_STATE_OBSERVER_EFFECTS_OBJECT="$(realpath .output/system_effects.bpf.
 export BPF_STATE_OBSERVER_EFFECTS_SHA256="$(sha256sum "$BPF_STATE_OBSERVER_EFFECTS_OBJECT" | awk '{print $1}')"
 export BPF_STATE_OBSERVER_EFFECTS_PROFILE=balanced
 
+# To benchmark expanded object/lifecycle observation as a separate batch:
+# export BPF_STATE_OBSERVER_EFFECTS_OBJECT_RESOLUTION=kernel-object-expanded-partial
+# export BPF_STATE_OBSERVER_LIFECYCLE_OBJECT="$(realpath .output/process_lifecycle.bpf.o)"
+# export BPF_STATE_OBSERVER_LIFECYCLE_SHA256="$(sha256sum "$BPF_STATE_OBSERVER_LIFECYCLE_OBJECT" | awk '{print $1}')"
+
 # Run the whole collection at one privilege level so the direct and observed
 # arms remain comparable.
-sudo --preserve-env=BPF_STATE_OBSERVER_BIN,BPF_STATE_OBSERVER_EFFECTS_OBJECT,BPF_STATE_OBSERVER_EFFECTS_SHA256,BPF_STATE_OBSERVER_EFFECTS_PROFILE \
+sudo --preserve-env=BPF_STATE_OBSERVER_BIN,BPF_STATE_OBSERVER_EFFECTS_OBJECT,BPF_STATE_OBSERVER_EFFECTS_SHA256,BPF_STATE_OBSERVER_EFFECTS_PROFILE,BPF_STATE_OBSERVER_EFFECTS_OBJECT_RESOLUTION,BPF_STATE_OBSERVER_LIFECYCLE_OBJECT,BPF_STATE_OBSERVER_LIFECYCLE_SHA256 \
   bash experiments/system-effects-overhead/run.sh \
   --output /var/lib/system-effects-overhead/run-001 \
   --workload /tmp/system-effects-workload \
@@ -211,3 +235,33 @@ The benchmark workload is intentionally compatible with the `balanced`
 profile. Changing to `control` removes the write-event denominator; changing
 to `full` changes both the selected syscall set and startup noise. Treat either
 as a different experiment, not as a directly comparable configuration.
+
+## Expanded-vs-user-input VM batch
+
+The privileged expanded-effects VM acceptance uses
+`analyze-expanded.js` for a separate comparison: both collectors are enabled,
+and the treatment is `kernel-object-expanded-partial` plus lifecycle and
+socket-state evidence versus the `user-input` recorder path. This is not an
+input to `analyze.js` and must not be mixed with its direct/observed four-arm
+design.
+
+Each of twelve measured blocks, preceded by four excluded warm-up blocks, runs
+both modes at N=0 and N=1024. Load and mode order follow a four-row balanced
+cycle. The per-block wall and aggregate-CPU estimands are:
+
+```text
+[(expanded - user-input) at N=1024 -
+ (expanded - user-input) at N=0]
+/
+[expanded persisted system-effect events at N=1024 - N=0]
+```
+
+The analyzer also retains the user-input denominator, requires the two modes'
+system-event deltas to agree before accepting an estimate, and reports
+lifecycle/socket-state deltas separately. It validates all 48 measured arms
+and all 16 warm-up arms as complete, lossless and offline-verified; reports
+per-stream bytes, RSS and context switches; and computes an exact
+distribution-free median interval. With twelve blocks the narrowest interval
+meeting at least 95% coverage is the third through tenth order statistics,
+whose exact coverage is `1969/2048` (about 96.14%). A failed gate yields an
+exploratory result without removing any block.

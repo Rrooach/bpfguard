@@ -6,17 +6,16 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const EFFECT_EVENT_SCHEMA_VERSION: u32 = 1;
-/// Version of the additive userspace attribution contract. This protocol is
-/// derived entirely from the existing raw event fields and does not extend or
-/// reinterpret the kernel/WAL ABI.
-pub const EFFECT_ATTRIBUTION_PROTOCOL_VERSION: u32 = 1;
+/// Version of the userspace attribution contract, including boot-scoped task
+/// start time carried by the kernel/WAL ABI.
+pub const EFFECT_ATTRIBUTION_PROTOCOL_VERSION: u32 = 2;
 /// Version of the additive userspace object-identity protocol carried by a
-/// decoded system-effect event. The additive v1 WAL ABI preserves the original
-/// 152/344-byte frames and adds one closed 328-byte FILE_OBJECT result frame.
+/// decoded system-effect event.
 pub const OBJECT_IDENTITY_PROTOCOL_VERSION: u32 = 1;
-pub const KERNEL_EVENT_HEADER_SIZE: usize = 152;
-pub const KERNEL_EVENT_SIZE: usize = 344;
-pub const KERNEL_FILE_EVENT_SIZE: usize = 328;
+pub const KERNEL_EVENT_HEADER_SIZE: usize = 160;
+pub const KERNEL_EVENT_SIZE: usize = 352;
+pub const KERNEL_FILE_EVENT_SIZE: usize = 336;
+pub const KERNEL_SOCKET_EVENT_SIZE: usize = 336;
 pub const CAPTURE_BYTES: usize = 96;
 pub const KERNEL_FILE_PATH_BYTES: usize = 128;
 pub const MAX_OBJECT_REFERENCES: usize = 2;
@@ -44,6 +43,11 @@ pub const FLAG_OBJECT_JOIN_AMBIGUOUS: u32 = 1 << 14;
 pub const FLAG_OBJECT_READ_FAILED: u32 = 1 << 15;
 pub const FLAG_OBJECT_DELETE_FAILED: u32 = 1 << 16;
 pub const FLAG_OBJECT_PATH_UNAVAILABLE: u32 = 1 << 17;
+pub const FLAG_TASK_READ_FAILED: u32 = 1 << 18;
+/// The selected resolver deliberately rejected an object outside its frozen
+/// semantic contract. This is nonfatal but keeps an otherwise successful
+/// syscall explicitly UNRESOLVED instead of claiming a generic identity.
+pub const FLAG_OBJECT_UNSUPPORTED: u32 = 1 << 19;
 const KNOWN_FLAGS: u32 = FLAG_PENDING_INSERT_FAILED
     | FLAG_PENDING_MISSING
     | FLAG_PENDING_POISONED
@@ -61,7 +65,9 @@ const KNOWN_FLAGS: u32 = FLAG_PENDING_INSERT_FAILED
     | FLAG_OBJECT_JOIN_AMBIGUOUS
     | FLAG_OBJECT_READ_FAILED
     | FLAG_OBJECT_DELETE_FAILED
-    | FLAG_OBJECT_PATH_UNAVAILABLE;
+    | FLAG_OBJECT_PATH_UNAVAILABLE
+    | FLAG_TASK_READ_FAILED
+    | FLAG_OBJECT_UNSUPPORTED;
 const CAPTURE_FLAGS: u32 = FLAG_PAYLOAD1_READ_FAILED
     | FLAG_PAYLOAD1_TRUNCATED
     | FLAG_PAYLOAD2_READ_FAILED
@@ -77,6 +83,8 @@ pub const FILE_PATH_NOT_REQUESTED: u8 = 0;
 pub const FILE_PATH_RESOLVED_AT_HOOK: u8 = 1;
 pub const FILE_PATH_TRUNCATED_AT_HOOK: u8 = 2;
 pub const FILE_PATH_UNAVAILABLE: u8 = 3;
+pub const SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT: u8 = 1;
+pub const SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelFileObject {
@@ -90,6 +98,21 @@ pub struct KernelFileObject {
     pub generation_valid: u8,
     pub path_quality: u8,
     pub path: [u8; KERNEL_FILE_PATH_BYTES],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSocketObject {
+    pub network_namespace_cookie: u64,
+    pub socket_cookie: u64,
+    pub address_family: u32,
+    pub socket_type: u32,
+    pub protocol: u32,
+    pub endpoint_address_family: u32,
+    pub endpoint_len: u16,
+    pub endpoint_role: u8,
+    pub endpoint_quality: u8,
+    pub endpoint: [u8; MAX_SOCKET_ENDPOINT_BYTES],
+    pub endpoint_authority: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,11 +132,13 @@ pub struct KernelEvent {
     pub return_value: i64,
     pub args: [u64; 6],
     pub comm: [u8; 16],
+    pub task_start_boottime_ns: u64,
     pub payload_lens: [u16; 2],
     pub payload_kinds: [u8; 2],
     pub payload_arg_indices: [u8; 2],
     pub payloads: [[u8; CAPTURE_BYTES]; 2],
     pub file_object: Option<KernelFileObject>,
+    pub socket_object: Option<KernelSocketObject>,
 }
 
 impl KernelEvent {
@@ -148,33 +173,72 @@ impl KernelEvent {
         let mut first = [0u8; CAPTURE_BYTES];
         let mut second = [0u8; CAPTURE_BYTES];
         if bytes.len() == KERNEL_EVENT_SIZE {
-            first.copy_from_slice(&bytes[152..248]);
-            second.copy_from_slice(&bytes[248..344]);
+            first.copy_from_slice(&bytes[160..256]);
+            second.copy_from_slice(&bytes[256..352]);
         }
-        let file_object = if bytes.len() == KERNEL_FILE_EVENT_SIZE {
-            if bytes[192..196] != [0; 4] || bytes[324..328] != [0; 4] {
+        let domain = endian.u16(&bytes[6..8]);
+        let operation = endian.u32(&bytes[8..12]);
+        let is_socket_frame = bytes.len() == KERNEL_SOCKET_EVENT_SIZE
+            && domain == EffectDomain::Network as u16
+            && matches!(
+                EffectOperation::from_raw(operation),
+                Some(
+                    EffectOperation::SocketConnect
+                        | EffectOperation::SocketBind
+                        | EffectOperation::SocketAccept
+                )
+            );
+        let file_object = if bytes.len() == KERNEL_FILE_EVENT_SIZE && !is_socket_frame {
+            if bytes[200..204] != [0; 4] || bytes[332..336] != [0; 4] {
                 bail!("kernel file-object event has a nonzero reserved field");
             }
-            let path_len = endian.u16(&bytes[188..190]);
+            let path_len = endian.u16(&bytes[196..198]);
             let retained = usize::from(path_len).min(KERNEL_FILE_PATH_BYTES);
-            if require_canonical_tail && bytes[196 + retained..324].iter().any(|byte| *byte != 0) {
+            if require_canonical_tail && bytes[204 + retained..332].iter().any(|byte| *byte != 0) {
                 bail!("kernel file-object WAL path has a nonzero unused tail");
             }
             // bpf_d_path is allowed to leave helper scratch bytes beyond its
             // returned length. Normalize those bytes before they enter the WAL.
             let mut path = [0u8; KERNEL_FILE_PATH_BYTES];
-            path[..retained].copy_from_slice(&bytes[196..196 + retained]);
+            path[..retained].copy_from_slice(&bytes[204..204 + retained]);
             Some(KernelFileObject {
-                mount_id_unique: endian.u64(&bytes[152..160]),
-                inode: endian.u64(&bytes[160..168]),
-                filesystem_magic: endian.u64(&bytes[168..176]),
-                device_major: endian.u32(&bytes[176..180]),
-                device_minor: endian.u32(&bytes[180..184]),
-                inode_generation: endian.u32(&bytes[184..188]),
+                mount_id_unique: endian.u64(&bytes[160..168]),
+                inode: endian.u64(&bytes[168..176]),
+                filesystem_magic: endian.u64(&bytes[176..184]),
+                device_major: endian.u32(&bytes[184..188]),
+                device_minor: endian.u32(&bytes[188..192]),
+                inode_generation: endian.u32(&bytes[192..196]),
                 path_len,
-                generation_valid: bytes[190],
-                path_quality: bytes[191],
+                generation_valid: bytes[198],
+                path_quality: bytes[199],
                 path,
+            })
+        } else {
+            None
+        };
+        let socket_object = if is_socket_frame {
+            if bytes[325..336].iter().any(|byte| *byte != 0) {
+                bail!("kernel socket-object event has a nonzero reserved field");
+            }
+            let endpoint_len = endian.u16(&bytes[192..194]);
+            let retained = usize::from(endpoint_len).min(MAX_SOCKET_ENDPOINT_BYTES);
+            if require_canonical_tail && bytes[196 + retained..324].iter().any(|byte| *byte != 0) {
+                bail!("kernel socket-object WAL endpoint has a nonzero unused tail");
+            }
+            let mut endpoint = [0u8; MAX_SOCKET_ENDPOINT_BYTES];
+            endpoint[..retained].copy_from_slice(&bytes[196..196 + retained]);
+            Some(KernelSocketObject {
+                network_namespace_cookie: endian.u64(&bytes[160..168]),
+                socket_cookie: endian.u64(&bytes[168..176]),
+                address_family: endian.u32(&bytes[176..180]),
+                socket_type: endian.u32(&bytes[180..184]),
+                protocol: endian.u32(&bytes[184..188]),
+                endpoint_address_family: endian.u32(&bytes[188..192]),
+                endpoint_len,
+                endpoint_role: bytes[194],
+                endpoint_quality: bytes[195],
+                endpoint,
+                endpoint_authority: bytes[324],
             })
         } else {
             None
@@ -195,11 +259,13 @@ impl KernelEvent {
             return_value: endian.i64(&bytes[72..80]),
             args,
             comm,
+            task_start_boottime_ns: endian.u64(&bytes[152..160]),
             payload_lens: [endian.u16(&bytes[144..146]), endian.u16(&bytes[146..148])],
             payload_kinds: [bytes[148], bytes[149]],
             payload_arg_indices: [bytes[150], bytes[151]],
             payloads: [first, second],
             file_object,
+            socket_object,
         };
         event.validate()?;
         if bytes.len() == KERNEL_EVENT_HEADER_SIZE {
@@ -213,7 +279,7 @@ impl KernelEvent {
     }
 
     pub fn encode_le(&self) -> Vec<u8> {
-        let size = if self.file_object.is_some() {
+        let size = if self.file_object.is_some() || self.socket_object.is_some() {
             KERNEL_FILE_EVENT_SIZE
         } else if self.payload_kinds == [PAYLOAD_NONE; 2] {
             KERNEL_EVENT_HEADER_SIZE
@@ -243,25 +309,38 @@ impl KernelEvent {
         bytes[146..148].copy_from_slice(&self.payload_lens[1].to_le_bytes());
         bytes[148..150].copy_from_slice(&self.payload_kinds);
         bytes[150..152].copy_from_slice(&self.payload_arg_indices);
+        bytes[152..160].copy_from_slice(&self.task_start_boottime_ns.to_le_bytes());
         if size == KERNEL_EVENT_SIZE {
-            bytes[152..248].copy_from_slice(&self.payloads[0]);
-            bytes[248..344].copy_from_slice(&self.payloads[1]);
+            bytes[160..256].copy_from_slice(&self.payloads[0]);
+            bytes[256..352].copy_from_slice(&self.payloads[1]);
         } else if let Some(object) = &self.file_object {
-            bytes[152..160].copy_from_slice(&object.mount_id_unique.to_le_bytes());
-            bytes[160..168].copy_from_slice(&object.inode.to_le_bytes());
-            bytes[168..176].copy_from_slice(&object.filesystem_magic.to_le_bytes());
-            bytes[176..180].copy_from_slice(&object.device_major.to_le_bytes());
-            bytes[180..184].copy_from_slice(&object.device_minor.to_le_bytes());
-            bytes[184..188].copy_from_slice(&object.inode_generation.to_le_bytes());
-            bytes[188..190].copy_from_slice(&object.path_len.to_le_bytes());
-            bytes[190] = object.generation_valid;
-            bytes[191] = object.path_quality;
-            bytes[196..324].copy_from_slice(&object.path);
+            bytes[160..168].copy_from_slice(&object.mount_id_unique.to_le_bytes());
+            bytes[168..176].copy_from_slice(&object.inode.to_le_bytes());
+            bytes[176..184].copy_from_slice(&object.filesystem_magic.to_le_bytes());
+            bytes[184..188].copy_from_slice(&object.device_major.to_le_bytes());
+            bytes[188..192].copy_from_slice(&object.device_minor.to_le_bytes());
+            bytes[192..196].copy_from_slice(&object.inode_generation.to_le_bytes());
+            bytes[196..198].copy_from_slice(&object.path_len.to_le_bytes());
+            bytes[198] = object.generation_valid;
+            bytes[199] = object.path_quality;
+            bytes[204..332].copy_from_slice(&object.path);
+        } else if let Some(object) = &self.socket_object {
+            bytes[160..168].copy_from_slice(&object.network_namespace_cookie.to_le_bytes());
+            bytes[168..176].copy_from_slice(&object.socket_cookie.to_le_bytes());
+            bytes[176..180].copy_from_slice(&object.address_family.to_le_bytes());
+            bytes[180..184].copy_from_slice(&object.socket_type.to_le_bytes());
+            bytes[184..188].copy_from_slice(&object.protocol.to_le_bytes());
+            bytes[188..192].copy_from_slice(&object.endpoint_address_family.to_le_bytes());
+            bytes[192..194].copy_from_slice(&object.endpoint_len.to_le_bytes());
+            bytes[194] = object.endpoint_role;
+            bytes[195] = object.endpoint_quality;
+            bytes[196..324].copy_from_slice(&object.endpoint);
+            bytes[324] = object.endpoint_authority;
         }
         bytes
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.schema_version != EFFECT_EVENT_SCHEMA_VERSION {
             bail!(
                 "system-effect event schema {} != userspace schema {}",
@@ -290,6 +369,9 @@ impl KernelEvent {
         if self.run_epoch == 0 || self.event_seq == 0 || self.cgroup_id == 0 || self.pid_tgid == 0 {
             bail!("system-effect event has a zero identity field");
         }
+        if (self.flags & FLAG_TASK_READ_FAILED == 0) != (self.task_start_boottime_ns != 0) {
+            bail!("system-effect task start identity and read-failure flag disagree");
+        }
         if self.kind == EVENT_OPERATION_ATTEMPT {
             if self.related_attempt_seq != 0 || self.return_value != 0 {
                 bail!("operation attempt has result-only fields");
@@ -303,7 +385,8 @@ impl KernelEvent {
                     | FLAG_OBJECT_JOIN_AMBIGUOUS
                     | FLAG_OBJECT_READ_FAILED
                     | FLAG_OBJECT_DELETE_FAILED
-                    | FLAG_OBJECT_PATH_UNAVAILABLE)
+                    | FLAG_OBJECT_PATH_UNAVAILABLE
+                    | FLAG_OBJECT_UNSUPPORTED)
                 != 0
             {
                 bail!("operation attempt has result-only correlation flags");
@@ -328,11 +411,15 @@ impl KernelEvent {
                 bail!("operation result has entry-only flags");
             }
         }
+        if self.file_object.is_some() && self.socket_object.is_some() {
+            bail!("system-effect result contains two incompatible object frame types");
+        }
         const OBJECT_FLAGS: u32 = FLAG_OBJECT_JOIN_MISSING
             | FLAG_OBJECT_JOIN_AMBIGUOUS
             | FLAG_OBJECT_READ_FAILED
             | FLAG_OBJECT_DELETE_FAILED
-            | FLAG_OBJECT_PATH_UNAVAILABLE;
+            | FLAG_OBJECT_PATH_UNAVAILABLE
+            | FLAG_OBJECT_UNSUPPORTED;
         let is_file_open_result = self.kind == EVENT_OPERATION_RESULT
             && self.domain == EffectDomain::Filesystem as u16
             && matches!(
@@ -342,7 +429,37 @@ impl KernelEvent {
         let is_file_write_result = self.kind == EVENT_OPERATION_RESULT
             && self.domain == EffectDomain::Io as u16
             && EffectOperation::from_raw(self.operation) == Some(EffectOperation::FdWrite);
-        if self.flags & OBJECT_FLAGS != 0 && !(is_file_open_result || is_file_write_result) {
+        let operation = EffectOperation::from_raw(self.operation).expect("validated operation");
+        let is_extended_file_result = self.kind == EVENT_OPERATION_RESULT
+            && matches!(
+                operation,
+                EffectOperation::DirectoryCreate
+                    | EffectOperation::SymlinkCreate
+                    | EffectOperation::DeviceNodeCreate
+                    | EffectOperation::HardLinkCreate
+                    | EffectOperation::FileUnlink
+                    | EffectOperation::DirectoryRemove
+                    | EffectOperation::PathEntryRemove
+                    | EffectOperation::FileRename
+                    | EffectOperation::PermissionsChange
+                    | EffectOperation::OwnershipChange
+                    | EffectOperation::ExtendedAttributeSet
+                    | EffectOperation::ExtendedAttributeRemove
+                    | EffectOperation::MemoryWriteChannel
+            );
+        let is_socket_result = self.kind == EVENT_OPERATION_RESULT
+            && matches!(
+                operation,
+                EffectOperation::SocketConnect
+                    | EffectOperation::SocketBind
+                    | EffectOperation::SocketAccept
+            );
+        if self.flags & OBJECT_FLAGS != 0
+            && !(is_file_open_result
+                || is_file_write_result
+                || is_extended_file_result
+                || is_socket_result)
+        {
             bail!("kernel object flags are present on an unsupported operation result");
         }
         if is_file_write_result && self.flags & FLAG_OBJECT_PATH_UNAVAILABLE != 0 {
@@ -367,7 +484,8 @@ impl KernelEvent {
         }
         if let Some(object) = &self.file_object {
             if !((is_file_open_result && self.return_value >= 0)
-                || (is_file_write_result && self.return_value > 0))
+                || (is_file_write_result && self.return_value > 0)
+                || (is_extended_file_result && self.return_value >= 0))
                 || self.flags
                     & (FLAG_PENDING_MISSING
                         | FLAG_PENDING_POISONED
@@ -380,7 +498,7 @@ impl KernelEvent {
             {
                 bail!("kernel file-object evidence is not an eligible successful open or positive-byte write result");
             }
-            object.validate()?;
+            object.validate(operation)?;
             if is_file_write_result && object.path_quality != FILE_PATH_NOT_REQUESTED {
                 bail!("file_permission write object unexpectedly claims a kernel path snapshot");
             }
@@ -392,10 +510,47 @@ impl KernelEvent {
             {
                 bail!("file_open object has a path quality not produced by the current hook");
             }
+            if is_extended_file_result && object.path_quality != FILE_PATH_NOT_REQUESTED {
+                bail!("extended file-object hook unexpectedly claims a path snapshot");
+            }
             if (object.path_quality == FILE_PATH_UNAVAILABLE)
                 != (self.flags & FLAG_OBJECT_PATH_UNAVAILABLE != 0)
             {
                 bail!("kernel file-object path quality and event flag disagree");
+            }
+        }
+        if let Some(object) = &self.socket_object {
+            if !is_socket_result
+                || self.flags
+                    & (FLAG_PENDING_MISSING
+                        | FLAG_PENDING_POISONED
+                        | FLAG_SYSCALL_MISMATCH
+                        | FLAG_OBJECT_JOIN_MISSING
+                        | FLAG_OBJECT_JOIN_AMBIGUOUS
+                        | FLAG_OBJECT_READ_FAILED
+                        | FLAG_OBJECT_DELETE_FAILED)
+                    != 0
+            {
+                bail!("kernel socket-object evidence is not an eligible socket result");
+            }
+            object.validate(operation)?;
+        }
+        if self.flags & FLAG_OBJECT_UNSUPPORTED != 0 {
+            if !((is_socket_result && self.return_value >= 0)
+                || operation == EffectOperation::MemoryWriteChannel)
+                || self.socket_object.is_some()
+                || self.file_object.is_some()
+            {
+                bail!("explicit unsupported-object flag is not an unresolved socket or memory-write-channel result");
+            }
+            if self.flags
+                & (FLAG_OBJECT_JOIN_MISSING
+                    | FLAG_OBJECT_JOIN_AMBIGUOUS
+                    | FLAG_OBJECT_READ_FAILED
+                    | FLAG_OBJECT_DELETE_FAILED)
+                != 0
+            {
+                bail!("unsupported-object flag is mixed with a resolver failure flag");
             }
         }
         let has_capture = self.payload_kinds != [PAYLOAD_NONE; 2];
@@ -467,6 +622,16 @@ impl KernelEvent {
         boot_id: &str,
         policy: EventPolicyIdentity,
     ) -> Result<SystemEffectEvent> {
+        self.to_schema_with_cgroup_match(run_id, boot_id, policy, CgroupMatchMode::ExactCurrent)
+    }
+
+    pub(crate) fn to_schema_with_cgroup_match(
+        &self,
+        run_id: &str,
+        boot_id: &str,
+        policy: EventPolicyIdentity,
+        cgroup_match_mode: CgroupMatchMode,
+    ) -> Result<SystemEffectEvent> {
         if self.domain != policy.domain as u16 || self.operation != policy.operation as u32 {
             bail!(
                 "event syscall {} identity {}/{} disagrees with frozen policy {}/{}",
@@ -505,7 +670,8 @@ impl KernelEvent {
             Vec::new()
         };
         let object_resolution = ObjectResolution::from_kernel_event(self, &captures, boot_id);
-        let attribution = EffectAttribution::from_kernel_event(self);
+        let attribution = EffectAttribution::from_kernel_event(self, cgroup_match_mode);
+        let process_identity = EffectProcessIdentity::from_kernel_event(self, boot_id);
         let event = SystemEffectEvent {
             schema_version: EFFECT_EVENT_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
@@ -522,6 +688,7 @@ impl KernelEvent {
             pid: self.pid_tgid as u32,
             tgid: (self.pid_tgid >> 32) as u32,
             comm: nul_terminated_lossy(&self.comm),
+            process_identity,
             raw_arguments: self.args,
             captures,
             object_resolution,
@@ -533,6 +700,7 @@ impl KernelEvent {
         };
         event.validate_object_resolution()?;
         event.validate_attribution()?;
+        event.validate_process_identity()?;
         Ok(event)
     }
 
@@ -594,8 +762,16 @@ impl KernelEvent {
 }
 
 impl KernelFileObject {
-    fn validate(&self) -> Result<()> {
-        if self.mount_id_unique == 0 || self.inode == 0 || self.filesystem_magic == 0 {
+    fn validate(&self, operation: EffectOperation) -> Result<()> {
+        let inode_only = matches!(
+            operation,
+            EffectOperation::ExtendedAttributeSet | EffectOperation::ExtendedAttributeRemove
+        );
+        if (!inode_only && self.mount_id_unique == 0)
+            || (inode_only && self.mount_id_unique != 0)
+            || self.inode == 0
+            || self.filesystem_magic == 0
+        {
             bail!("kernel file-object identity has a zero stable field");
         }
         if self.device_major >= 1 << 12 || self.device_minor >= 1 << 20 {
@@ -618,6 +794,52 @@ impl KernelFileObject {
         }
         if self.path[path_len..].iter().any(|byte| *byte != 0) {
             bail!("kernel file-object path has a nonzero unused tail");
+        }
+        Ok(())
+    }
+}
+
+impl KernelSocketObject {
+    fn validate(&self, operation: EffectOperation) -> Result<()> {
+        if self.network_namespace_cookie == 0
+            || self.socket_cookie == 0
+            || self.address_family == 0
+            || self.socket_type == 0
+            || !matches!(self.endpoint_role, 1 | 2)
+            || !matches!(self.endpoint_quality, 1 | 2)
+            || !matches!(
+                self.endpoint_authority,
+                SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT | SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE
+            )
+        {
+            bail!("kernel socket-object identity has an invalid stable field");
+        }
+        let length = usize::from(self.endpoint_len);
+        if !(2..=MAX_SOCKET_ENDPOINT_BYTES).contains(&length) {
+            bail!("kernel socket endpoint has an invalid bounded length");
+        }
+        if self.endpoint_quality == 2 && length != MAX_SOCKET_ENDPOINT_BYTES {
+            bail!("kernel socket endpoint truncation status is not canonical");
+        }
+        if self.endpoint[length..].iter().any(|byte| *byte != 0) {
+            bail!("kernel socket endpoint has a nonzero unused tail");
+        }
+        let copied_family = u16::from_ne_bytes(
+            self.endpoint[..2]
+                .try_into()
+                .expect("validated socket endpoint family bytes"),
+        );
+        if u32::from(copied_family) != self.endpoint_address_family {
+            bail!("kernel socket endpoint family disagrees with copied sockaddr bytes");
+        }
+        match operation {
+            EffectOperation::SocketConnect | EffectOperation::SocketBind
+                if self.endpoint_authority == SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT => {}
+            EffectOperation::SocketAccept
+                if self.endpoint_authority == SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE
+                    && self.endpoint_role == 2
+                    && self.endpoint_address_family == self.address_family => {}
+            _ => bail!("kernel socket endpoint authority overstates its producing hook"),
         }
         Ok(())
     }
@@ -817,10 +1039,12 @@ pub enum SocketEndpointQuality {
 pub enum SocketEndpointAuthority {
     None,
     KernelSocketState,
+    KernelCopiedSockaddrAtLsmHook,
 }
 
-/// Bounded endpoint bytes read from kernel socket state after resolution.
-/// Requested user sockaddr bytes never populate this type.
+/// Bounded sockaddr bytes copied from the BPF LSM hook argument before the
+/// operation. This is requested endpoint evidence, not post-bind/post-connect
+/// state; bind port zero therefore remains zero here.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum SocketEndpointAddress {
@@ -876,9 +1100,8 @@ pub struct SocketEndpointPair {
 
 /// A closed set of object identities understood by this protocol.
 ///
-/// The file variant is produced for opt-in BPF LSM `file_open` and
-/// `file_permission(MAY_WRITE)` paths. The socket variant remains reserved and
-/// cannot be derived from current WAL.
+/// The variants are produced by the corresponding opt-in file, path, inode,
+/// mmap and socket BPF LSM hooks and reconstructed from the binary WAL.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ObjectIdentity {
@@ -901,6 +1124,19 @@ pub enum ObjectIdentity {
         /// means the tuple does not rule out later inode reuse.
         path: FilePathObservation,
     },
+    /// Actual inode passed to an inode LSM hook when that hook has no mount.
+    /// This is deliberately weaker than FILE_OBJECT and cannot distinguish
+    /// bind mounts of the same device/inode.
+    InodeObject {
+        boot_id: String,
+        device_major: u32,
+        device_minor: u32,
+        inode: u64,
+        inode_generation: Option<u32>,
+        filesystem_magic: u64,
+        filesystem_class: FilesystemClass,
+        identity_scope: String,
+    },
     SocketObject {
         boot_id: String,
         network_namespace_cookie: u64,
@@ -908,8 +1144,9 @@ pub enum ObjectIdentity {
         address_family: u32,
         socket_type: u32,
         protocol: u32,
-        /// Point-in-time local/peer state. A user-supplied sockaddr is never
-        /// accepted here; it remains a USER_INPUT_ONLY capture.
+        endpoint_address_family: u32,
+        /// Pre-operation local/peer request copied from the kernel LSM
+        /// argument. A user-memory capture is never accepted as this evidence.
         endpoints: SocketEndpointPair,
     },
 }
@@ -956,7 +1193,7 @@ impl Default for ObjectResolution {
 }
 
 impl ObjectResolution {
-    fn from_kernel_event(
+    pub fn from_kernel_event(
         event: &KernelEvent,
         captures: &[CapturedArgument],
         boot_id: &str,
@@ -983,10 +1220,31 @@ impl ObjectResolution {
                 }
                 _ => unreachable!("validated kernel file path quality"),
             };
-            vec![ObjectReference {
-                slot: 0,
-                role: ObjectRole::Primary,
-                identity: ObjectIdentity::FileObject {
+            let role = match EffectOperation::from_raw(event.operation) {
+                Some(
+                    EffectOperation::DirectoryCreate
+                    | EffectOperation::SymlinkCreate
+                    | EffectOperation::DeviceNodeCreate,
+                ) => ObjectRole::Parent,
+                Some(EffectOperation::FileRename | EffectOperation::HardLinkCreate) => {
+                    ObjectRole::Source
+                }
+                _ => ObjectRole::Primary,
+            };
+            let identity = if object.mount_id_unique == 0 {
+                ObjectIdentity::InodeObject {
+                    boot_id: boot_id.to_owned(),
+                    device_major: object.device_major,
+                    device_minor: object.device_minor,
+                    inode: object.inode,
+                    inode_generation: (object.generation_valid == 1)
+                        .then_some(object.inode_generation),
+                    filesystem_magic: object.filesystem_magic,
+                    filesystem_class: filesystem_class(object.filesystem_magic),
+                    identity_scope: "DEVICE_INODE_GENERATION_WITHOUT_MOUNT".to_owned(),
+                }
+            } else {
+                ObjectIdentity::FileObject {
                     boot_id: boot_id.to_owned(),
                     mount_id_unique: object.mount_id_unique,
                     device_major: object.device_major,
@@ -997,6 +1255,48 @@ impl ObjectResolution {
                     filesystem_magic: object.filesystem_magic,
                     filesystem_class: filesystem_class(object.filesystem_magic),
                     path,
+                }
+            };
+            vec![ObjectReference {
+                slot: 0,
+                role,
+                identity,
+            }]
+        } else if let Some(object) = &event.socket_object {
+            let bytes = &object.endpoint[..usize::from(object.endpoint_len)];
+            let endpoint = SocketEndpointObservation {
+                quality: if object.endpoint_quality == 1 {
+                    SocketEndpointQuality::KernelResolved
+                } else {
+                    SocketEndpointQuality::KernelResolvedTruncated
+                },
+                authority: if object.endpoint_authority == SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE {
+                    SocketEndpointAuthority::KernelSocketState
+                } else {
+                    SocketEndpointAuthority::KernelCopiedSockaddrAtLsmHook
+                },
+                address: Some(kernel_sockaddr(bytes, object.endpoint_address_family)),
+            };
+            let mut endpoints = SocketEndpointPair::default();
+            let role = if object.endpoint_role == 1 {
+                endpoints.local = endpoint;
+                ObjectRole::Primary
+            } else {
+                endpoints.peer = endpoint;
+                ObjectRole::Peer
+            };
+            vec![ObjectReference {
+                slot: 0,
+                role,
+                identity: ObjectIdentity::SocketObject {
+                    boot_id: boot_id.to_owned(),
+                    network_namespace_cookie: object.network_namespace_cookie,
+                    socket_cookie: object.socket_cookie,
+                    address_family: object.address_family,
+                    socket_type: object.socket_type,
+                    protocol: object.protocol,
+                    endpoint_address_family: object.endpoint_address_family,
+                    endpoints,
                 },
             }]
         } else if event.kind == EVENT_OPERATION_ATTEMPT {
@@ -1022,7 +1322,7 @@ impl ObjectResolution {
         } else {
             Vec::new()
         };
-        let (quality, authority) = if event.file_object.is_some() {
+        let (quality, authority) = if event.file_object.is_some() || event.socket_object.is_some() {
             (
                 ObjectResolutionQuality::KernelResolved,
                 ObjectResolutionAuthority::KernelObjectHook,
@@ -1171,6 +1471,17 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
                     EffectOperation::FileCreateOrTruncate
                         | EffectOperation::FileOpenRequest
                         | EffectOperation::FdWrite
+                        | EffectOperation::DirectoryCreate
+                        | EffectOperation::SymlinkCreate
+                        | EffectOperation::DeviceNodeCreate
+                        | EffectOperation::HardLinkCreate
+                        | EffectOperation::FileUnlink
+                        | EffectOperation::DirectoryRemove
+                        | EffectOperation::PathEntryRemove
+                        | EffectOperation::FileRename
+                        | EffectOperation::PermissionsChange
+                        | EffectOperation::OwnershipChange
+                        | EffectOperation::MemoryWriteChannel
                 )
             {
                 bail!("invalid FILE_OBJECT identity");
@@ -1190,6 +1501,39 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
                 }
                 _ => {}
             }
+            let expected_role = match event.operation {
+                EffectOperation::DirectoryCreate
+                | EffectOperation::SymlinkCreate
+                | EffectOperation::DeviceNodeCreate => ObjectRole::Parent,
+                EffectOperation::FileRename | EffectOperation::HardLinkCreate => ObjectRole::Source,
+                _ => ObjectRole::Primary,
+            };
+            if object.role != expected_role {
+                bail!("FILE_OBJECT role overstates the object supplied by its hook");
+            }
+        }
+        ObjectIdentity::InodeObject {
+            boot_id,
+            inode,
+            filesystem_magic,
+            filesystem_class,
+            identity_scope,
+            ..
+        } => {
+            if invalid_boot_id(boot_id)
+                || *inode == 0
+                || *filesystem_magic == 0
+                || !filesystem_class_matches(*filesystem_class, *filesystem_magic)
+                || identity_scope != "DEVICE_INODE_GENERATION_WITHOUT_MOUNT"
+                || object.role != ObjectRole::Primary
+                || !matches!(
+                    event.operation,
+                    EffectOperation::ExtendedAttributeSet
+                        | EffectOperation::ExtendedAttributeRemove
+                )
+            {
+                bail!("invalid mountless INODE_OBJECT identity");
+            }
         }
         ObjectIdentity::SocketObject {
             boot_id,
@@ -1197,6 +1541,7 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
             socket_cookie,
             address_family,
             socket_type,
+            endpoint_address_family,
             endpoints,
             ..
         } => {
@@ -1205,11 +1550,16 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
                 || *socket_cookie == 0
                 || *address_family == 0
                 || *socket_type == 0
-                || object.role == ObjectRole::SyscallArgument
+                || !matches!(
+                    (event.operation, object.role),
+                    (EffectOperation::SocketConnect, ObjectRole::Peer)
+                        | (EffectOperation::SocketBind, ObjectRole::Primary)
+                        | (EffectOperation::SocketAccept, ObjectRole::Peer)
+                )
             {
                 bail!("invalid SOCKET_OBJECT identity");
             }
-            validate_socket_endpoints(endpoints, *address_family)?;
+            validate_socket_endpoints(endpoints, *endpoint_address_family)?;
         }
     }
     Ok(())
@@ -1293,7 +1643,8 @@ fn validate_socket_endpoint(endpoint: &SocketEndpointObservation, family: u32) -
         ) => return Ok(()),
         (
             SocketEndpointQuality::KernelResolved | SocketEndpointQuality::KernelResolvedTruncated,
-            SocketEndpointAuthority::KernelSocketState,
+            SocketEndpointAuthority::KernelSocketState
+            | SocketEndpointAuthority::KernelCopiedSockaddrAtLsmHook,
             true,
         ) => {}
         _ => bail!("socket endpoint quality, authority, and payload disagree"),
@@ -1362,6 +1713,44 @@ fn validate_socket_endpoint(endpoint: &SocketEndpointObservation, family: u32) -
     Ok(())
 }
 
+fn kernel_sockaddr(bytes: &[u8], family: u32) -> SocketEndpointAddress {
+    if family == libc::AF_INET as u32 && bytes.len() >= 8 {
+        return SocketEndpointAddress::Inet4 {
+            port: u16::from_be_bytes([bytes[2], bytes[3]]),
+            address: bytes[4..8].try_into().expect("fixed IPv4 slice"),
+        };
+    }
+    if family == libc::AF_INET6 as u32 && bytes.len() >= 28 {
+        return SocketEndpointAddress::Inet6 {
+            port: u16::from_be_bytes([bytes[2], bytes[3]]),
+            flowinfo: u32::from_be_bytes(bytes[4..8].try_into().expect("fixed flowinfo slice")),
+            address: bytes[8..24].try_into().expect("fixed IPv6 slice"),
+            scope_id: u32::from_ne_bytes(bytes[24..28].try_into().expect("fixed scope slice")),
+        };
+    }
+    if family == libc::AF_UNIX as u32 {
+        let raw_name = bytes.get(2..).unwrap_or_default();
+        let abstract_namespace = raw_name.first() == Some(&0);
+        let name = if abstract_namespace {
+            raw_name
+        } else {
+            &raw_name[..raw_name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(raw_name.len())]
+        };
+        return SocketEndpointAddress::Unix {
+            name_hex: hex(name),
+            abstract_namespace,
+            unnamed: name.is_empty(),
+        };
+    }
+    SocketEndpointAddress::Other {
+        address_family: family,
+        raw_hex: hex(bytes),
+    }
+}
+
 fn decode_canonical_hex(value: &str, maximum_bytes: usize, allow_empty: bool) -> Result<Vec<u8>> {
     if value.len() % 2 != 0
         || value.len() > maximum_bytes.saturating_mul(2)
@@ -1403,6 +1792,106 @@ pub struct CapturedArgument {
     pub authority: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EffectProcessIdentityAuthority {
+    None,
+    KernelTaskStartBoottimeAtSyscallEntry,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectProcessIdentity {
+    pub boot_id: String,
+    pub run_epoch: u64,
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub start_boottime_ns: Option<u64>,
+    pub authority: EffectProcessIdentityAuthority,
+    pub stable_key: Option<String>,
+}
+
+impl Default for EffectProcessIdentity {
+    fn default() -> Self {
+        Self {
+            boot_id: String::new(),
+            run_epoch: 0,
+            cgroup_id: 0,
+            pid: 0,
+            tgid: 0,
+            start_boottime_ns: None,
+            authority: EffectProcessIdentityAuthority::None,
+            stable_key: None,
+        }
+    }
+}
+
+impl EffectProcessIdentity {
+    fn from_kernel_event(event: &KernelEvent, boot_id: &str) -> Self {
+        let pid = event.pid_tgid as u32;
+        let tgid = (event.pid_tgid >> 32) as u32;
+        let resolved = event.flags & FLAG_TASK_READ_FAILED == 0;
+        let start = resolved.then_some(event.task_start_boottime_ns);
+        Self {
+            boot_id: boot_id.to_owned(),
+            run_epoch: event.run_epoch,
+            cgroup_id: event.cgroup_id,
+            pid,
+            tgid,
+            start_boottime_ns: start,
+            authority: if resolved {
+                EffectProcessIdentityAuthority::KernelTaskStartBoottimeAtSyscallEntry
+            } else {
+                EffectProcessIdentityAuthority::None
+            },
+            stable_key: start.map(|start| {
+                format!(
+                    "{boot_id}/cgroup:{}/epoch:{}/tgid:{tgid}/pid:{pid}/start:{start}",
+                    event.cgroup_id, event.run_epoch
+                )
+            }),
+        }
+    }
+
+    fn validate_for_event(&self, event: &SystemEffectEvent) -> Result<()> {
+        let resolved = event.flags & FLAG_TASK_READ_FAILED == 0;
+        let expected_start = if resolved {
+            Some(
+                self.start_boottime_ns
+                    .context("resolved process identity has no task start time")?,
+            )
+        } else {
+            None
+        };
+        let expected_key = expected_start.map(|start| {
+            format!(
+                "{}/cgroup:{}/epoch:{}/tgid:{}/pid:{}/start:{start}",
+                self.boot_id, event.cgroup_id, event.run_epoch, event.tgid, event.pid
+            )
+        });
+        if invalid_boot_id(&self.boot_id)
+            || self.run_epoch != event.run_epoch
+            || self.cgroup_id != event.cgroup_id
+            || self.pid != event.pid
+            || self.tgid != event.tgid
+            || self.pid == 0
+            || self.tgid == 0
+            || self.start_boottime_ns != expected_start
+            || self.stable_key != expected_key
+            || self.authority
+                != if resolved {
+                    EffectProcessIdentityAuthority::KernelTaskStartBoottimeAtSyscallEntry
+                } else {
+                    EffectProcessIdentityAuthority::None
+                }
+        {
+            bail!("system-effect process identity is not derived from the raw event");
+        }
+        Ok(())
+    }
+}
+
 /// Attribution mode supported by the current raw-syscall recorder.
 ///
 /// `DIRECT` means only that the syscall caller was a member of the registered
@@ -1414,10 +1903,20 @@ pub enum EffectAttributionMode {
     Direct,
 }
 
+/// Meaning of the kernel frame's `cgroup_id` field.  The ancestor form binds
+/// the matched, FD-pinned scope root; the leaf cgroup is not present in ABI v1.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CgroupMatchMode {
+    ExactCurrent,
+    AncestorRoot,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EffectAttributionAuthority {
     KernelCurrentCgroupIdAtSyscallEntry,
+    KernelCurrentTaskUnderCgroupAtSyscallEntry,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1448,6 +1947,7 @@ pub enum EffectCausalStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DirectAttributionClaim {
     SelectedNativeSyscallCallerInExactCgroupAtEntry,
+    SelectedNativeSyscallCallerWithinBoundCgroupV2RootAtEntry,
 }
 
 /// Run-wide closed interpretation contract for every v1 attribution record.
@@ -1478,8 +1978,29 @@ impl AttributionContract {
         }
     }
 
+    pub const fn ancestor_root_v2() -> Self {
+        Self {
+            protocol_version: EFFECT_ATTRIBUTION_PROTOCOL_VERSION,
+            direct_claim:
+                DirectAttributionClaim::SelectedNativeSyscallCallerWithinBoundCgroupV2RootAtEntry,
+            mode: EffectAttributionMode::Direct,
+            authority: EffectAttributionAuthority::KernelCurrentTaskUnderCgroupAtSyscallEntry,
+            subject: EffectAttributionSubject::RunExecutionDomain,
+            component: EffectAttributionComponent::UnclassifiedCgroupMember,
+            delegated_effects: DelegatedEffectsStatus::NotObserved,
+            causal_status: EffectCausalStatus::CausalNotEstablished,
+        }
+    }
+
+    pub const fn for_cgroup_match(mode: CgroupMatchMode) -> Self {
+        match mode {
+            CgroupMatchMode::ExactCurrent => Self::direct_v1(),
+            CgroupMatchMode::AncestorRoot => Self::ancestor_root_v2(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if *self != Self::direct_v1() {
+        if *self != Self::direct_v1() && *self != Self::ancestor_root_v2() {
             bail!("system-effect attribution contract is unsupported or overstates authority");
         }
         Ok(())
@@ -1497,6 +2018,9 @@ pub struct EffectAttribution {
     pub component: EffectAttributionComponent,
     pub delegated_effects: DelegatedEffectsStatus,
     pub causal_status: EffectCausalStatus,
+    pub cgroup_match_mode: CgroupMatchMode,
+    pub matched_scope_cgroup_id: u64,
+    pub leaf_cgroup_id_retained: bool,
     pub cgroup_id_at_syscall_entry: u64,
     pub source_event_seq: u64,
     pub operation_attempt_seq: u64,
@@ -1514,6 +2038,9 @@ impl Default for EffectAttribution {
             component: EffectAttributionComponent::UnclassifiedCgroupMember,
             delegated_effects: DelegatedEffectsStatus::NotObserved,
             causal_status: EffectCausalStatus::CausalNotEstablished,
+            cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+            matched_scope_cgroup_id: 0,
+            leaf_cgroup_id_retained: false,
             cgroup_id_at_syscall_entry: 0,
             source_event_seq: 0,
             operation_attempt_seq: 0,
@@ -1522,44 +2049,53 @@ impl Default for EffectAttribution {
 }
 
 impl EffectAttribution {
-    pub fn from_kernel_event(event: &KernelEvent) -> Self {
+    pub fn from_kernel_event(event: &KernelEvent, cgroup_match_mode: CgroupMatchMode) -> Self {
         let operation_attempt_seq = if event.kind == EVENT_OPERATION_ATTEMPT {
             event.event_seq
         } else {
             event.related_attempt_seq
         };
+        let exact = cgroup_match_mode == CgroupMatchMode::ExactCurrent;
+        let contract = AttributionContract::for_cgroup_match(cgroup_match_mode);
         Self {
             protocol_version: EFFECT_ATTRIBUTION_PROTOCOL_VERSION,
-            mode: EffectAttributionMode::Direct,
-            authority: EffectAttributionAuthority::KernelCurrentCgroupIdAtSyscallEntry,
-            subject: EffectAttributionSubject::RunExecutionDomain,
-            component: EffectAttributionComponent::UnclassifiedCgroupMember,
-            delegated_effects: DelegatedEffectsStatus::NotObserved,
-            causal_status: EffectCausalStatus::CausalNotEstablished,
-            cgroup_id_at_syscall_entry: event.cgroup_id,
+            mode: contract.mode,
+            authority: contract.authority,
+            subject: contract.subject,
+            component: contract.component,
+            delegated_effects: contract.delegated_effects,
+            causal_status: contract.causal_status,
+            cgroup_match_mode,
+            matched_scope_cgroup_id: event.cgroup_id,
+            leaf_cgroup_id_retained: exact,
+            cgroup_id_at_syscall_entry: if exact { event.cgroup_id } else { 0 },
             source_event_seq: event.event_seq,
             operation_attempt_seq,
         }
     }
 
     fn validate_for_event(&self, event: &SystemEffectEvent) -> Result<()> {
-        AttributionContract {
-            protocol_version: self.protocol_version,
-            direct_claim: DirectAttributionClaim::SelectedNativeSyscallCallerInExactCgroupAtEntry,
-            mode: self.mode,
-            authority: self.authority,
-            subject: self.subject,
-            component: self.component,
-            delegated_effects: self.delegated_effects,
-            causal_status: self.causal_status,
+        let expected_contract = AttributionContract::for_cgroup_match(self.cgroup_match_mode);
+        if self.protocol_version != expected_contract.protocol_version
+            || self.mode != expected_contract.mode
+            || self.authority != expected_contract.authority
+            || self.subject != expected_contract.subject
+            || self.component != expected_contract.component
+            || self.delegated_effects != expected_contract.delegated_effects
+            || self.causal_status != expected_contract.causal_status
+        {
+            bail!("system-effect attribution contract disagrees with cgroup match mode");
         }
-        .validate()?;
         let expected_attempt_seq = match event.kind {
             EventKind::OperationAttempt => event.event_seq,
             EventKind::OperationResult => event.related_attempt_seq,
         };
-        if self.cgroup_id_at_syscall_entry != event.cgroup_id
-            || self.cgroup_id_at_syscall_entry == 0
+        let exact = self.cgroup_match_mode == CgroupMatchMode::ExactCurrent;
+        if self.matched_scope_cgroup_id != event.cgroup_id
+            || self.matched_scope_cgroup_id == 0
+            || self.leaf_cgroup_id_retained != exact
+            || (exact && self.cgroup_id_at_syscall_entry != event.cgroup_id)
+            || (!exact && self.cgroup_id_at_syscall_entry != 0)
             || self.source_event_seq != event.event_seq
             || self.source_event_seq == 0
             || self.operation_attempt_seq != expected_attempt_seq
@@ -1594,6 +2130,8 @@ pub struct SystemEffectEvent {
     pub pid: u32,
     pub tgid: u32,
     pub comm: String,
+    #[serde(default)]
+    pub process_identity: EffectProcessIdentity,
     pub raw_arguments: [u64; 6],
     pub captures: Vec<CapturedArgument>,
     #[serde(default)]
@@ -1613,6 +2151,10 @@ impl SystemEffectEvent {
 
     pub fn validate_attribution(&self) -> Result<()> {
         self.attribution.validate_for_event(self)
+    }
+
+    pub fn validate_process_identity(&self) -> Result<()> {
+        self.process_identity.validate_for_event(self)
     }
 }
 
@@ -1689,11 +2231,13 @@ mod tests {
                 comm[..5].copy_from_slice(b"agent");
                 comm
             },
+            task_start_boottime_ns: 77,
             payload_lens: [9, 9],
             payload_kinds: [PAYLOAD_USER_STRING, PAYLOAD_USER_STRING],
             payload_arg_indices: [1, 3],
             payloads: [payload, payload],
             file_object: None,
+            socket_object: None,
         }
     }
 
@@ -1740,6 +2284,16 @@ mod tests {
         object.path_len = 0;
         object.path_quality = FILE_PATH_NOT_REQUESTED;
         object.path = [0; KERNEL_FILE_PATH_BYTES];
+        event
+    }
+
+    fn hard_link_result(syscall_nr: i32) -> KernelEvent {
+        let mut event = file_write_result();
+        event.domain = EffectDomain::Filesystem as u16;
+        event.operation = EffectOperation::HardLinkCreate as u32;
+        event.syscall_nr = syscall_nr;
+        event.return_value = 0;
+        event.args = [0x1000, 0x2000, 0, 0, 0, 0];
         event
     }
 
@@ -1851,6 +2405,34 @@ mod tests {
     }
 
     #[test]
+    fn hard_link_file_frame_round_trips_and_projects_only_the_source() {
+        let policies =
+            crate::policy::event_policy_identities(crate::policy::PolicyProfile::Control).unwrap();
+        for syscall_nr in [libc::SYS_link as i32, libc::SYS_linkat as i32] {
+            let raw = hard_link_result(syscall_nr);
+            let encoded = raw.encode_le();
+            assert_eq!(encoded.len(), KERNEL_FILE_EVENT_SIZE);
+            assert_eq!(KernelEvent::decode_le(&encoded).unwrap(), raw);
+
+            let event = raw
+                .to_schema("run", BOOT_ID, policies[&syscall_nr])
+                .unwrap();
+            assert_eq!(event.operation, EffectOperation::HardLinkCreate);
+            assert_eq!(
+                event.object_resolution.quality,
+                ObjectResolutionQuality::KernelResolved
+            );
+            assert_eq!(event.object_resolution.objects.len(), 1);
+            assert_eq!(event.object_resolution.objects[0].role, ObjectRole::Source);
+            assert!(matches!(
+                event.object_resolution.objects[0].identity,
+                ObjectIdentity::FileObject { .. }
+            ));
+            event.validate_object_resolution().unwrap();
+        }
+    }
+
+    #[test]
     fn raw_hook_path_contract_is_operation_specific() {
         let write = file_write_result();
         write.validate().expect("canonical file_permission result");
@@ -1921,7 +2503,7 @@ mod tests {
         let raw = file_open_result();
         let mut encoded = raw.encode_le();
         let path_len = usize::from(raw.file_object.as_ref().unwrap().path_len);
-        encoded[196 + path_len] = 0xaa;
+        encoded[204 + path_len] = 0xaa;
         let error = KernelEvent::decode_le(&encoded).unwrap_err().to_string();
         assert!(error.contains("nonzero unused tail"));
 
@@ -2068,7 +2650,7 @@ mod tests {
         event.object_resolution.authority = ObjectResolutionAuthority::KernelObjectHook;
         event.object_resolution.objects = vec![ObjectReference {
             slot: 0,
-            role: ObjectRole::Primary,
+            role: ObjectRole::Peer,
             identity: ObjectIdentity::FileObject {
                 boot_id: "00000000-0000-0000-0000-000000000001".to_owned(),
                 mount_id_unique: 1,
@@ -2093,6 +2675,7 @@ mod tests {
                 address_family: libc::AF_INET as u32,
                 socket_type: libc::SOCK_STREAM as u32,
                 protocol: 0,
+                endpoint_address_family: libc::AF_INET as u32,
                 endpoints: SocketEndpointPair::default(),
             },
         }];
@@ -2148,6 +2731,9 @@ mod tests {
         let mut raw = fixture();
         raw.kind = EVENT_OPERATION_RESULT;
         raw.flags = 0;
+        raw.domain = EffectDomain::Network as u16;
+        raw.operation = EffectOperation::SocketConnect as u32;
+        raw.syscall_nr = libc::SYS_connect as i32;
         raw.event_seq = 12;
         raw.related_attempt_seq = 11;
         raw.payload_lens = [0; 2];
@@ -2155,13 +2741,13 @@ mod tests {
         raw.payload_arg_indices = [0; 2];
         raw.payloads = [[0; CAPTURE_BYTES]; 2];
         let mut event = raw
-            .to_schema("run", BOOT_ID, policies[&(libc::SYS_renameat2 as i32)])
+            .to_schema("run", BOOT_ID, policies[&(libc::SYS_connect as i32)])
             .unwrap();
         event.object_resolution.quality = ObjectResolutionQuality::KernelResolved;
         event.object_resolution.authority = ObjectResolutionAuthority::KernelObjectHook;
         event.object_resolution.objects = vec![ObjectReference {
             slot: 0,
-            role: ObjectRole::Primary,
+            role: ObjectRole::Peer,
             identity: ObjectIdentity::SocketObject {
                 boot_id: "00000000-0000-0000-0000-000000000001".to_owned(),
                 network_namespace_cookie: 1,
@@ -2169,8 +2755,10 @@ mod tests {
                 address_family: libc::AF_INET as u32,
                 socket_type: libc::SOCK_STREAM as u32,
                 protocol: libc::IPPROTO_TCP as u32,
+                endpoint_address_family: libc::AF_INET as u32,
                 endpoints: SocketEndpointPair {
-                    local: SocketEndpointObservation {
+                    local: SocketEndpointObservation::default(),
+                    peer: SocketEndpointObservation {
                         quality: SocketEndpointQuality::KernelResolved,
                         authority: SocketEndpointAuthority::KernelSocketState,
                         address: Some(SocketEndpointAddress::Inet4 {
@@ -2178,7 +2766,6 @@ mod tests {
                             port: 12345,
                         }),
                     },
-                    peer: SocketEndpointObservation::default(),
                 },
             },
         }];
@@ -2187,9 +2774,147 @@ mod tests {
         if let ObjectIdentity::SocketObject { endpoints, .. } =
             &mut event.object_resolution.objects[0].identity
         {
-            endpoints.local.authority = SocketEndpointAuthority::None;
+            endpoints.peer.authority = SocketEndpointAuthority::None;
         }
         assert!(event.validate_object_resolution().is_err());
+    }
+
+    #[test]
+    fn socket_and_sockaddr_families_are_not_conflated_for_unspec_disconnect() {
+        let policies =
+            crate::policy::event_policy_identities(crate::policy::PolicyProfile::Balanced).unwrap();
+        let mut raw = fixture();
+        raw.kind = EVENT_OPERATION_RESULT;
+        raw.flags = 0;
+        raw.domain = EffectDomain::Network as u16;
+        raw.operation = EffectOperation::SocketConnect as u32;
+        raw.syscall_nr = libc::SYS_connect as i32;
+        raw.event_seq = 12;
+        raw.related_attempt_seq = 11;
+        raw.payload_lens = [0; 2];
+        raw.payload_kinds = [PAYLOAD_NONE; 2];
+        raw.payload_arg_indices = [0; 2];
+        raw.payloads = [[0; CAPTURE_BYTES]; 2];
+        raw.socket_object = Some(KernelSocketObject {
+            network_namespace_cookie: 1,
+            socket_cookie: 2,
+            address_family: libc::AF_INET as u32,
+            socket_type: libc::SOCK_DGRAM as u32,
+            protocol: libc::IPPROTO_UDP as u32,
+            endpoint_address_family: libc::AF_UNSPEC as u32,
+            endpoint_len: 2,
+            endpoint_role: 2,
+            endpoint_quality: 1,
+            endpoint: [0; MAX_SOCKET_ENDPOINT_BYTES],
+            endpoint_authority: SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT,
+        });
+        let encoded = raw.encode_le();
+        let decoded = KernelEvent::decode_le(&encoded).unwrap();
+        let event = decoded
+            .to_schema("run", BOOT_ID, policies[&(libc::SYS_connect as i32)])
+            .unwrap();
+        let ObjectIdentity::SocketObject {
+            address_family,
+            endpoint_address_family,
+            endpoints,
+            ..
+        } = &event.object_resolution.objects[0].identity
+        else {
+            panic!("expected socket object");
+        };
+        assert_eq!(*address_family, libc::AF_INET as u32);
+        assert_eq!(*endpoint_address_family, libc::AF_UNSPEC as u32);
+        assert!(matches!(
+            endpoints.peer.address,
+            Some(SocketEndpointAddress::Other {
+                address_family: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accepted_tcp_peer_round_trips_as_post_accept_kernel_state() {
+        let policies =
+            crate::policy::event_policy_identities(crate::policy::PolicyProfile::Control).unwrap();
+        let mut raw = fixture();
+        raw.kind = EVENT_OPERATION_RESULT;
+        raw.flags = 0;
+        raw.domain = EffectDomain::Network as u16;
+        raw.operation = EffectOperation::SocketAccept as u32;
+        raw.syscall_nr = libc::SYS_accept4 as i32;
+        raw.event_seq = 12;
+        raw.related_attempt_seq = 11;
+        raw.return_value = 7;
+        raw.payload_lens = [0; 2];
+        raw.payload_kinds = [PAYLOAD_NONE; 2];
+        raw.payload_arg_indices = [0; 2];
+        raw.payloads = [[0; CAPTURE_BYTES]; 2];
+        let mut endpoint = [0; MAX_SOCKET_ENDPOINT_BYTES];
+        endpoint[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        endpoint[2..4].copy_from_slice(&443u16.to_be_bytes());
+        endpoint[4..8].copy_from_slice(&[192, 0, 2, 9]);
+        raw.socket_object = Some(KernelSocketObject {
+            network_namespace_cookie: 1,
+            socket_cookie: 2,
+            address_family: libc::AF_INET as u32,
+            socket_type: libc::SOCK_STREAM as u32,
+            protocol: libc::IPPROTO_TCP as u32,
+            endpoint_address_family: libc::AF_INET as u32,
+            endpoint_len: 16,
+            endpoint_role: 2,
+            endpoint_quality: 1,
+            endpoint,
+            endpoint_authority: SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE,
+        });
+        let decoded = KernelEvent::decode_le(&raw.encode_le()).unwrap();
+        let projected = decoded
+            .to_schema("run", BOOT_ID, policies[&(libc::SYS_accept4 as i32)])
+            .unwrap();
+        assert_eq!(
+            projected.object_resolution.quality,
+            ObjectResolutionQuality::KernelResolved
+        );
+        assert_eq!(
+            projected.object_resolution.objects[0].role,
+            ObjectRole::Peer
+        );
+        let ObjectIdentity::SocketObject { endpoints, .. } =
+            &projected.object_resolution.objects[0].identity
+        else {
+            panic!("expected accepted socket identity");
+        };
+        assert_eq!(
+            endpoints.peer.authority,
+            SocketEndpointAuthority::KernelSocketState
+        );
+        assert_eq!(
+            endpoints.peer.address,
+            Some(SocketEndpointAddress::Inet4 {
+                address: [192, 0, 2, 9],
+                port: 443,
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_successful_accept_is_explicitly_unresolved() {
+        let mut raw = fixture();
+        raw.kind = EVENT_OPERATION_RESULT;
+        raw.flags = FLAG_OBJECT_UNSUPPORTED;
+        raw.domain = EffectDomain::Network as u16;
+        raw.operation = EffectOperation::SocketAccept as u32;
+        raw.syscall_nr = libc::SYS_accept as i32;
+        raw.event_seq = 12;
+        raw.related_attempt_seq = 11;
+        raw.return_value = 7;
+        raw.payload_lens = [0; 2];
+        raw.payload_kinds = [PAYLOAD_NONE; 2];
+        raw.payload_arg_indices = [0; 2];
+        raw.payloads = [[0; CAPTURE_BYTES]; 2];
+        assert!(KernelEvent::decode_le(&raw.encode_le()).is_ok());
+        raw.return_value = -libc::EAGAIN as i64;
+        assert!(KernelEvent::decode_le(&raw.encode_le()).is_err());
     }
 
     #[test]

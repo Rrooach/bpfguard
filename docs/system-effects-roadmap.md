@@ -1,241 +1,207 @@
 # Linux-first system-effects roadmap
 
-This document separates the shipped Linux-first standalone baseline from
-planned work. An unchecked item, a protocol type with no runtime integration,
-or a future adapter does not expand the claims made by current manifests or
-verifiers.
+This document distinguishes shipped, independently verifiable mechanisms from
+remaining research gaps. A schema variant, discovered process, or successful
+endpoint read does not enlarge the claim beyond the exact contract below.
 
-## Current standalone baseline
+## Shipped standalone lifecycle
 
-- `observe-effects` records selected native syscall attempts/results from one
-  exact cgroup. The stream is operation history, not a state diff.
-- Kernel object resolution is limited to successful selected file opens with
-  exactly one `file_open` join and, in
-  `kernel-file-open-write-partial`, positive-byte selected native write-family
-  results with the required `file_permission` join. Missing required joins,
-  `O_PATH`, and duplicate stacked-filesystem open hooks fail evidence closed.
-  No general VFS, socket, or delegated-service resolver exists.
-- Optional BPF-object and bounded generic filesystem path-tree confirmers
-  capture S0/S1 and report independent entries in `state_domains`. Their
-  captures are sequential and there is no aggregate whole-system verdict.
-- The delegation module supplies a bounded ledger schema and structural
-  validator only. No broker, signer/authenticator, helper lifecycle, CLI or
-  manifest integration, or runtime causal chain exists.
-- The launcher does not isolate workload credentials or evidence writes. Its
-  claims are cooperative unless an outer launcher supplies and enforces those
-  boundaries.
-
-The core implementation must remain independent of Agent frameworks and
-sandbox products. A trusted Linux runner owns one workload lifecycle:
+`observe-effects` owns one new cgroup and executes:
 
 ```text
-create run cgroup
-  -> load recorder and register the exact cgroup
-  -> capture each enabled confirmer's S0 sequentially
-  -> fork; child enters the cgroup in pre-exec
-  -> exec workload only after the cgroup barrier
-  -> drain operation evidence
-  -> require the complete cgroup empty/frozen
-  -> capture each enabled confirmer's S1 sequentially
-  -> finalize a closed artifact set
+load and attest enabled recorders
+  -> register the exact cgroup and run epoch
+  -> capture enabled S0 endpoints
+  -> fork; child joins the cgroup before exec
+  -> record operation and optional lifecycle evidence
+  -> require the recursive cgroup empty and freeze the boundary
+  -> drain and reconcile every enabled recorder
+  -> capture enabled S1 endpoints
+  -> fsync a closed artifact set and commit the manifest last
 ```
 
-The standalone launcher does not need a `SIGSTOP` window: the recorder is
-registered before `fork`, and the child joins the already-registered cgroup in
-the pre-exec hook before the workload image exists. A future broker helper
-would need a different lifecycle, including remaining stopped until its
-per-request cgroup had been registered; no such broker lifecycle is present
-today.
+This core is independent of Agent frameworks, Allox, Docker, and Kata. It is an
+observer for cooperative controlled workloads, not a sandbox. The standalone
+launcher does not drop workload privilege or isolate the evidence directory;
+those coverage flags remain false in its manifest.
 
-Allox or another runtime may later drive this contract, but must not become an
-assumption inside the recorder, object resolver, state confirmer, or offline
-verifier.
+## Object-level operation evidence
 
-## Current partial object resolution and next steps
+Four modes are externally selected and bound into collection and verification:
 
-The two kernel-backed modes are intentionally named for their exact limits.
-`kernel-file-open-partial` resolves selected successful native opens through
-exactly one BPF LSM `file_open` join. `O_PATH` is currently unsupported because
-its disposition is not captured in the replay ABI; a missing join fails
-evidence closed. Stacked/re-entrant duplicate open hooks are also fatal rather
-than guessing which object is syscall-visible.
-`kernel-file-open-write-partial` preserves that open-only behavior and adds event-time
-`file_permission(MAY_WRITE)` VFS `struct file` identity for positive-byte
-selected native write-family results. Pipefs/socketfs pseudo-files are valid
-FILE_OBJECT identities but do not establish socket endpoints or persistence.
-Every positive-byte result in the selected native write family requires that
-join; its absence is a transport-integrity failure. Unselected paths such as
-mmap and io_uring remain coverage gaps. The hook is non-sleepable, so it
-records an event-time kernel-derived mount/device/inode tuple with path quality
-`NOT_REQUESTED`; optional inode generation means this does not exclude inode
-reuse. Kernel path snapshots remain available only from `file_open`. The 328-byte WAL
-`FILE_OBJECT` frame, strict
-attempt/result join, capability-schema-v2 preflight, and offline reconstruction
-are implemented. Missing, ambiguous, or forged joins fail verification.
-Userspace FD lookup is not authoritative evidence.
+- `user-input`: bounded syscall-entry bytes only;
+- `kernel-file-open-partial`: selected successful open-family
+  `file_open` objects;
+- `kernel-file-open-write-partial`: the open contract plus selected
+  positive-byte native write-family `file_permission(MAY_WRITE)` objects;
+- `kernel-object-expanded-partial`: both earlier contracts plus the explicit
+  path/inode/mmap/socket matrix and a separate lifecycle stream.
 
-Reading a target process's descriptor from userspace can enrich evidence, but
-it has several distinct authority levels:
+Expanded mode currently implements:
 
-| Mechanism | Useful result | Required limitation |
-|---|---|---|
-| `/proc/<pid>/fd/<n>` and `fdinfo` | path display, mount ID, flags, socket inode hints | diagnostic snapshot only; PID/FD close and reuse races remain |
-| `pidfd_open` + `pidfd_getfd` + `fstat/statx` | duplicate the descriptor that exists at lookup time and inspect its object | ptrace-style permission checks apply; a later lookup does not prove which object an earlier syscall used |
-| fanotify event FD/FID | filesystem object reference for supported marked filesystems and event classes | not a general syscall correlator and does not cover every FD, rename, mmap, io_uring, or socket effect |
-| seccomp user notification or ptrace stop | synchronously inspect selected input descriptors while the task is blocked | mediation changes the execution model and has much higher per-syscall overhead |
-| BPF LSM/VFS hook | object used by the kernel at the hook point | requires BTF/hook availability and operation-specific correlation |
+- [x] create-family parent evidence for mkdir, symlink, and mknod;
+- [x] hard-link source, unlink/rmdir target, and rename source evidence;
+- [x] chmod/chown target evidence;
+- [x] setxattr/removexattr inode evidence;
+- [x] file-backed `MAP_SHARED|PROT_WRITE` mmap-establishment evidence;
+- [x] single shared file-backed VMA `mprotect`/x86-64 `pkey_mprotect`
+      write-permission-channel evidence, with unsupported ranges explicit;
+- [x] bind/connect socket cookie, network-namespace cookie, socket metadata,
+      and kernel-copied requested endpoint evidence;
+- [x] successful accept/accept4 accepted-socket and peer identity plus a
+      separate AF_INET/AF_INET6 TCP accept/transition/destroy stream correlated
+      to the originating syscall-entry identity;
+- [x] independently attested fork/exec/exit WAL and JSONL, PID/TGID plus task
+      start-boottime identity, terminal replay of the events admitted by those
+      hooks, and correlation for syscall identities present in that stream;
+- [x] strict WAL-derived reconstruction and rejection of missing, ambiguous,
+      unreadable, lossy, truncated, or JSON-only object/lifecycle claims;
+- [x] fail-closed BTF, active-BPF-LSM, hook-ABI, object/lifecycle digest, and
+      real libbpf load/attach gates before workload launch; required kernel
+      config is reported explicitly and missing facilities fail the real gate.
 
-The current event protocol emits only `KERNEL_RESOLVED`,
-`USER_INPUT_ONLY`, or `UNRESOLVED`. Future enrichment may add blocked or
-racy userspace evidence, but lower levels must never be silently promoted:
+The word `partial` is material:
+
+- [ ] Add an authoritative S0 task/thread enrollment ledger plus sound cgroup
+      migration and `CLONE_INTO_CGROUP` enrollment coverage. Until all three
+      exist, lifecycle status is capped at `PARTIAL` and does not prove a
+      complete process-tree association.
+- [ ] Resolve the not-yet-created child object and rename destination/parent
+      where a reliable post-operation hook is available.
+- [ ] Add mount identity to inode-only xattr evidence without guessing it.
+- [ ] Observe actual mmap/mprotect dirtying. Current hooks prove only an
+      eligible mapping request or write-permission transition; private,
+      anonymous, mixed, and multi-VMA mprotect ranges are unresolved.
+- [ ] Add complete post-bind/post-connect coverage beyond the current
+      AF_INET/AF_INET6 TCP state stream. Bind/connect object evidence remains
+      the requested endpoint; bind port zero remains zero unless a later
+      eligible TCP state event exposes the assigned local endpoint.
+- [ ] Decode and correlate `io_uring`, `SCM_RIGHTS`, ioctl, and netlink
+      object semantics.
+- [ ] Add compat/x32 coverage and define delayed kernel-worker/writeback
+      attribution. Native syscall coverage does not imply either.
+
+Userspace `/proc/<pid>/fd` or pidfd lookup may be added as explicitly racy
+enrichment, but it must never be promoted to event-time kernel object identity.
+Exec filename is likewise descriptive kernel-copied evidence, not executable
+file identity.
+
+## Endpoint-state confirmation
+
+Operation history and endpoint state remain separate outputs. The following
+S0/S1 confirmers are shipped and independently recomputed by
+`verify-effects`:
+
+- [x] BPF Program/Map/Link state under an explicit `ClaimScope`;
+- [x] bounded generic filesystem path trees with selected metadata, content,
+      symlink, and xattr evidence;
+- [x] sorted explicit sysctl keys under a bound proc-sys root;
+- [x] mountinfo for one PID- and inode-bound mount namespace;
+- [x] selected local address, route, rule, tc, and nftables state in one
+      PID- and inode-bound network namespace, using exact trusted tool paths
+      and SHA-256 values;
+- [x] all or explicitly selected loaded modules, with optional readable sysfs
+      parameters;
+- [x] recursive residual-process enumeration for an exact cgroup-v2 path and
+      kernel cgroup ID.
+
+Every domain has hard record, value, total-byte, issue, and deadline bounds.
+Errors, races, namespace/PID changes, tool replacement, parse failures, and
+budget exhaustion yield `INCOMPLETE`/`INCONCLUSIVE`; they never narrow the
+scope silently. Omitted domains remain `NOT_CONFIRMED`.
+
+A complete observed S0/S1 difference may yield
+`CHANGED_WITHIN_SCOPE` for that one domain. A complete identical endpoint
+still yields `INCONCLUSIVE`, because the standalone path lacks authenticated
+exclusive-writer and per-domain atomic-quiescence proof. The per-domain vector
+must never be collapsed into “all Linux unchanged” or rollback `CLEAN`.
+
+Remaining state work:
+
+- [ ] Implement a filesystem-native/Btrfs confirmer with typed rename,
+      hard-link topology, deletion, metadata, xattr, and changed-set hashing.
+- [ ] Add narrowly scoped keyring and other configuration adapters only where
+      both endpoint enumeration and completeness are defensible.
+- [ ] Decide whether conntrack deserves a separate local-network scope;
+      transient packets and sockets must remain operation evidence.
+- [ ] Treat remote service/database effects as an enforced-egress ledger or
+      signed remote receipt, never as a locally provable endpoint diff.
+- [ ] Authenticate fresh actor/quiescence contracts for domains where a
+      negative verdict is required.
+
+## Direct, Docker, and Kata-host deployment
+
+The one-shot `deployment-observe` adapter is implemented for an already
+existing, externally frozen target:
+
+- [x] `DIRECT`: trusted root PID, expected dedicated cgroup, process and
+      namespace identity;
+- [x] `DOCKER`: full 64-hex container ID, optional trusted init PID,
+      expected cgroup, and host-visible container namespaces without invoking a
+      Docker/containerd CLI;
+- [x] `KATA_HOST`: shim, expected hypervisor and optional backend PIDs,
+      target-Linux runtime/QEMU/virtiofs identity, and QEMU-derived disk,
+      block-device, TAP, and network-backend resources;
+- [x] READY/FINISH freeze and identity revalidation, one shared recorder pair
+      for up to eight FD-pinned ancestor roots, optional BPF/filesystem/Linux
+      endpoints, expanded socket-state artifacts, a closed artifact manifest,
+      and independent offline replay/comparison.
+
+Kata means host-only observation. The adapter does not enter the Kata guest and
+does not claim its syscalls; it observes only what the Kata runtime, QEMU,
+virtual storage, and network backend do to the target Linux.
+
+Discovery now registers bounded, FD-pinned cgroup-v2 ancestor roots. Every
+selected syscall/object/lifecycle hook checks
+`bpf_current_task_under_cgroup`, so child cgroups created and deleted entirely
+between barriers remain in scope. FINISH additionally detects root inode
+replacement, unexpected root processes, and root identity changes. Therefore:
 
 ```text
-KERNEL_RESOLVED
-USERSPACE_BLOCKED_RESOLVED
-USERSPACE_RACY_SNAPSHOT
-USER_INPUT_ONLY
-UNRESOLVED
+ancestor-root transport:       may be COMPLETE
+dynamic descendant coverage:  DYNAMIC_ANCESTOR_COMPLETE
 ```
 
-- [x] Keep `kernel-file-open-partial` and
-      `kernel-file-open-write-partial` explicit, fail-closed, and independently
-      verified.
-- [x] Bind the selected mode into the run manifest and require the same
-      externally selected mode during `verify-effects`.
-- [ ] Bind the complete capability report, required kernel features, and hook
-      ABI into an authenticated control transcript.
-- [ ] Add operation-specific object hooks for create, unlink, rename, and
-      setattr; record explicit gaps for mmap and io_uring writes.
-- [ ] Add socket cookie, network-namespace identity, and kernel-derived
-      bind/connect/accept endpoint evidence.
-- [ ] Use pidfds for process lifetime and userspace enrichment, but label every
-      asynchronous lookup `USERSPACE_RACY_SNAPSHOT`.
-- [x] Reject missing required object evidence and JSON/WAL substitutions in the
-      independent verifier.
-- [x] Filter by selected operation and exact cgroup before object/path work,
-      retain fixed bounds, and fail evidence completeness on any loss.
+- [x] Add an ancestor-cgroup kernel filter before claiming dynamic subtree
+      membership coverage for the selected hook matrix.
+- [ ] Run and record separate privileged Direct, real Docker, and real Kata
+      E2E gates. The adapter implementation and unit tests alone are not such
+      validation.
+- [ ] Add deployment-specific performance batches; do not extrapolate the
+      standalone expanded microbenchmark to Kata block/network backend load.
 
-## Current endpoint confirmers and remaining domains
+## Attribution boundary
 
-Operation history and endpoint state are separate outputs. Each confirmer
-must bind an externally trusted scope, S0, its own quiescence requirements, S1,
-canonical comparison, completeness, and independent offline verification.
+Current runtime attribution proves that the event-time caller was under one of
+the FD-pinned cgroup-v2 ancestor roots at the selected kernel hook. Its causal
+status remains `CAUSAL_NOT_ESTABLISHED`. An Agent request handled by systemd,
+D-Bus, a long-lived daemon, a kernel worker, or a remote service is not
+attributed to the Agent merely because it followed in time.
 
-- [x] Integrate the existing BPF S0/S1 confirmer without turning a BPF-domain
-      result into whole-system state. In standalone effects mode it may confirm
-      a delta, but it never authorizes BPF `UNCHANGED_WITHIN_SCOPE`.
-- [x] Implement a bounded generic filesystem path-tree v1 confirmer with
-      explicit exact-byte roots, metadata plus optional content/symlink/xattr
-      capture, resource limits, typed comparison, closed artifacts, and strict
-      offline recomputation.
-- [x] Publish a per-domain vector for filesystem, BPF, local network
-      configuration, sysctl, mounts, modules, keyrings, and remote network
-      effect. Unimplemented local domains remain `NOT_CONFIRMED`; remote
-      network effect remains `NOT_CONFIRMABLE`.
-- [ ] Implement a Btrfs confirmer for one declared workspace subvolume,
-      including content, metadata, xattrs, link topology, rename, and deletion.
-- [ ] Hash only the changed set derived from the filesystem-native comparison;
-      do not recursively hash the entire Guest root on every run.
-- [ ] Keep shared directories and external mounts as separate explicit scopes.
-- [ ] Add separate local-network-configuration, sysctl, mount, module, and
-      other narrowly defined adapters only where state can be enumerated.
-- [ ] Treat remote network effects as an enforced-egress ledger or signed
-      remote receipt, never as a locally provable final-state diff.
-- [x] Keep per-domain verdict, state completeness, endpoint difference,
-      actor-contract status, and causal status as independent axes.
+The bounded delegation-ledger schema and structural validator remain library
+work only. There is no authenticated broker, helper-cgroup runtime, signer,
+manifest integration, or `BROKER_REQUEST_EXECUTION_CHAIN_ESTABLISHED` result.
+That work is intentionally outside the current standalone/deployment milestone
+and must not be inferred from the observer's operation history.
 
-The filesystem comparer reports `CHANGED_WITHIN_SCOPE` when complete,
-same-environment S0/S1 captures contain a typed endpoint difference, while
-keeping causal attribution `NOT_ESTABLISHED`. Identical captures remain
-`INCONCLUSIVE`. The static v1 actor contract only validates and exact-matches
-caller JSON; even all-true booleans become `ASSERTED_NOT_AUTHENTICATED` and
-cannot authorize `UNCHANGED_WITHIN_SCOPE`. It has no signature or freshness,
-does not verify `evidence_sha256`, and does not bind boot/cgroup/barrier proof.
+## Overhead contract
 
-Required negative tests include ephemeral create/delete, modify/restore,
-external concurrent actors, scope narrowing, snapshot substitution,
-truncation, budget exhaustion, and incomplete quiescence. An empty diff may
-become `UNCHANGED_WITHIN_SCOPE` only under a future authenticated, fresh,
-exact-domain exclusive/quiescence contract.
+The implementation keeps expensive work behind the narrowest available gate:
 
-## Delegation protocol/validator only; broker runtime TODO
+- unselected syscall entry/exit takes one policy-array lookup;
+- selected calls outside registered cgroups stop after the exact-cgroup lookup;
+- object hooks first require a matching selected pending operation, cgroup,
+  epoch, and resolver before object/path reads;
+- untracked lifecycle hooks take one current-cgroup helper and one hash lookup;
+- all registered cgroups share one system recorder and one lifecycle recorder;
+- endpoint confirmers run only at S0/S1, adding barrier latency and evidence
+  I/O rather than syscall hot-path work;
+- fixed ring buffers, bounded queues, artifact sizes, and collector deadlines
+  prevent unbounded memory and capture work.
 
-Direct attribution v1 remains unchanged: it proves only that the selected
-native syscall caller belonged to the exact cgroup at syscall entry.
-
-`crates/system-effects-recorder/src/delegation.rs` now defines a bounded
-protocol-v1 ledger and `validate_against`. The validator checks external run
-bindings, request IDs and ordering, TTLs, parent/helper cgroup linkage,
-`ACCEPTED -> REGISTERED -> STARTED -> COMPLETED/FAILED` transitions, nesting
-depth, and an empty/frozen zero-outstanding closure. This is structural
-validation, not production or authentication. No current CLI command creates
-or consumes the ledger, and `verify-effects` does not accept it in the closed
-artifact set.
-
-- [x] Define fields for one unique request ID per brokered operation and bind
-      its
-      boot ID, run ID/epoch, source cgroup, adapter/version, operation,
-      canonical argument digest, sequence, expiry, and optional parent.
-- [ ] Implement request generation and keep signing capability outside the
-      workload; authenticate and reject replay, cross-run,
-      expired, wrong-adapter, and argument-substitution attempts.
-- [ ] Prefer one stopped helper and one sealed request cgroup per operation.
-      Register that cgroup before resume and require it empty/frozen at finish.
-- [x] Structurally validate the closed
-      `ACCEPTED -> REGISTERED -> STARTED -> COMPLETED/FAILED` sequence.
-- [ ] Authenticate the delegation ledger and bind its digest into the run
-      manifest and verifier's closed artifact set.
-- [x] Limit the protocol claim enum to
-      `BROKER_REQUEST_EXECUTION_CHAIN_ESTABLISHED`; do not claim Agent
-      intent, necessity, remote outcome, or generic `CAUSAL_ESTABLISHED`.
-- [x] Validate explicit parent linkage, maximum depth, and child lifetime
-      containment for nested ledger records.
-- [ ] Make real asynchronous work remain represented by a registered child
-      request until actual completion.
-- [x] Require a structurally validated ledger closure with zero outstanding
-      request, token, helper, and request-cgroup state.
-- [ ] Implement a broker that actually enforces and produces that closure.
-- [ ] Never attribute an unbrokered daemon syscall to the workload. Long-lived
-      D-Bus, systemd, netlink, and thread-pool services require explicit
-      adapters that propagate context to the actual worker; otherwise record
-      only that a request was delivered.
-- [ ] Cover forgery, replay, expiry, concurrent cross-talk, cgroup-ID reuse,
-      adapter/helper crash, async leftovers, and bypass attempts in a
-      privileged VM.
-- [ ] Reuse the current WAL cgroup ID for userspace ledger correlation where
-      possible so direct-only BPF hot-path cost does not increase.
-
-The intended causal vocabulary remains:
-
-```text
-DIRECT_CALLER_ESTABLISHED
-BROKER_REQUEST_EXECUTION_CHAIN_ESTABLISHED
-CAUSAL_NOT_ESTABLISHED
-```
-
-The current runtime emits only direct exact-cgroup attribution with
-`CAUSAL_NOT_ESTABLISHED`. Merely constructing a ledger that passes the
-validator does not establish
-`BROKER_REQUEST_EXECUTION_CHAIN_ESTABLISHED`; that requires the still-missing
-authenticated broker, helper-cgroup execution, recorder integration, closure,
-and manifest binding.
-
-## Standalone boundary and later adapters
-
-The Linux runner can provide useful, framework-independent evidence now, but
-its claim remains cooperative unless an external launcher isolates workload
-credentials and the evidence directory. Empty/frozen closes only the direct
-run cgroup; it does not close host daemons, external actors, kernel workers,
-writeback, or delayed asynchronous effects.
-
-The coordinator's mode-`0700` output directory is a collision/permissions
-default, not evidence isolation from a workload that inherits the same identity
-or capabilities. The manifest deliberately keeps
-`workload_privilege_isolation_enforced=false` and
-`evidence_write_isolation_enforced=false`. Filesystem-scope/output overlap
-checks keep observer artifacts out of the selected tree but do not change that
-threat boundary.
-
-Runtime integrations should supply lifecycle, policy, and sandbox enforcement
-around the stable Linux contract. They must not reinterpret an empty event
-stream as no system change or upgrade direct attribution to causality.
+`make system-effects-overhead-check` enforces static instruction ceilings for
+expanded object and lifecycle hooks. The paired benchmark supports a separate
+`kernel-object-expanded-partial` batch and must not mix it with file-only or
+`user-input` measurements. Static instruction counts are regression guards,
+not runtime overhead percentages; runtime claims require a privileged,
+lossless, same-profile paired measurement.

@@ -52,6 +52,10 @@ enum Commands {
         #[clap(long, parse(from_os_str))]
         recorder_object: Option<PathBuf>,
 
+        /// Separate process-lifecycle BPF object required by expanded mode.
+        #[clap(long, parse(from_os_str))]
+        process_lifecycle_object: Option<PathBuf>,
+
         /// Cgroup subtree that observed runs will create.
         #[clap(
             long,
@@ -194,6 +198,14 @@ enum Commands {
         #[clap(long)]
         expected_recorder_sha256: String,
 
+        /// Separate fork/exec/exit BPF object; required only in expanded mode.
+        #[clap(long, parse(from_os_str))]
+        process_lifecycle_object: Option<PathBuf>,
+
+        /// Trusted SHA-256 for the exact process-lifecycle object bytes.
+        #[clap(long)]
+        expected_process_lifecycle_sha256: Option<String>,
+
         /// New output directory; it must not already exist.
         #[clap(long, parse(from_os_str))]
         output_dir: PathBuf,
@@ -248,6 +260,16 @@ enum Commands {
         #[clap(long, parse(from_os_str))]
         filesystem_actor_contract: Option<PathBuf>,
 
+        /// Explicit bounded sysctl/mount/network/module Linux endpoint-state
+        /// scope. Omit it to leave those domains unconfirmed.
+        #[clap(long, parse(from_os_str))]
+        linux_state_scope: Option<PathBuf>,
+
+        /// Add an Observer-derived residual-process scope bound to the exact
+        /// per-run cgroup path and kernel cgroup ID.
+        #[clap(long)]
+        confirm_process_residual: bool,
+
         /// Finalize diagnostic artifacts even when event transport is incomplete.
         #[clap(long)]
         allow_incomplete_transport: bool,
@@ -291,6 +313,10 @@ enum Commands {
         #[clap(long)]
         expected_recorder_sha256: String,
 
+        /// Externally trusted lifecycle object SHA-256, required for expanded runs.
+        #[clap(long)]
+        expected_process_lifecycle_sha256: Option<String>,
+
         /// Externally selected policy profile for this run.
         #[clap(long)]
         expected_profile: PolicyProfile,
@@ -315,6 +341,16 @@ enum Commands {
         /// does not authenticate its issuer.
         #[clap(long, parse(from_os_str))]
         expected_filesystem_actor_contract: Option<PathBuf>,
+
+        /// Externally trusted Linux endpoint-state scope. For an automatically
+        /// bound residual-process-only run this may be omitted.
+        #[clap(long, parse(from_os_str))]
+        expected_linux_state_scope: Option<PathBuf>,
+
+        /// Require and independently reconstruct automatic residual-process
+        /// confirmation from the finalized run cgroup binding.
+        #[clap(long)]
+        confirm_process_residual: bool,
     },
 
     /// Verify a finalized run manifest, artifact digests, event streams, and verdict.
@@ -364,11 +400,13 @@ fn main() -> Result<()> {
         Commands::RecorderCanary => command_recorder_canary(),
         Commands::Doctor {
             recorder_object,
+            process_lifecycle_object,
             cgroup_root,
             output,
             object_resolution,
         } => command_doctor(
             recorder_object.as_deref(),
+            process_lifecycle_object.as_deref(),
             &cgroup_root,
             output.as_deref(),
             object_resolution,
@@ -451,6 +489,8 @@ fn main() -> Result<()> {
         Commands::ObserveEffects {
             recorder_object,
             expected_recorder_sha256,
+            process_lifecycle_object,
+            expected_process_lifecycle_sha256,
             output_dir,
             cgroup_root,
             run_id,
@@ -462,17 +502,25 @@ fn main() -> Result<()> {
             bpf_state_scope,
             filesystem_state_scope,
             filesystem_actor_contract,
+            linux_state_scope,
+            confirm_process_residual,
             allow_incomplete_transport,
             workload,
         } => {
             // Do this before effects_run creates an output directory or a
             // cgroup. Unsupported evidence strength must have no workload or
             // evidence-side effects.
-            let capability = object_resolution::inspect(object_resolution, Some(&recorder_object));
+            let capability = object_resolution::inspect_with_lifecycle(
+                object_resolution,
+                Some(&recorder_object),
+                process_lifecycle_object.as_deref(),
+            );
             object_resolution::require_available(&capability)?;
             let outcome = effects_run::observe(effects_run::ObserveRequest {
                 recorder_object,
                 expected_recorder_sha256,
+                process_lifecycle_object,
+                expected_process_lifecycle_sha256,
                 output_dir,
                 cgroup_root,
                 run_id,
@@ -485,6 +533,8 @@ fn main() -> Result<()> {
                 bpf_state_scope,
                 filesystem_state_scope,
                 filesystem_actor_contract,
+                linux_state_scope,
+                confirm_process_residual,
                 workload,
             })?;
             print_json(&outcome)
@@ -525,11 +575,14 @@ fn main() -> Result<()> {
         Commands::VerifyEffects {
             run_dir,
             expected_recorder_sha256,
+            expected_process_lifecycle_sha256,
             expected_profile,
             expected_object_resolution,
             expected_bpf_state_scope,
             expected_filesystem_state_scope,
             expected_filesystem_actor_contract,
+            expected_linux_state_scope,
+            confirm_process_residual,
         } => {
             let expected_scope = expected_bpf_state_scope
                 .as_deref()
@@ -556,14 +609,27 @@ fn main() -> Result<()> {
                 })
                 .transpose()
                 .context("read caller-supplied filesystem actor contract")?;
-            let report = effects_verify::verify_run(
+            let expected_linux_scope = expected_linux_state_scope
+                .as_deref()
+                .map(|path| {
+                    input::read_json(
+                        path,
+                        bpf_observer_linux_state_confirmers::HARD_MAX_SCOPE_JSON_BYTES,
+                    )
+                })
+                .transpose()
+                .context("read externally trusted Linux endpoint-state scope")?;
+            let report = effects_verify::verify_run_with_linux_state_and_lifecycle(
                 &run_dir,
                 &expected_recorder_sha256,
+                expected_process_lifecycle_sha256.as_deref(),
                 expected_profile,
                 expected_object_resolution,
                 expected_scope.as_ref(),
                 expected_filesystem_scope.as_ref(),
                 expected_filesystem_contract.as_ref(),
+                expected_linux_scope.as_ref(),
+                confirm_process_residual,
             )?;
             print_json(&report)
         }
@@ -624,11 +690,17 @@ fn command_recorder_canary() -> Result<()> {
 
 fn command_doctor(
     recorder_object: Option<&Path>,
+    process_lifecycle_object: Option<&Path>,
     cgroup_root: &Path,
     output: Option<&Path>,
     object_resolution_mode: ObjectResolutionMode,
 ) -> Result<()> {
-    let report = doctor::inspect(recorder_object, cgroup_root, object_resolution_mode);
+    let report = doctor::inspect(
+        recorder_object,
+        process_lifecycle_object,
+        cgroup_root,
+        object_resolution_mode,
+    );
     if let Some(path) = output {
         atomic_file::write_json_atomic(path, &report)?;
     } else {

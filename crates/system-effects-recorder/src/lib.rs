@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+mod ancestor;
 pub mod delegation;
+pub mod lifecycle;
 mod policy;
 mod protocol;
+pub mod socket_state;
+mod verify;
 mod wal;
 
 pub use policy::{
@@ -10,27 +14,36 @@ pub use policy::{
     PolicyDescription, PolicyProfile,
 };
 pub use protocol::{
-    AttributionContract, CaptureSource, CaptureStatus, CapturedArgument, DelegatedEffectsStatus,
-    DirectAttributionClaim, EffectAttribution, EffectAttributionAuthority,
+    AttributionContract, CaptureSource, CaptureStatus, CapturedArgument, CgroupMatchMode,
+    DelegatedEffectsStatus, DirectAttributionClaim, EffectAttribution, EffectAttributionAuthority,
     EffectAttributionComponent, EffectAttributionMode, EffectAttributionSubject,
-    EffectCausalStatus, EventKind, FilePathObservation, FilesystemClass, KernelEvent,
-    KernelFileObject, ObjectIdentity, ObjectReference, ObjectResolution, ObjectResolutionAuthority,
+    EffectCausalStatus, EffectProcessIdentity, EffectProcessIdentityAuthority, EventKind,
+    FilePathObservation, FilesystemClass, KernelEvent, KernelFileObject, KernelSocketObject,
+    ObjectIdentity, ObjectReference, ObjectResolution, ObjectResolutionAuthority,
     ObjectResolutionQuality, ObjectRole, PathResolutionAuthority, PathResolutionQuality,
     ResolvedPath, ResultStatus, SocketEndpointAddress, SocketEndpointAuthority,
     SocketEndpointObservation, SocketEndpointPair, SocketEndpointQuality, SystemEffectEvent,
     EFFECT_ATTRIBUTION_PROTOCOL_VERSION, EFFECT_EVENT_SCHEMA_VERSION, FILE_PATH_NOT_REQUESTED,
     FILE_PATH_RESOLVED_AT_HOOK, FILE_PATH_TRUNCATED_AT_HOOK, FILE_PATH_UNAVAILABLE,
     FLAG_OBJECT_DELETE_FAILED, FLAG_OBJECT_JOIN_AMBIGUOUS, FLAG_OBJECT_JOIN_MISSING,
-    FLAG_OBJECT_PATH_UNAVAILABLE, FLAG_OBJECT_READ_FAILED, FLAG_PAYLOAD1_INVALID_LENGTH,
-    FLAG_PAYLOAD1_READ_FAILED, FLAG_PAYLOAD1_TRUNCATED, FLAG_PAYLOAD2_INVALID_LENGTH,
-    FLAG_PAYLOAD2_READ_FAILED, FLAG_PAYLOAD2_TRUNCATED, FLAG_PENDING_DELETE_FAILED,
-    FLAG_PENDING_INSERT_FAILED, FLAG_PENDING_MISSING, FLAG_PENDING_POISONED, FLAG_POLICY_INVALID,
-    FLAG_SYSCALL_MISMATCH, FLAG_USER_MEMORY_SNAPSHOT, KERNEL_FILE_EVENT_SIZE,
-    KERNEL_FILE_PATH_BYTES, MAX_OBJECT_REFERENCES, MAX_RESOLVED_PATH_BYTES,
+    FLAG_OBJECT_PATH_UNAVAILABLE, FLAG_OBJECT_READ_FAILED, FLAG_OBJECT_UNSUPPORTED,
+    FLAG_PAYLOAD1_INVALID_LENGTH, FLAG_PAYLOAD1_READ_FAILED, FLAG_PAYLOAD1_TRUNCATED,
+    FLAG_PAYLOAD2_INVALID_LENGTH, FLAG_PAYLOAD2_READ_FAILED, FLAG_PAYLOAD2_TRUNCATED,
+    FLAG_PENDING_DELETE_FAILED, FLAG_PENDING_INSERT_FAILED, FLAG_PENDING_MISSING,
+    FLAG_PENDING_POISONED, FLAG_POLICY_INVALID, FLAG_SYSCALL_MISMATCH, FLAG_TASK_READ_FAILED,
+    FLAG_USER_MEMORY_SNAPSHOT, KERNEL_FILE_EVENT_SIZE, KERNEL_FILE_PATH_BYTES,
+    KERNEL_SOCKET_EVENT_SIZE, MAX_OBJECT_REFERENCES, MAX_RESOLVED_PATH_BYTES,
     MAX_SOCKET_ENDPOINT_BYTES, OBJECT_IDENTITY_PROTOCOL_VERSION,
+    SOCKET_ENDPOINT_AUTHORITY_KERNEL_STATE, SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT,
+};
+pub use verify::{
+    canonical_system_effect_projection, verify_system_effect_artifacts,
+    SystemEffectArtifactVerification, SystemEffectProcessReference, SystemEffectRunVerification,
+    SystemEffectRunVerificationResult, SystemEffectVerificationBinding,
 };
 pub use wal::{recover as recover_wal, recover_reader as recover_wal_reader, WalRecovery};
 
+use ancestor::{AncestorConfig, AncestorRootSet, MAX_ANCESTOR_ROOTS};
 use anyhow::{anyhow, bail, Context, Result};
 use bpf_observer_schema::ObjectExclusions;
 use libbpf_sys as libbpf;
@@ -40,6 +53,10 @@ use policy::{
 use protocol::{EVENT_OPERATION_ATTEMPT, EVENT_OPERATION_RESULT};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket_state::{
+    receive_socket_state_event, socket_state_health, SocketStateClosingBoundary, SocketStateHealth,
+    SocketStateOutputs, SocketStateRunState,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_void, CString};
 use std::fs::{self, File, OpenOptions};
@@ -54,24 +71,77 @@ use wal::WalWriter;
 
 const MAP_POLICY: &str = "effect_policy";
 const MAP_RUNS: &str = "effect_runs";
+const MAP_ROOTS: &str = "effect_roots";
+const MAP_ROOT_IDS: &str = "effect_root_ids";
+const MAP_ROOT_CONFIG: &str = "effect_root_cfg";
 const MAP_PENDING: &str = "effect_pending";
 const MAP_EVENTS: &str = "effect_events";
 const MAP_OBJECT_CONFIG: &str = "effect_object_config";
 const MAP_FILE_OBJECTS: &str = "effect_file_objects";
+const MAP_SOCKET_OBJECTS: &str = "effect_socket_objects";
+const MAP_SOCKET_STATE_RUNS: &str = "effect_socket_state_runs";
+const MAP_SOCKET_OWNERS: &str = "effect_socket_owners";
+const MAP_SOCKET_STATE_EVENTS: &str = "effect_socket_state_events";
 const PROGRAM_ENTER: &str = "trace_effect_enter";
 const PROGRAM_EXIT: &str = "trace_effect_exit";
 const PROGRAM_FILE_EXIT: &str = "trace_effect_file_exit";
+const PROGRAM_EXPANDED_EXIT: &str = "trace_effect_expanded_exit";
 const PROGRAM_FILE_OBJECT: &str = "trace_effect_file_object";
 const PROGRAM_FILE_PERMISSION: &str = "trace_effect_file_permission";
+const PROGRAM_ACCEPT_EXIT: &str = "trace_effect_do_accept_exit";
+const PROGRAM_INET_STATE: &str = "trace_effect_inet_sock_set_state";
+const PROGRAM_TCP_DESTROY: &str = "trace_effect_tcp_destroy_sock";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AsyncSocketStateProducer {
+    InetSockSetState,
+    TcpDestroySock,
+}
+
+impl AsyncSocketStateProducer {
+    const fn program_name(self) -> &'static str {
+        match self {
+            Self::InetSockSetState => PROGRAM_INET_STATE,
+            Self::TcpDestroySock => PROGRAM_TCP_DESTROY,
+        }
+    }
+}
+
+const ASYNC_SOCKET_STATE_PRODUCERS: [AsyncSocketStateProducer;
+    socket_state::SOCKET_STATE_ASYNC_PRODUCER_LINKS as usize] = [
+    AsyncSocketStateProducer::InetSockSetState,
+    AsyncSocketStateProducer::TcpDestroySock,
+];
+const ASYNC_SOCKET_STATE_PRODUCER_LINKS: u32 = ASYNC_SOCKET_STATE_PRODUCERS.len() as u32;
+const PROGRAM_EXPANDED_OBJECT_HOOKS: &[&str] = &[
+    "trace_effect_path_mkdir",
+    "trace_effect_path_symlink",
+    "trace_effect_path_mknod",
+    "trace_effect_path_unlink",
+    "trace_effect_path_rmdir",
+    "trace_effect_path_rename",
+    "trace_effect_path_link",
+    "trace_effect_path_chmod",
+    "trace_effect_path_chown",
+    "trace_effect_inode_setxattr",
+    "trace_effect_inode_removexattr",
+    "trace_effect_mmap_file",
+    "trace_effect_file_mprotect",
+    "trace_effect_socket_connect",
+    "trace_effect_socket_bind",
+];
 
 const OBJECT_RESOLVE_FILE_OPEN: u32 = 1 << 0;
 const OBJECT_RESOLVE_FILE_PERMISSION_WRITE: u32 = 1 << 1;
+const OBJECT_RESOLVE_EXPANDED: u32 = ((1 << 13) - 1) & !((1 << 2) - 1);
 
 const MAX_RUNS: u32 = 1024;
 const MAX_PENDING: u32 = 16384;
 const PENDING_VALUE_SIZE: u32 = 96;
 const FILE_PENDING_VALUE_SIZE: u32 = 200;
+const SOCKET_PENDING_VALUE_SIZE: u32 = 200;
 const RING_BYTES: u32 = 1 << 22;
+const SOCKET_STATE_RING_BYTES: u32 = 1 << 20;
 const MAX_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 /* libbpf 1.0's poll/consume functions otherwise keep draining while producers
  * advance the ring. The callback returns a private -EAGAIN after this many
@@ -104,6 +174,20 @@ struct RunState {
     object_delete_failed: u64,
     object_path_unavailable: u64,
     object_pending_remaining: u64,
+    task_read_failed: u64,
+    object_unsupported: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+struct SocketOwner {
+    epoch: u64,
+    cgroup_id: u64,
+    origin_attempt_seq: u64,
+    origin_pid_tgid: u64,
+    origin_task_start_boottime_ns: u64,
+    origin_operation: u32,
+    flags: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -112,6 +196,7 @@ pub enum FileObjectResolutionMode {
     UserInput,
     KernelFileOpenPartial,
     KernelFileOpenWritePartial,
+    KernelObjectExpandedPartial,
 }
 
 impl FileObjectResolutionMode {
@@ -120,7 +205,14 @@ impl FileObjectResolutionMode {
     }
 
     fn kernel_file_write_enabled(self) -> bool {
-        self == Self::KernelFileOpenWritePartial
+        matches!(
+            self,
+            Self::KernelFileOpenWritePartial | Self::KernelObjectExpandedPartial
+        )
+    }
+
+    fn expanded_object_enabled(self) -> bool {
+        self == Self::KernelObjectExpandedPartial
     }
 
     fn resolver_mask(self) -> u32 {
@@ -129,6 +221,11 @@ impl FileObjectResolutionMode {
             Self::KernelFileOpenPartial => OBJECT_RESOLVE_FILE_OPEN,
             Self::KernelFileOpenWritePartial => {
                 OBJECT_RESOLVE_FILE_OPEN | OBJECT_RESOLVE_FILE_PERMISSION_WRITE
+            }
+            Self::KernelObjectExpandedPartial => {
+                OBJECT_RESOLVE_FILE_OPEN
+                    | OBJECT_RESOLVE_FILE_PERMISSION_WRITE
+                    | OBJECT_RESOLVE_EXPANDED
             }
         }
     }
@@ -145,6 +242,7 @@ struct ObjectConfig {
 struct CallbackState {
     queue: VecDeque<KernelEvent>,
     decode_failures: u64,
+    first_decode_error: Option<String>,
     routing_failures: u64,
     pairing_failures: u64,
     capacity_failures: u64,
@@ -172,6 +270,39 @@ fn enqueue_event(state: &mut CallbackState, event: KernelEvent) -> c_int {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackBatchStop {
+    None,
+    SystemEffect,
+    SocketState,
+    Both,
+}
+
+impl CallbackBatchStop {
+    fn from_flags(system_effect: bool, socket_state: bool) -> Self {
+        match (system_effect, socket_state) {
+            (false, false) => Self::None,
+            (true, false) => Self::SystemEffect,
+            (false, true) => Self::SocketState,
+            (true, true) => Self::Both,
+        }
+    }
+
+    fn is_controlled(self) -> bool {
+        self != Self::None
+    }
+}
+
+fn controlled_batch_stop_propagated(rc: c_int, stop: CallbackBatchStop) -> Result<bool> {
+    if !stop.is_controlled() {
+        return Ok(false);
+    }
+    if rc == -libc::EAGAIN {
+        return Ok(true);
+    }
+    bail!("{stop:?} callback batch stop was not propagated by libbpf (return code {rc})")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AttemptIdentity {
     pid_tgid: u64,
     syscall_nr: i32,
@@ -179,6 +310,7 @@ struct AttemptIdentity {
     operation: u32,
     ktime_ns: u64,
     args: [u64; 6],
+    task_start_boottime_ns: u64,
 }
 
 unsafe extern "C" fn receive_event(context: *mut c_void, data: *mut c_void, size: u64) -> c_int {
@@ -188,21 +320,45 @@ unsafe extern "C" fn receive_event(context: *mut c_void, data: *mut c_void, size
     let state = &mut *(context as *mut CallbackState);
     let Ok(size) = usize::try_from(size) else {
         state.decode_failures = state.decode_failures.saturating_add(1);
+        if state.first_decode_error.is_none() {
+            state.first_decode_error = Some(format!("ring sample length {size} exceeds usize"));
+        }
         return -libc::EBADMSG;
     };
     let bytes = slice::from_raw_parts(data.cast::<u8>(), size);
     match KernelEvent::decode_native(bytes) {
         Ok(event) => enqueue_event(state, event),
-        Err(_) => {
+        Err(error) => {
             state.decode_failures = state.decode_failures.saturating_add(1);
+            if state.first_decode_error.is_none() {
+                let structural_prefix = &bytes[..bytes.len().min(152)];
+                let mut prefix_hex = String::with_capacity(structural_prefix.len() * 2);
+                for byte in structural_prefix {
+                    use std::fmt::Write as _;
+                    let _ = write!(prefix_hex, "{byte:02x}");
+                }
+                state.first_decode_error = Some(format!(
+                    "sample_len={} structural_prefix_hex={} reason={error:#}",
+                    bytes.len(),
+                    prefix_hex
+                ));
+            }
             -libc::EBADMSG
         }
     }
 }
 
+struct AsyncSocketStateLink {
+    producer: AsyncSocketStateProducer,
+    link: *mut libbpf::bpf_link,
+    link_id: u32,
+}
+
 struct KernelResources {
     object: *mut libbpf::bpf_object,
     links: Vec<*mut libbpf::bpf_link>,
+    async_socket_state_links: Vec<AsyncSocketStateLink>,
+    detached_link_ids: HashSet<u32>,
     ring: *mut libbpf::ring_buffer,
 }
 
@@ -211,6 +367,8 @@ impl KernelResources {
         Self {
             object,
             links: Vec::new(),
+            async_socket_state_links: Vec::new(),
+            detached_link_ids: HashSet::new(),
             ring: ptr::null_mut(),
         }
     }
@@ -227,10 +385,62 @@ impl Drop for KernelResources {
                     libbpf::bpf_link__destroy(link);
                 }
             }
+            for link in self.async_socket_state_links.drain(..).rev() {
+                if !link.link.is_null() {
+                    libbpf::bpf_link__destroy(link.link);
+                }
+            }
             if !self.object.is_null() {
                 libbpf::bpf_object__close(self.object);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsyncSocketProducerSealState {
+    NotRequired,
+    Attached,
+    Sealed,
+    Failed { detached: u32 },
+}
+
+impl AsyncSocketProducerSealState {
+    fn new(required: bool) -> Self {
+        if required {
+            Self::Attached
+        } else {
+            Self::NotRequired
+        }
+    }
+
+    fn evidence(self) -> socket_state::SocketStateProducerSeal {
+        match self {
+            Self::NotRequired => socket_state::SocketStateProducerSeal {
+                complete: true,
+                links_expected: 0,
+                links_detached: 0,
+            },
+            Self::Attached => socket_state::SocketStateProducerSeal {
+                complete: false,
+                links_expected: ASYNC_SOCKET_STATE_PRODUCER_LINKS,
+                links_detached: 0,
+            },
+            Self::Sealed => socket_state::SocketStateProducerSeal {
+                complete: true,
+                links_expected: ASYNC_SOCKET_STATE_PRODUCER_LINKS,
+                links_detached: ASYNC_SOCKET_STATE_PRODUCER_LINKS,
+            },
+            Self::Failed { detached } => socket_state::SocketStateProducerSeal {
+                complete: false,
+                links_expected: ASYNC_SOCKET_STATE_PRODUCER_LINKS,
+                links_detached: detached,
+            },
+        }
+    }
+
+    fn registration_open(self) -> bool {
+        matches!(self, Self::NotRequired | Self::Attached)
     }
 }
 
@@ -243,6 +453,12 @@ pub struct SystemEffectRecorder {
     resources: KernelResources,
     callback: Box<CallbackState>,
     run_states_fd: c_int,
+    socket_state_runs_fd: Option<c_int>,
+    socket_owners_fd: Option<c_int>,
+    socket_state_outputs: Option<SocketStateOutputs>,
+    async_socket_producer_seal: AsyncSocketProducerSealState,
+    ancestor_roots: AncestorRootSet,
+    cgroup_registration_mode: Option<bool>,
     run_id: String,
     boot_id: String,
     profile: PolicyProfile,
@@ -263,6 +479,7 @@ pub struct SystemEffectRecorder {
     poll_calls: u64,
     maximum_events_per_poll: u64,
     finished: HashSet<(u64, u64)>,
+    socket_owners_retired: HashMap<(u64, u64), u64>,
     ever_used: HashSet<(u64, u64)>,
 }
 
@@ -284,6 +501,10 @@ impl SystemEffectRecorder {
             .with_context(|| format!("create system-effect output {}", output_dir.display()))?;
         let wal = WalWriter::create(&output_dir.join("system-effects.raw.bin"))?;
         let jsonl = open_new(&output_dir.join("system-effects.jsonl"))?;
+        let mut socket_state_outputs = object_resolution_mode
+            .expanded_object_enabled()
+            .then(|| SocketStateOutputs::create(output_dir, run_id, boot_id))
+            .transpose()?;
 
         let (object_bytes, object_sha256) = read_object(object_path)?;
         verify_digest(&object_sha256, expected_object_sha256)?;
@@ -304,12 +525,29 @@ impl SystemEffectRecorder {
 
         let policy_fd = find_map_fd(resources.object, MAP_POLICY)?;
         let run_states_fd = find_map_fd(resources.object, MAP_RUNS)?;
+        let root_cgroups_fd = find_map_fd(resources.object, MAP_ROOTS)?;
+        let root_ids_fd = find_map_fd(resources.object, MAP_ROOT_IDS)?;
+        let root_config_fd = find_map_fd(resources.object, MAP_ROOT_CONFIG)?;
         let pending_fd = find_map_fd(resources.object, MAP_PENDING)?;
         let events_fd = find_map_fd(resources.object, MAP_EVENTS)?;
         let object_fds = if object_resolution_mode.kernel_file_object_enabled() {
             Some((
                 find_map_fd(resources.object, MAP_OBJECT_CONFIG)?,
                 find_map_fd(resources.object, MAP_FILE_OBJECTS)?,
+            ))
+        } else {
+            None
+        };
+        let socket_objects_fd = if object_resolution_mode.expanded_object_enabled() {
+            Some(find_map_fd(resources.object, MAP_SOCKET_OBJECTS)?)
+        } else {
+            None
+        };
+        let socket_state_fds = if object_resolution_mode.expanded_object_enabled() {
+            Some((
+                find_map_fd(resources.object, MAP_SOCKET_STATE_RUNS)?,
+                find_map_fd(resources.object, MAP_SOCKET_OWNERS)?,
+                find_map_fd(resources.object, MAP_SOCKET_STATE_EVENTS)?,
             ))
         } else {
             None
@@ -332,6 +570,36 @@ impl SystemEffectRecorder {
                 8,
                 std::mem::size_of::<RunState>() as u32,
                 MAX_RUNS,
+            ),
+        )?;
+        validate_map_abi(
+            root_cgroups_fd,
+            MapAbi::new(
+                MAP_ROOTS,
+                libbpf::BPF_MAP_TYPE_CGROUP_ARRAY,
+                4,
+                4,
+                MAX_ANCESTOR_ROOTS,
+            ),
+        )?;
+        validate_map_abi(
+            root_ids_fd,
+            MapAbi::new(
+                MAP_ROOT_IDS,
+                libbpf::BPF_MAP_TYPE_ARRAY,
+                4,
+                8,
+                MAX_ANCESTOR_ROOTS,
+            ),
+        )?;
+        validate_map_abi(
+            root_config_fd,
+            MapAbi::new(
+                MAP_ROOT_CONFIG,
+                libbpf::BPF_MAP_TYPE_ARRAY,
+                4,
+                std::mem::size_of::<AncestorConfig>() as u32,
+                1,
             ),
         )?;
         validate_map_abi(
@@ -381,6 +649,51 @@ impl SystemEffectRecorder {
                 "freeze immutable file-object resolution config",
             )?;
         }
+        if let Some(socket_objects_fd) = socket_objects_fd {
+            validate_map_abi(
+                socket_objects_fd,
+                MapAbi::new(
+                    MAP_SOCKET_OBJECTS,
+                    libbpf::BPF_MAP_TYPE_HASH,
+                    8,
+                    SOCKET_PENDING_VALUE_SIZE,
+                    MAX_PENDING,
+                )
+                .with_flags(0),
+            )?;
+        }
+        if let Some((state_runs_fd, owners_fd, state_events_fd)) = socket_state_fds {
+            validate_map_abi(
+                state_runs_fd,
+                MapAbi::new(
+                    MAP_SOCKET_STATE_RUNS,
+                    libbpf::BPF_MAP_TYPE_HASH,
+                    8,
+                    std::mem::size_of::<SocketStateRunState>() as u32,
+                    MAX_RUNS,
+                ),
+            )?;
+            validate_map_abi(
+                owners_fd,
+                MapAbi::new(
+                    MAP_SOCKET_OWNERS,
+                    libbpf::BPF_MAP_TYPE_HASH,
+                    8,
+                    48,
+                    MAX_PENDING,
+                ),
+            )?;
+            validate_map_abi(
+                state_events_fd,
+                MapAbi::new(
+                    MAP_SOCKET_STATE_EVENTS,
+                    libbpf::BPF_MAP_TYPE_RINGBUF,
+                    0,
+                    0,
+                    SOCKET_STATE_RING_BYTES,
+                ),
+            )?;
+        }
 
         for (number, policy) in kernel_policies(profile)? {
             map_update(policy_fd, &number, &policy, libbpf::BPF_ANY as u64)
@@ -394,13 +707,31 @@ impl SystemEffectRecorder {
         if object_resolution_mode.kernel_file_object_enabled() {
             attach_tracepoint(
                 &mut resources,
-                PROGRAM_FILE_EXIT,
+                if object_resolution_mode.expanded_object_enabled() {
+                    PROGRAM_EXPANDED_EXIT
+                } else {
+                    PROGRAM_FILE_EXIT
+                },
                 "raw_syscalls",
                 "sys_exit",
             )?;
             attach_lsm(&mut resources, PROGRAM_FILE_OBJECT)?;
             if object_resolution_mode.kernel_file_write_enabled() {
                 attach_lsm(&mut resources, PROGRAM_FILE_PERMISSION)?;
+            }
+            if object_resolution_mode.expanded_object_enabled() {
+                for program in PROGRAM_EXPANDED_OBJECT_HOOKS {
+                    attach_lsm(&mut resources, program)?;
+                }
+                attach_auto(&mut resources, PROGRAM_ACCEPT_EXIT)?;
+                for producer in ASYNC_SOCKET_STATE_PRODUCERS {
+                    attach_async_socket_state(&mut resources, producer)?;
+                }
+                if resources.async_socket_state_links.len()
+                    != ASYNC_SOCKET_STATE_PRODUCER_LINKS as usize
+                {
+                    bail!("expanded recorder did not attach the closed async socket producer set");
+                }
             }
         } else {
             attach_tracepoint(&mut resources, PROGRAM_EXIT, "raw_syscalls", "sys_exit")?;
@@ -419,11 +750,34 @@ impl SystemEffectRecorder {
             return Err(std::io::Error::last_os_error())
                 .context("create system-effect ring buffer");
         }
+        if let (Some((_, _, state_events_fd)), Some(outputs)) =
+            (socket_state_fds, socket_state_outputs.as_mut())
+        {
+            check_rc(
+                unsafe {
+                    libbpf::ring_buffer__add(
+                        resources.ring,
+                        state_events_fd,
+                        Some(receive_socket_state_event),
+                        outputs.callback_context(),
+                    )
+                },
+                "add socket-state ring buffer",
+            )?;
+        }
 
         Ok(Self {
             resources,
             callback,
             run_states_fd,
+            socket_state_runs_fd: socket_state_fds.map(|value| value.0),
+            socket_owners_fd: socket_state_fds.map(|value| value.1),
+            socket_state_outputs,
+            async_socket_producer_seal: AsyncSocketProducerSealState::new(
+                object_resolution_mode.expanded_object_enabled(),
+            ),
+            ancestor_roots: AncestorRootSet::new(root_cgroups_fd, root_ids_fd, root_config_fd),
+            cgroup_registration_mode: None,
             run_id: run_id.to_owned(),
             boot_id: boot_id.to_owned(),
             profile,
@@ -444,6 +798,7 @@ impl SystemEffectRecorder {
             poll_calls: 0,
             maximum_events_per_poll: 0,
             finished: HashSet::new(),
+            socket_owners_retired: HashMap::new(),
             ever_used: HashSet::new(),
         })
     }
@@ -469,7 +824,96 @@ impl SystemEffectRecorder {
         self.profile
     }
 
+    /// Synchronously stop the two global asynchronous TCP-state producers.
+    ///
+    /// Callers must first establish their cgroup-empty/frozen boundary.  The
+    /// detach is recorder-global and therefore is performed once before any
+    /// registered run is drained or has its socket-cookie owners retired.
+    /// `bpf_link__destroy` closes/detaches the kernel link synchronously; after
+    /// this method succeeds no new inet_sock_set_state/tcp_destroy_sock sample
+    /// can be published by this recorder.  Already-published ring records are
+    /// intentionally retained for the following drain.
+    pub fn seal_socket_state_producers(&mut self) -> Result<socket_state::SocketStateProducerSeal> {
+        match self.async_socket_producer_seal {
+            AsyncSocketProducerSealState::NotRequired | AsyncSocketProducerSealState::Sealed => {
+                return Ok(self.async_socket_producer_seal.evidence())
+            }
+            AsyncSocketProducerSealState::Failed { detached } => {
+                bail!(
+                    "async socket-state producer sealing previously failed after detaching {detached}/{ASYNC_SOCKET_STATE_PRODUCER_LINKS} links"
+                )
+            }
+            AsyncSocketProducerSealState::Attached => {}
+        }
+        if !self.finished.is_empty() || !self.socket_owners_retired.is_empty() {
+            bail!("async socket-state producers must be sealed before any run is finalized");
+        }
+        if self.resources.async_socket_state_links.len()
+            != ASYNC_SOCKET_STATE_PRODUCER_LINKS as usize
+        {
+            self.async_socket_producer_seal = AsyncSocketProducerSealState::Failed { detached: 0 };
+            bail!(
+                "async socket-state producer link set is not exactly {ASYNC_SOCKET_STATE_PRODUCER_LINKS}"
+            );
+        }
+        if ASYNC_SOCKET_STATE_PRODUCERS.iter().any(|expected| {
+            self.resources
+                .async_socket_state_links
+                .iter()
+                .filter(|link| link.producer == *expected)
+                .count()
+                != 1
+        }) {
+            self.async_socket_producer_seal = AsyncSocketProducerSealState::Failed { detached: 0 };
+            bail!(
+                "async socket-state producer link set is not exactly inet_sock_set_state plus tcp_destroy_sock"
+            );
+        }
+
+        let links = std::mem::take(&mut self.resources.async_socket_state_links);
+        let mut detached = 0u32;
+        let mut first_error = None;
+        for link in links {
+            let rc = unsafe { libbpf::bpf_link__destroy(link.link) };
+            if rc != 0 {
+                if first_error.is_none() {
+                    first_error = Some(
+                        libbpf_error(rc)
+                            .context("synchronously detach async socket-state BPF producer"),
+                    );
+                }
+                continue;
+            }
+            detached = detached
+                .checked_add(1)
+                .context("async socket-state detached-link count overflow")?;
+            if !self.resources.detached_link_ids.insert(link.link_id) && first_error.is_none() {
+                first_error = Some(anyhow!(
+                    "duplicate async socket-state BPF link ID while sealing producers"
+                ));
+            }
+        }
+        if let Some(error) = first_error {
+            self.async_socket_producer_seal = AsyncSocketProducerSealState::Failed { detached };
+            return Err(error);
+        }
+        if detached != ASYNC_SOCKET_STATE_PRODUCER_LINKS {
+            self.async_socket_producer_seal = AsyncSocketProducerSealState::Failed { detached };
+            bail!(
+                "async socket-state producer seal detached {detached}/{ASYNC_SOCKET_STATE_PRODUCER_LINKS} links"
+            );
+        }
+        self.async_socket_producer_seal = AsyncSocketProducerSealState::Sealed;
+        Ok(self.async_socket_producer_seal.evidence())
+    }
+
     pub fn register_run(&mut self, cgroup_id: u64, epoch: u64) -> Result<()> {
+        if !self.async_socket_producer_seal.registration_open() {
+            bail!("cannot register a run after asynchronous TCP-state producers were sealed");
+        }
+        if self.cgroup_registration_mode == Some(true) {
+            bail!("cannot mix exact and ancestor-root registrations");
+        }
         if cgroup_id == 0 || epoch == 0 {
             bail!("cgroup_id and epoch must both be nonzero");
         }
@@ -491,6 +935,29 @@ impl SystemEffectRecorder {
             libbpf::BPF_NOEXIST as u64,
         )
         .context("register exact cgroup with system-effect recorder")?;
+        if let Some(fd) = self.socket_state_runs_fd {
+            let socket_state = SocketStateRunState {
+                epoch,
+                ..SocketStateRunState::default()
+            };
+            if let Err(error) =
+                map_update(fd, &cgroup_id, &socket_state, libbpf::BPF_NOEXIST as u64)
+            {
+                let _ = map_delete(self.run_states_fd, &cgroup_id);
+                return Err(error).context("register exact cgroup socket-state run");
+            }
+        }
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            if let Err(error) =
+                outputs.register_run(cgroup_id, epoch, CgroupMatchMode::ExactCurrent)
+            {
+                if let Some(fd) = self.socket_state_runs_fd {
+                    let _ = map_delete(fd, &cgroup_id);
+                }
+                let _ = map_delete(self.run_states_fd, &cgroup_id);
+                return Err(error);
+            }
+        }
         self.ever_used.insert(key);
         self.persisted.insert(key, 0);
         self.open_attempts.insert(key, HashMap::new());
@@ -499,15 +966,107 @@ impl SystemEffectRecorder {
         self.capture_read_failures.insert(key, 0);
         self.capture_truncations.insert(key, 0);
         self.capture_invalid_lengths.insert(key, 0);
+        self.cgroup_registration_mode = Some(false);
         Ok(())
+    }
+
+    pub fn register_ancestor_root(
+        &mut self,
+        cgroup_path: &Path,
+        cgroup_id: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        if !self.async_socket_producer_seal.registration_open() {
+            bail!(
+                "cannot register an ancestor root after asynchronous TCP-state producers were sealed"
+            );
+        }
+        if self.cgroup_registration_mode == Some(false) {
+            bail!("cannot mix ancestor-root and exact registrations");
+        }
+        if cgroup_id == 0 || epoch == 0 {
+            bail!("ancestor root cgroup ID and epoch must both be nonzero");
+        }
+        let key = (cgroup_id, epoch);
+        if self.ever_used.contains(&key) || self.persisted.contains_key(&key) {
+            bail!("ancestor root cgroup/epoch identity cannot be reused");
+        }
+        let state = RunState {
+            epoch,
+            ..RunState::default()
+        };
+        map_update(
+            self.run_states_fd,
+            &cgroup_id,
+            &state,
+            libbpf::BPF_NOEXIST as u64,
+        )
+        .context("register ancestor-root system-effect run")?;
+        if let Some(fd) = self.socket_state_runs_fd {
+            let socket_state = SocketStateRunState {
+                epoch,
+                ..SocketStateRunState::default()
+            };
+            if let Err(error) =
+                map_update(fd, &cgroup_id, &socket_state, libbpf::BPF_NOEXIST as u64)
+            {
+                let _ = map_delete(self.run_states_fd, &cgroup_id);
+                return Err(error).context("register ancestor-root socket-state run");
+            }
+        }
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            if let Err(error) =
+                outputs.register_run(cgroup_id, epoch, CgroupMatchMode::AncestorRoot)
+            {
+                if let Some(fd) = self.socket_state_runs_fd {
+                    let _ = map_delete(fd, &cgroup_id);
+                }
+                let _ = map_delete(self.run_states_fd, &cgroup_id);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.ancestor_roots.register(cgroup_path, cgroup_id, epoch) {
+            if let Some(outputs) = self.socket_state_outputs.as_mut() {
+                outputs.unregister_run(key);
+            }
+            if let Some(fd) = self.socket_state_runs_fd {
+                let _ = map_delete(fd, &cgroup_id);
+            }
+            let _ = map_delete(self.run_states_fd, &cgroup_id);
+            return Err(error);
+        }
+        self.ever_used.insert(key);
+        self.persisted.insert(key, 0);
+        self.open_attempts.insert(key, HashMap::new());
+        self.seen_sequences.insert(key, HashSet::new());
+        self.fatal_kernel_flags.insert(key, 0);
+        self.capture_read_failures.insert(key, 0);
+        self.capture_truncations.insert(key, 0);
+        self.capture_invalid_lengths.insert(key, 0);
+        self.cgroup_registration_mode = Some(true);
+        Ok(())
+    }
+
+    pub fn seal_ancestor_roots(&mut self) -> Result<()> {
+        if self.cgroup_registration_mode != Some(true) {
+            bail!("system-effect recorder has no ancestor roots to seal");
+        }
+        self.ancestor_roots.seal()
+    }
+
+    pub fn verify_ancestor_roots(&self) -> Result<()> {
+        if self.cgroup_registration_mode != Some(true) {
+            bail!("system-effect recorder is not in ancestor-root mode");
+        }
+        self.ancestor_roots.verify()
     }
 
     pub fn poll(&mut self, timeout: Duration) -> Result<usize> {
         self.poll_calls = self.poll_calls.saturating_add(1);
-        self.callback.batch_limit_reached = false;
+        self.reset_callback_batch_limits();
         let rc = unsafe { libbpf::ring_buffer__consume(self.resources.ring) };
         self.validate_consume_result(rc, "consume system-effect ring buffer")?;
-        let mut persisted = self.persist_queued()?;
+        let mut persisted = self.persist_all_queued()?;
 
         /* Avoid epoll when consume found data. Besides reducing latency, this
          * guarantees progress after the callback deliberately stopped a
@@ -519,29 +1078,52 @@ impl SystemEffectRecorder {
             return Ok(persisted);
         }
 
-        self.callback.batch_limit_reached = false;
+        self.reset_callback_batch_limits();
         let millis = timeout.as_millis().min(c_int::MAX as u128) as c_int;
         let rc = unsafe { libbpf::ring_buffer__poll(self.resources.ring, millis) };
         self.validate_consume_result(rc, "poll system-effect ring buffer")?;
-        persisted = self.persist_queued()?;
+        persisted = self.persist_all_queued()?;
         self.maximum_events_per_poll = self.maximum_events_per_poll.max(persisted as u64);
         Ok(persisted)
     }
 
+    fn reset_callback_batch_limits(&mut self) {
+        self.callback.batch_limit_reached = false;
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            outputs.reset_callback_batch_limit();
+        }
+    }
+
+    fn callback_batch_stop(&self) -> CallbackBatchStop {
+        CallbackBatchStop::from_flags(
+            self.callback.batch_limit_reached,
+            self.socket_state_outputs
+                .as_ref()
+                .map_or(false, SocketStateOutputs::callback_batch_limit_reached),
+        )
+    }
+
     fn validate_consume_result(&self, rc: c_int, action: &'static str) -> Result<()> {
-        if rc >= 0 || rc == -libc::EINTR {
-            if self.callback.batch_limit_reached {
-                bail!("system-effect callback batch stop was not propagated by libbpf");
-            }
+        if controlled_batch_stop_propagated(rc, self.callback_batch_stop())? {
             return Ok(());
         }
-        if rc == -libc::EAGAIN && self.callback.batch_limit_reached {
+        if rc >= 0 || rc == -libc::EINTR {
             return Ok(());
         }
         if self.callback.capacity_failures != 0 {
             bail!(
                 "system-effect event capacity exceeded (batch <= {MAX_CALLBACK_QUEUE_EVENTS}, total <= {MAX_RECORDED_EVENTS})"
             );
+        }
+        if let Some(error) = self.callback.first_decode_error.as_deref() {
+            bail!("{action}: callback rejected a noncanonical kernel frame: {error}");
+        }
+        if self
+            .socket_state_outputs
+            .as_ref()
+            .map_or(false, |outputs| outputs.userspace_failures() != 0)
+        {
+            bail!("{action}: socket-state callback rejected or could not route a kernel frame");
         }
         Err(libbpf_error(rc)).context(action)
     }
@@ -560,6 +1142,15 @@ impl SystemEffectRecorder {
         let deadline = Instant::now()
             .checked_add(timeout)
             .context("system-effect drain timeout exceeds monotonic clock range")?;
+        let socket_producer_seal = self.async_socket_producer_seal.evidence();
+        if producer_barrier_complete && socket_producer_seal.complete {
+            let retired = self.retire_socket_owners(cgroup_id, epoch)?;
+            let total = self.socket_owners_retired.entry(key).or_default();
+            *total = total
+                .checked_add(retired)
+                .context("socket-owner retirement count overflow")?;
+        }
+        let retired_socket_owners = self.socket_owners_retired.get(&key).copied().unwrap_or(0);
         let mut timed_out = false;
         loop {
             self.poll(
@@ -567,17 +1158,33 @@ impl SystemEffectRecorder {
             )?;
             let first = self.read_run_state(cgroup_id, epoch)?;
             let persisted = self.persisted.get(&key).copied().unwrap_or(0);
+            let first_socket = self.read_socket_state_run(cgroup_id, epoch)?;
+            let socket_ready = first_socket.map_or(true, |state| {
+                state.owner_remaining == retired_socket_owners
+                    && self.socket_state_outputs.as_ref().map_or(false, |outputs| {
+                        state.event_published == outputs.persisted(key)
+                    })
+            });
             if first.pending_remaining == 0
                 && first.object_pending_remaining == 0
                 && first.event_published == persisted
+                && socket_ready
             {
                 self.poll(Duration::ZERO)?;
                 let second = self.read_run_state(cgroup_id, epoch)?;
+                let second_socket = self.read_socket_state_run(cgroup_id, epoch)?;
                 let persisted = self.persisted.get(&key).copied().unwrap_or(0);
                 if first == second
+                    && first_socket == second_socket
                     && second.pending_remaining == 0
                     && second.object_pending_remaining == 0
                     && second.event_published == persisted
+                    && second_socket.map_or(true, |state| {
+                        state.owner_remaining == retired_socket_owners
+                            && self.socket_state_outputs.as_ref().map_or(false, |outputs| {
+                                state.event_published == outputs.persisted(key)
+                            })
+                    })
                 {
                     break;
                 }
@@ -590,6 +1197,23 @@ impl SystemEffectRecorder {
         self.sync_outputs()?;
         let state = self.read_run_state(cgroup_id, epoch)?;
         let persisted = self.persisted.get(&key).copied().unwrap_or(0);
+        let socket_state = self.read_socket_state_run(cgroup_id, epoch)?;
+        let socket_state_health = match (socket_state, self.socket_state_outputs.as_ref()) {
+            (Some(state), Some(outputs)) => Some(socket_state_health(
+                &self.run_id,
+                cgroup_id,
+                state,
+                outputs,
+                SocketStateClosingBoundary {
+                    owners_retired_at_barrier: retired_socket_owners,
+                    async_producer_seal: socket_producer_seal,
+                    producer_barrier_complete,
+                    timed_out,
+                },
+            )),
+            (None, None) => None,
+            _ => bail!("socket-state kernel/userspace resources disagree"),
+        };
         let mut reasons = Vec::new();
         if timed_out {
             reasons.push("recorder drain timed out".to_owned());
@@ -625,6 +1249,9 @@ impl SystemEffectRecorder {
         if state.event_dropped != 0 {
             reasons.push("kernel ring buffer dropped effect events".to_owned());
         }
+        if state.task_read_failed != 0 {
+            reasons.push("task start-boottime identity reads were incomplete".to_owned());
+        }
         if self.object_resolution_mode.kernel_file_object_enabled() {
             if state
                 .object_resolution_resolved
@@ -634,9 +1261,13 @@ impl SystemEffectRecorder {
                 reasons
                     .push("kernel file-object resolution accounting invariant failed".to_owned());
             }
-            if state.object_resolution_failed_syscalls != state.object_resolution_unresolved {
+            if state
+                .object_resolution_failed_syscalls
+                .checked_add(state.object_unsupported)
+                != Some(state.object_resolution_unresolved)
+            {
                 reasons.push(
-                    "unresolved file-object results are not exactly the failed selected opens"
+                    "unresolved object results are not exactly failed syscalls plus explicit unsupported objects"
                         .to_owned(),
                 );
             }
@@ -658,6 +1289,7 @@ impl SystemEffectRecorder {
             || state.object_delete_failed != 0
             || state.object_path_unavailable != 0
             || state.object_pending_remaining != 0
+            || state.object_unsupported != 0
         {
             reasons.push("disabled kernel file-object path reported activity".to_owned());
         }
@@ -708,6 +1340,11 @@ impl SystemEffectRecorder {
         if !producer_barrier_complete {
             reasons.push("producer cgroup empty/frozen barrier was not established".to_owned());
         }
+        if socket_state_health.as_ref().map_or(false, |health| {
+            health.status != socket_state::SocketStateStatus::Complete
+        }) {
+            reasons.push("socket-state evidence stream is incomplete".to_owned());
+        }
         if state.event_attempted == 0 {
             reasons.push(
                 "no selected operation exercised the event transport during this run".to_owned(),
@@ -716,7 +1353,10 @@ impl SystemEffectRecorder {
         let drain_completed = !timed_out
             && state.pending_remaining == 0
             && state.object_pending_remaining == 0
-            && state.event_published == persisted;
+            && state.event_published == persisted
+            && socket_state_health
+                .as_ref()
+                .map_or(true, |health| health.drain_completed);
         let transport_status =
             if state.event_attempted == 0 && drain_completed && reasons.len() == 1 {
                 TransportStatus::UnprovenNoEvents
@@ -762,6 +1402,9 @@ impl SystemEffectRecorder {
             object_delete_failed: state.object_delete_failed,
             object_path_unavailable: state.object_path_unavailable,
             object_pending_remaining: state.object_pending_remaining,
+            task_read_failed: state.task_read_failed,
+            object_unsupported: state.object_unsupported,
+            socket_state: socket_state_health,
             producer_barrier_complete,
             drain_completed,
             wal_durable: true,
@@ -775,6 +1418,9 @@ impl SystemEffectRecorder {
     }
 
     pub fn unregister_run(&mut self, cgroup_id: u64, epoch: u64) -> Result<()> {
+        if self.cgroup_registration_mode == Some(true) {
+            bail!("ancestor-root runs require unregister_ancestor_root");
+        }
         let key = (cgroup_id, epoch);
         if !self.finished.contains(&key) {
             bail!("finish_run must succeed before unregister_run");
@@ -782,6 +1428,20 @@ impl SystemEffectRecorder {
         let state = self.read_run_state(cgroup_id, epoch)?;
         if state.pending_remaining != 0 || state.object_pending_remaining != 0 {
             bail!("refusing to unregister a run with pending effect or object operations");
+        }
+        if let Some(socket_state) = self.read_socket_state_run(cgroup_id, epoch)? {
+            let retired = self.socket_owners_retired.get(&key).copied().unwrap_or(0);
+            if socket_state.owner_remaining != retired {
+                bail!(
+                    "refusing to unregister a run whose socket-owner counter does not exactly match barrier retirement"
+                );
+            }
+        }
+        if let Some(fd) = self.socket_state_runs_fd {
+            map_delete(fd, &cgroup_id).context("unregister exact cgroup socket-state run")?;
+        }
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            outputs.unregister_run(key);
         }
         map_delete(self.run_states_fd, &cgroup_id).context("unregister system-effect run")?;
         self.persisted.remove(&key);
@@ -792,6 +1452,48 @@ impl SystemEffectRecorder {
         self.capture_truncations.remove(&key);
         self.capture_invalid_lengths.remove(&key);
         self.finished.remove(&key);
+        self.socket_owners_retired.remove(&key);
+        Ok(())
+    }
+
+    pub fn unregister_ancestor_root(&mut self, cgroup_id: u64, epoch: u64) -> Result<()> {
+        if self.cgroup_registration_mode != Some(true) {
+            bail!("system-effect recorder is not in ancestor-root mode");
+        }
+        let key = (cgroup_id, epoch);
+        if !self.finished.contains(&key) {
+            bail!("finish_run must succeed before unregister_ancestor_root");
+        }
+        let state = self.read_run_state(cgroup_id, epoch)?;
+        if state.pending_remaining != 0 || state.object_pending_remaining != 0 {
+            bail!("refusing to unregister an ancestor root with pending operations");
+        }
+        if let Some(socket_state) = self.read_socket_state_run(cgroup_id, epoch)? {
+            let retired = self.socket_owners_retired.get(&key).copied().unwrap_or(0);
+            if socket_state.owner_remaining != retired {
+                bail!(
+                    "refusing to unregister an ancestor root whose socket-owner counter does not exactly match barrier retirement"
+                );
+            }
+        }
+        self.ancestor_roots.unregister(cgroup_id, epoch)?;
+        if let Some(fd) = self.socket_state_runs_fd {
+            map_delete(fd, &cgroup_id).context("unregister ancestor-root socket-state run")?;
+        }
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            outputs.unregister_run(key);
+        }
+        map_delete(self.run_states_fd, &cgroup_id)
+            .context("unregister ancestor-root system-effect run")?;
+        self.persisted.remove(&key);
+        self.open_attempts.remove(&key);
+        self.seen_sequences.remove(&key);
+        self.fatal_kernel_flags.remove(&key);
+        self.capture_read_failures.remove(&key);
+        self.capture_truncations.remove(&key);
+        self.capture_invalid_lengths.remove(&key);
+        self.finished.remove(&key);
+        self.socket_owners_retired.remove(&key);
         Ok(())
     }
 
@@ -804,7 +1506,21 @@ impl SystemEffectRecorder {
                 .get(&event.syscall_nr)
                 .copied()
                 .context("event syscall is absent from the frozen policy")?;
-            let schema = event.to_schema(&self.run_id, &self.boot_id, policy)?;
+            let cgroup_match_mode = match self.cgroup_registration_mode {
+                Some(true) => CgroupMatchMode::AncestorRoot,
+                Some(false) => CgroupMatchMode::ExactCurrent,
+                None => {
+                    self.callback.routing_failures =
+                        self.callback.routing_failures.saturating_add(1);
+                    bail!("system-effect event arrived without a cgroup registration mode");
+                }
+            };
+            let schema = event.to_schema_with_cgroup_match(
+                &self.run_id,
+                &self.boot_id,
+                policy,
+                cgroup_match_mode,
+            )?;
             let json = serde_json::to_vec(&schema)?;
             let next_size = self
                 .jsonl_bytes
@@ -838,7 +1554,8 @@ impl SystemEffectRecorder {
                     | FLAG_OBJECT_JOIN_MISSING
                     | FLAG_OBJECT_JOIN_AMBIGUOUS
                     | FLAG_OBJECT_READ_FAILED
-                    | FLAG_OBJECT_DELETE_FAILED;
+                    | FLAG_OBJECT_DELETE_FAILED
+                    | FLAG_TASK_READ_FAILED;
                 if event.flags & FATAL_FLAGS != 0 {
                     if let Some(count) = self.fatal_kernel_flags.get_mut(&key) {
                         *count = count.saturating_add(1);
@@ -869,6 +1586,7 @@ impl SystemEffectRecorder {
                             operation: event.operation,
                             ktime_ns: event.ktime_ns,
                             args: event.args,
+                            task_start_boottime_ns: event.task_start_boottime_ns,
                         };
                         if attempts.insert(event.event_seq, identity).is_some() {
                             self.callback.pairing_failures =
@@ -884,6 +1602,8 @@ impl SystemEffectRecorder {
                                     && attempt.domain == event.domain
                                     && attempt.operation == event.operation
                                     && attempt.args == event.args
+                                    && attempt.task_start_boottime_ns
+                                        == event.task_start_boottime_ns
                                     && event.event_seq > event.related_attempt_seq
                                     && attempt.ktime_ns <= event.ktime_ns
                             })
@@ -905,6 +1625,19 @@ impl SystemEffectRecorder {
         Ok(count)
     }
 
+    fn persist_all_queued(&mut self) -> Result<usize> {
+        let system = self.persist_queued()?;
+        let socket = self
+            .socket_state_outputs
+            .as_mut()
+            .map(SocketStateOutputs::persist_queued)
+            .transpose()?
+            .unwrap_or(0);
+        system
+            .checked_add(socket)
+            .context("combined effect stream persist count overflow")
+    }
+
     fn sync_outputs(&mut self) -> Result<()> {
         self.wal.sync().context("sync system-effect WAL")?;
         self.jsonl.flush().context("flush system-effect JSONL")?;
@@ -912,6 +1645,9 @@ impl SystemEffectRecorder {
             .get_ref()
             .sync_all()
             .context("sync system-effect JSONL")?;
+        if let Some(outputs) = self.socket_state_outputs.as_mut() {
+            outputs.sync().context("sync socket-state WAL and JSONL")?;
+        }
         Ok(())
     }
 
@@ -926,6 +1662,79 @@ impl SystemEffectRecorder {
             );
         }
         Ok(state)
+    }
+
+    fn read_socket_state_run(
+        &self,
+        cgroup_id: u64,
+        epoch: u64,
+    ) -> Result<Option<SocketStateRunState>> {
+        let Some(fd) = self.socket_state_runs_fd else {
+            return Ok(None);
+        };
+        let mut state = SocketStateRunState::default();
+        map_lookup(fd, &cgroup_id, &mut state).context("read socket-state run counters")?;
+        if state.epoch != epoch {
+            bail!(
+                "socket-state run epoch mismatch for cgroup {cgroup_id}: {} != {epoch}",
+                state.epoch
+            );
+        }
+        Ok(Some(state))
+    }
+
+    fn retire_socket_owners(&self, cgroup_id: u64, epoch: u64) -> Result<u64> {
+        let Some(fd) = self.socket_owners_fd else {
+            return Ok(0);
+        };
+        let mut current: Option<u64> = None;
+        let mut matching = Vec::new();
+        loop {
+            let mut next = 0u64;
+            let rc = unsafe {
+                libbpf::bpf_map_get_next_key(
+                    fd,
+                    current
+                        .as_ref()
+                        .map(|key| (key as *const u64).cast())
+                        .unwrap_or(ptr::null()),
+                    (&mut next as *mut u64).cast(),
+                )
+            };
+            if rc == -libc::ENOENT {
+                break;
+            }
+            check_rc(rc, "enumerate socket-cookie owner map")?;
+            let mut owner = SocketOwner::default();
+            let lookup = unsafe {
+                libbpf::bpf_map_lookup_elem(
+                    fd,
+                    (&next as *const u64).cast(),
+                    (&mut owner as *mut SocketOwner).cast(),
+                )
+            };
+            if lookup == 0 && owner.cgroup_id == cgroup_id && owner.epoch == epoch {
+                matching.push(next);
+            } else if lookup != 0 && lookup != -libc::ENOENT {
+                check_rc(lookup, "read socket-cookie owner during retirement")?;
+            }
+            if matching.len() > MAX_PENDING as usize {
+                bail!("socket-cookie owner map exceeds its declared entry bound");
+            }
+            current = Some(next);
+        }
+        let mut retired = 0u64;
+        for cookie in matching {
+            let rc = unsafe { libbpf::bpf_map_delete_elem(fd, (&cookie as *const u64).cast()) };
+            if rc == 0 {
+                retired = retired
+                    .checked_add(1)
+                    .context("socket-owner retirement count overflow")?;
+            } else if rc != -libc::ENOENT {
+                check_rc(rc, "retire socket-cookie owner at producer barrier")?;
+            }
+        }
+        Ok(retired)
     }
 }
 
@@ -985,6 +1794,10 @@ pub struct SystemEffectHealth {
     pub object_delete_failed: u64,
     pub object_path_unavailable: u64,
     pub object_pending_remaining: u64,
+    pub task_read_failed: u64,
+    pub object_unsupported: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_state: Option<SocketStateHealth>,
     pub producer_barrier_complete: bool,
     pub drain_completed: bool,
     pub wal_durable: bool,
@@ -1030,8 +1843,19 @@ pub fn coverage_gaps_for(
             "KERNEL_RESOLVED FILE_OBJECT covers successful selected native open/openat/openat2/creat results with exactly one file_open join and positive-byte write/pwrite64/writev/pwritev/pwritev2 results with their required non-sleepable file_permission join; missing required hooks, O_PATH, and duplicate stacked-filesystem opens fail evidence closed; pipefs/socketfs FILE_OBJECT identities are not socket endpoints or persistent-state proof, and write identities deliberately have no kernel path snapshot"
                 .to_owned(),
         ),
+        FileObjectResolutionMode::KernelObjectExpandedPartial => gaps.push(
+            "KERNEL_OBJECT_EXPANDED resolves create parent directories, hard-link source inodes in the destination mount, unlink/rmdir targets, chmod/chown targets (including fchmodat2), mountless xattr inodes with bounded attribute-name capture, rename sources, eligible file-backed MAP_SHARED+PROT_WRITE mmap targets, and single shared file-backed VMA mprotect(PROT_WRITE) requests; it also resolves bind/connect requested socket endpoints, successful accept/accept4 accepted-socket peers, and a separately verified AF_INET/AF_INET6 TCP accept/transition/destroy stream. Hard-link destination children, rename destinations, other created children, actual dirty-page writes after mmap/mprotect, multi-VMA or anonymous/private mprotect targets, non-INET/TCP socket state, io_uring, SCM_RIGHTS provenance, and delegated effects remain explicitly outside this partial contract"
+                .to_owned(),
+        ),
     }
-    if object_resolution_mode != FileObjectResolutionMode::KernelFileOpenWritePartial {
+    if object_resolution_mode == FileObjectResolutionMode::KernelObjectExpandedPartial {
+        gaps.push(lifecycle::PROCESS_LIFECYCLE_ENROLLMENT_LIMITATION.to_owned());
+    }
+    if !matches!(
+        object_resolution_mode,
+        FileObjectResolutionMode::KernelFileOpenWritePartial
+            | FileObjectResolutionMode::KernelObjectExpandedPartial
+    ) {
         gaps.push(
             "fd-based operations do not yet resolve mount/dev/inode object identity".to_owned(),
         );
@@ -1241,12 +2065,39 @@ fn configure_object_autoload(
 ) -> Result<()> {
     let kernel_file_object = mode.kernel_file_object_enabled();
     set_program_autoload(object, PROGRAM_EXIT, !kernel_file_object)?;
-    set_program_autoload(object, PROGRAM_FILE_EXIT, kernel_file_object)?;
+    set_program_autoload(
+        object,
+        PROGRAM_FILE_EXIT,
+        kernel_file_object && !mode.expanded_object_enabled(),
+    )?;
+    set_program_autoload(
+        object,
+        PROGRAM_EXPANDED_EXIT,
+        mode.expanded_object_enabled(),
+    )?;
     set_program_autoload(object, PROGRAM_FILE_OBJECT, kernel_file_object)?;
     set_program_autoload(
         object,
         PROGRAM_FILE_PERMISSION,
         mode.kernel_file_write_enabled(),
+    )?;
+    for program in PROGRAM_EXPANDED_OBJECT_HOOKS {
+        set_program_autoload(object, program, mode.expanded_object_enabled())?;
+    }
+    for program in [PROGRAM_ACCEPT_EXIT, PROGRAM_INET_STATE, PROGRAM_TCP_DESTROY] {
+        set_program_autoload(object, program, mode.expanded_object_enabled())?;
+    }
+    set_map_autocreate(object, MAP_SOCKET_OBJECTS, mode.expanded_object_enabled())?;
+    set_map_autocreate(
+        object,
+        MAP_SOCKET_STATE_RUNS,
+        mode.expanded_object_enabled(),
+    )?;
+    set_map_autocreate(object, MAP_SOCKET_OWNERS, mode.expanded_object_enabled())?;
+    set_map_autocreate(
+        object,
+        MAP_SOCKET_STATE_EVENTS,
+        mode.expanded_object_enabled(),
     )?;
     if !kernel_file_object {
         set_map_autocreate(object, MAP_OBJECT_CONFIG, false)?;
@@ -1277,6 +2128,47 @@ fn attach_lsm(resources: &mut KernelResources, program_name: &str) -> Result<()>
     let link = unsafe { libbpf::bpf_program__attach_lsm(program) };
     check_pointer(link.cast(), "attach system-effect BPF LSM file_open")?;
     resources.links.push(link);
+    Ok(())
+}
+
+fn attach_auto(resources: &mut KernelResources, program_name: &str) -> Result<()> {
+    let program = find_program(resources.object, program_name)?;
+    let link = unsafe { libbpf::bpf_program__attach(program) };
+    check_pointer(
+        link.cast(),
+        &format!("attach system-effect program {program_name}"),
+    )?;
+    resources.links.push(link);
+    Ok(())
+}
+
+fn attach_async_socket_state(
+    resources: &mut KernelResources,
+    producer: AsyncSocketStateProducer,
+) -> Result<()> {
+    let program_name = producer.program_name();
+    let program = find_program(resources.object, program_name)?;
+    let link = unsafe { libbpf::bpf_program__attach(program) };
+    check_pointer(
+        link.cast(),
+        &format!("attach async socket-state program {program_name}"),
+    )?;
+    let id = match unsafe { link_id(libbpf::bpf_link__fd(link)) } {
+        Ok(id) => id,
+        Err(error) => {
+            unsafe {
+                libbpf::bpf_link__destroy(link);
+            }
+            return Err(error).context("resolve async socket-state link ID at attachment");
+        }
+    };
+    resources
+        .async_socket_state_links
+        .push(AsyncSocketStateLink {
+            producer,
+            link,
+            link_id: id,
+        });
     Ok(())
 }
 
@@ -1319,6 +2211,20 @@ fn collect_exclusions(resources: &KernelResources) -> Result<ObjectExclusions> {
             let id = link_id(libbpf::bpf_link__fd(*link))?;
             if !exclusions.link_ids.insert(id) {
                 bail!("duplicate system-effect recorder link ID {id}");
+            }
+        }
+        for link in &resources.async_socket_state_links {
+            let observed_id = link_id(libbpf::bpf_link__fd(link.link))?;
+            if observed_id != link.link_id {
+                bail!("async socket-state BPF link identity changed while attached");
+            }
+            if !exclusions.link_ids.insert(link.link_id) {
+                bail!("duplicate system-effect recorder link ID {}", link.link_id);
+            }
+        }
+        for id in &resources.detached_link_ids {
+            if !exclusions.link_ids.insert(*id) {
+                bail!("duplicate detached system-effect recorder link ID {id}");
             }
         }
     }
@@ -1457,21 +2363,25 @@ mod tests {
             return_value: 0,
             args: [0; 6],
             comm: [0; 16],
+            task_start_boottime_ns: 1,
             payload_lens: [0; 2],
             payload_kinds: [protocol::PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; protocol::CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         }
     }
 
     #[test]
     fn rust_map_layouts_are_stable() {
-        assert_eq!(std::mem::size_of::<RunState>(), 160);
+        assert_eq!(std::mem::size_of::<RunState>(), 176);
+        assert_eq!(std::mem::size_of::<SocketOwner>(), 48);
         assert_eq!(std::mem::size_of::<ObjectConfig>(), 8);
         assert_eq!(std::mem::size_of::<KernelPolicy>(), 32);
-        assert_eq!(protocol::KERNEL_EVENT_SIZE, 344);
-        assert_eq!(protocol::KERNEL_FILE_EVENT_SIZE, 328);
+        assert_eq!(protocol::KERNEL_EVENT_SIZE, 352);
+        assert_eq!(protocol::KERNEL_FILE_EVENT_SIZE, 336);
+        assert_eq!(protocol::KERNEL_SOCKET_EVENT_SIZE, 336);
     }
 
     #[test]
@@ -1485,6 +2395,19 @@ mod tests {
             assert!(gaps.iter().any(|gap| gap.contains("not proof")));
             assert!(gaps.iter().any(|gap| gap.contains("native syscall ABI")));
         }
+        let expanded = coverage_gaps_for(
+            PolicyProfile::Control,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        );
+        assert!(expanded
+            .iter()
+            .any(|gap| gap.contains("successful accept/accept4 accepted-socket peers")));
+        assert!(!expanded
+            .iter()
+            .any(|gap| gap.contains("accept/accept4 sockets") && gap.contains("outside")));
+        assert!(expanded
+            .iter()
+            .any(|gap| gap == lifecycle::PROCESS_LIFECYCLE_ENROLLMENT_LIMITATION));
     }
 
     #[test]
@@ -1505,5 +2428,60 @@ mod tests {
         assert_eq!(enqueue_event(&mut state, callback_fixture()), -libc::EFBIG);
         assert_eq!(state.queue.len(), MAX_CALLBACK_QUEUE_EVENTS);
         assert_eq!(state.capacity_failures, 1);
+    }
+
+    #[test]
+    fn shared_ring_accepts_either_controlled_callback_stop_only_with_eagain() {
+        for stop in [
+            CallbackBatchStop::SystemEffect,
+            CallbackBatchStop::SocketState,
+            CallbackBatchStop::Both,
+        ] {
+            assert!(controlled_batch_stop_propagated(-libc::EAGAIN, stop).unwrap());
+            assert!(controlled_batch_stop_propagated(0, stop).is_err());
+        }
+        assert!(!controlled_batch_stop_propagated(-libc::EAGAIN, CallbackBatchStop::None).unwrap());
+    }
+
+    #[test]
+    fn async_socket_producer_state_machine_fails_closed_until_sealed() {
+        let attached = AsyncSocketProducerSealState::new(true);
+        assert!(attached.registration_open());
+        assert_eq!(
+            attached.evidence(),
+            socket_state::SocketStateProducerSeal {
+                complete: false,
+                links_expected: ASYNC_SOCKET_STATE_PRODUCER_LINKS,
+                links_detached: 0,
+            }
+        );
+        assert!(AsyncSocketProducerSealState::Sealed.evidence().complete);
+        assert!(!AsyncSocketProducerSealState::Sealed.registration_open());
+        assert!(
+            !AsyncSocketProducerSealState::Failed { detached: 1 }
+                .evidence()
+                .complete
+        );
+        assert!(!AsyncSocketProducerSealState::Failed { detached: 1 }.registration_open());
+        assert_eq!(
+            ASYNC_SOCKET_STATE_PRODUCERS
+                .iter()
+                .map(|producer| producer.program_name())
+                .collect::<HashSet<_>>(),
+            HashSet::from([PROGRAM_INET_STATE, PROGRAM_TCP_DESTROY])
+        );
+    }
+
+    #[test]
+    fn async_socket_producer_not_required_has_a_vacuous_closed_seal() {
+        assert!(AsyncSocketProducerSealState::new(false).registration_open());
+        assert_eq!(
+            AsyncSocketProducerSealState::new(false).evidence(),
+            socket_state::SocketStateProducerSeal {
+                complete: true,
+                links_expected: 0,
+                links_detached: 0,
+            }
+        );
     }
 }

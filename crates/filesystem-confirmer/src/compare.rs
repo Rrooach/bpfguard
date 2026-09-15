@@ -48,6 +48,14 @@ pub fn compare(
     if before.mount_namespace_inode != after.mount_namespace_inode {
         state_reasons.push("S0 and S1 mount namespace identities differ".to_owned());
     }
+    if before.mount_namespace_capture_source != after.mount_namespace_capture_source {
+        state_reasons.push("S0 and S1 mount namespace capture sources differ".to_owned());
+    }
+    if before.mount_root_device != after.mount_root_device
+        || before.mount_root_inode != after.mount_root_inode
+    {
+        state_reasons.push("S0 and S1 absolute-path root object identities differ".to_owned());
+    }
     state_reasons.sort();
     state_reasons.dedup();
     let state_completeness = Completeness {
@@ -85,7 +93,8 @@ pub fn compare(
             .to_owned(),
         "tree capture is non-atomic; the external harness must enforce quiescence".to_owned(),
         "captured hashes confirm read bytes, not storage durability".to_owned(),
-        "v1 intentionally omits atime because confirmation reads can update it".to_owned(),
+        "v1 intentionally omits atime; all file and directory reads require O_NOATIME and fail closed when that non-mutating access is unavailable"
+            .to_owned(),
         "COMPLETE is relative to the explicit capture policy and selected roots, never all filesystem state"
             .to_owned(),
         "v1 path walks do not pin intermediate components with openat2 and same-device traversal uses st_dev rather than mount ID"

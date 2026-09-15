@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -233,6 +233,59 @@ fn capture_is_canonical_and_preserves_linux_object_evidence() {
 }
 
 #[test]
+fn content_capture_does_not_mutate_regular_file_atime() {
+    let directory = TestDirectory::new("noatime");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    let file = root.join("payload");
+    fs::write(&file, b"content whose read must not change atime").expect("write payload");
+
+    let timestamps = [
+        libc::timespec {
+            tv_sec: 1_600_000_000,
+            tv_nsec: 123_456_789,
+        },
+        libc::timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 987_654_321,
+        },
+    ];
+    for target in [&root, &file] {
+        let path = CString::new(target.as_os_str().as_bytes()).expect("path without NUL");
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    timestamps.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0,
+            "set old atime: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let before = fs::metadata(&file).expect("metadata before capture");
+    let root_before = fs::metadata(&root).expect("root metadata before capture");
+
+    let captured = snapshot(&default_scope(&root), "noatime-s0", SnapshotPhase::S0);
+    assert_eq!(captured.completeness.status, CompletenessStatus::Complete);
+    let after = fs::metadata(&file).expect("metadata after capture");
+    let root_after = fs::metadata(&root).expect("root metadata after capture");
+    assert_eq!(
+        (before.atime(), before.atime_nsec()),
+        (after.atime(), after.atime_nsec()),
+        "filesystem confirmation must not cause an atime side effect"
+    );
+    assert_eq!(
+        (root_before.atime(), root_before.atime_nsec()),
+        (root_after.atime(), root_after.atime_nsec()),
+        "directory enumeration must not cause an atime side effect"
+    );
+}
+
+#[test]
 fn missing_actor_contract_never_authorizes_unchanged() {
     let directory = TestDirectory::new("missing-contract");
     let root = directory.path.join("scope");
@@ -254,6 +307,38 @@ fn missing_actor_contract_never_authorizes_unchanged() {
     );
     assert_eq!(result.verdict, FilesystemVerdict::Inconclusive);
     assert!(result.changes.is_empty());
+}
+
+#[test]
+fn comparison_rejects_cross_root_identity_as_complete_evidence() {
+    let directory = TestDirectory::new("root-identity");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    fs::write(root.join("file"), b"same").expect("write file");
+    let scope = default_scope(&root);
+    let before = snapshot(&scope, "root-identity-s0", SnapshotPhase::S0);
+    let mut after = snapshot(&scope, "root-identity-s1", SnapshotPhase::S1);
+    after.mount_root_inode = if after.mount_root_inode == u64::MAX {
+        u64::MAX - 1
+    } else {
+        after.mount_root_inode + 1
+    };
+
+    let result = compare(&before, &after, None).expect("compare cross-root snapshots");
+    assert_eq!(
+        result.state_completeness.status,
+        CompletenessStatus::Incomplete
+    );
+    assert_eq!(
+        result.endpoint_difference,
+        EndpointDifferenceStatus::Indeterminate
+    );
+    assert_eq!(result.verdict, FilesystemVerdict::Inconclusive);
+    assert!(result
+        .state_completeness
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("root object identities differ")));
 }
 
 #[test]
@@ -322,6 +407,47 @@ fn validation_rejects_missing_root_claiming_complete() {
     let mut forged = snapshot(&scope, "forged-missing-root-s0", SnapshotPhase::S0);
     forged.completeness.status = CompletenessStatus::Complete;
     forged.completeness.reasons.clear();
+
+    assert!(forged.validate().is_err());
+}
+
+#[test]
+fn validation_rejects_entry_without_immediate_parent() {
+    let directory = TestDirectory::new("forged-missing-parent");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    fs::create_dir(root.join("present")).expect("create present parent");
+    fs::write(root.join("present/child"), b"payload").expect("write nested child");
+    let scope = default_scope(&root);
+    let mut forged = snapshot(&scope, "forged-missing-parent-s0", SnapshotPhase::S0);
+    let child = forged
+        .entries
+        .iter_mut()
+        .find(|entry| entry.relative_path_bytes_hex == hex::encode(b"present/child"))
+        .expect("captured nested child");
+    // Keep ordering and all byte-accounting unchanged while redirecting the
+    // child beneath an absent, same-length parent.
+    child.relative_path_bytes_hex = hex::encode(b"missing/child");
+    child.relative_path_display = "missing/child".to_owned();
+
+    assert!(forged.validate().is_err());
+}
+
+#[test]
+fn validation_rejects_child_beneath_untraversed_parent() {
+    let directory = TestDirectory::new("forged-untraversed-parent");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    fs::create_dir(root.join("parent")).expect("create parent");
+    fs::write(root.join("parent/child"), b"payload").expect("write nested child");
+    let scope = default_scope(&root);
+    let mut forged = snapshot(&scope, "forged-untraversed-parent-s0", SnapshotPhase::S0);
+    forged
+        .entries
+        .iter_mut()
+        .find(|entry| entry.relative_path_bytes_hex == hex::encode(b"parent"))
+        .expect("captured parent")
+        .traversal = TraversalStatus::CrossDeviceExcluded;
 
     assert!(forged.validate().is_err());
 }

@@ -1,11 +1,13 @@
 # Target VM requirements
 
 The default recorder mode uses fixed raw-syscall tracepoint layouts and does
-not consume BTF. The explicit `kernel-file-open-partial` and
-`kernel-file-open-write-partial` modes additionally require BTF and an active
-BPF LSM; the latter also requires the non-sleepable `file_permission` hook and is
-accepted only when its symbol/load/attach gates pass. All modes must still be
-runtime-tested on the experiment kernel. The daemon records the actual release, boot ID,
+not consume BTF. The explicit `kernel-file-open-partial`,
+`kernel-file-open-write-partial`, and `kernel-object-expanded-partial` modes
+additionally require BTF and an active BPF LSM. The expanded mode also requires
+the exact path/inode/mmap/socket hook ABI and a separately measured lifecycle
+BPF object; it is accepted only when both objects load and every required
+program attaches. All modes must still be runtime-tested on the experiment
+kernel. The daemon records the actual release, boot ID,
 optional BTF hash, and recorder
 object hash. It enforces the recorder hash supplied by trusted policy, but does
 not yet enforce a complete expected kernel image/probe-matrix manifest.
@@ -90,11 +92,123 @@ This builds into `.output/vm-kernel-effects/` and applies
 [`effects-object-x86.config`](effects-object-x86.config) after the BTF-free
 overlay. The builder refuses the profile unless the effective configuration
 contains `CONFIG_DEBUG_INFO_BTF=y`, `CONFIG_BPF_LSM=y`, the required
-security/cgroup options, and a `CONFIG_LSM` list containing `bpf`. It also
-requires the resulting `vmlinux` to contain a `.BTF` section. Runtime
+security/cgroup options, `CONFIG_SECURITY_PATH=y`, built-in nftables,
+dummy/veth/TAP, IPv6 multiple-table routing, representative tc
+qdisc/classifier/action support, and a
+`CONFIG_LSM` list containing `bpf`. It builds `modules` as well as `bzImage` so
+the expanded state E2E can build its empty marker module against the exact
+`Module.symvers`. It also requires the resulting `vmlinux` to contain a `.BTF`
+section. Runtime
 acceptance still has to verify both a readable non-empty
 `/sys/kernel/btf/vmlinux` and `bpf` in `/sys/kernel/security/lsm`; a valid
 build alone is not proof that the booted kernel activated BPF LSM.
+
+## Expanded object/lifecycle/Linux-state VM acceptance
+
+[`run-expanded-effects-e2e.sh`](run-expanded-effects-e2e.sh) is the privileged
+acceptance gate for `kernel-object-expanded-partial`. It starts one uniquely
+named KVM process on a caller-selected loopback SSH port and records that
+process's PID, start time, and executable identity before it can ever be
+signalled. The external raw root image is attached with QEMU `snapshot=on`;
+the test deliberately mutates the Guest and must never run against a durable
+machine or writable production image.
+
+The Host gate rebuilds the release binary and both BPF objects, builds the
+test-only module against the exact effects kernel, measures every copied
+input, provisions the disposable Guest, recovers the complete evidence tree,
+and powers off only its own identity-checked QEMU process. Run it with:
+
+```sh
+make vm-effects-kernel \
+  VM_EFFECTS_PAHOLE=.output/toolchain/install-static/bin/pahole \
+  VM_KERNEL_JOBS=64
+
+bash vm/run-expanded-effects-e2e.sh \
+  --rootfs /absolute/path/to/trixie.raw \
+  --ssh-key /absolute/path/to/trixie.id_rsa \
+  --ssh-port 10029
+```
+
+The Guest gate performs these bounded cases:
+
+1. The object-v2 fixture creates directories, symlinks and a FIFO; creates,
+   writes, chmods/chowns (including `fchmodat2`), changes xattrs, establishes
+   shared-writable mmap and mprotect channels, records anonymous/private
+   mprotect as explicitly unsupported, exercises both `unlinkat` flag forms
+   under the generic `PATH_ENTRY_REMOVE` label, creates hard
+   links with both `link` and `linkat`, renames and deletes files; performs
+   loopback bind/connect/accept; and forks, execs and exits before restoring
+   filesystem state. Every corresponding result must carry the expected
+   kernel object kind/role. Independent `fstat` plus
+   `statx(STATX_MNT_ID_UNIQUE)` values emitted by the workload must match the
+   exact resolved open path and remain identical across the fixture's write,
+   metadata, xattr, mmap/mprotect, link, rename and unlink records.
+   Bind/connect/accept must resolve as `AF_INET`/`SOCK_STREAM`/TCP; their
+   cookies and endpoints must match the ports and three distinct `SO_COOKIE`
+   values read back by the workload, and accepted peer identity must come from
+   post-accept kernel socket state.
+2. The separate socket-state WAL/JSONL/health stream must contain exact
+   syscall-entry owner links for bind, connect and accept, exercise
+   `ACCEPT_SNAPSHOT`, `TRANSITION` and `DESTROY`, report zero unsupported
+   sockets for the fixture, and close with lossless `COMPLETE` health.
+   Lifecycle WAL/JSONL must be lossless and terminal for admitted events, but
+   schema v2 health must remain `PARTIAL` because S0 and cgroup-entry enrollment
+   are not proved. Identical Linux endpoints remain `INCONCLUSIVE`, never a
+   fabricated whole-system unchanged verdict.
+3. A scope containing a nonexistent sysctl must finalize honestly as
+   `INCOMPLETE`/`INCONCLUSIVE`, and the offline verifier must reproduce that
+   result.
+4. A production `deployment-observe` Direct run discovers a pre-frozen live
+   cgroup root, registers it before resume, observes an object workload in an
+   ephemeral child created only after `READY`, and completes only after the
+   child is gone and the root is frozen again. The same run enables BPF,
+   filesystem and Linux-state S0/S1 confirmers. A pinned HASH Map and a
+   persistent file must be reported `CHANGED_WITHIN_SCOPE`, all nine endpoint
+   artifacts and the three socket-state artifacts must be in the closed set,
+   and offline verification must bind their external scopes and digests. The
+   overall evidence status deliberately remains `INCOMPLETE`: global BPF S0/S1
+   has no authenticated exclusive-actor contract and the sysctl confirmer is
+   not deployment-namespace complete.
+5. Docker- and Kata-shaped fixtures exercise production live procfs, cgroup
+   v2, namespace and sysfs discovery, dynamic descendant observation, state
+   confirmation and closure revalidation. The Docker fixture uses a real
+   nested PID namespace whose init has namespace PID 1. The Kata fixture uses
+   real Host processes, a regular virtual-disk resource and a real TAP
+   interface. The process names and runtime identities are synthetic: this is
+   explicitly not a real Docker runtime, real Kata runtime or Kata Guest E2E.
+6. A state fixture toggles one sysctl, leaves a tmpfs mounted, creates a dummy
+   interface/address/route/qdisc/nftables table, and loads an empty test-only
+   module. Sysctl, mount, local-network, and module domains must each report
+   `CHANGED_WITHIN_SCOPE`; the managed process cgroup must be empty at S1.
+7. A negative fixture leaves a sleeping descendant. The managed process-tree
+   timeout must abort before the empty/frozen endpoint barrier, mark the run
+   failed, kill the exact cgroup, and refuse a false residual-process
+   confirmation.
+8. After the functional cases pass, four excluded warm-up blocks and twelve
+   measured blocks compare `user-input` with
+   `kernel-object-expanded-partial` plus lifecycle and socket-state collection.
+   Every block runs both modes at both 0 and 1024 identical file-effect
+   iterations. A four-row schedule cross-balances load and mode order. Every
+   arm must finalize losslessly and pass offline verification. Raw wall time,
+   user/system CPU, RSS, context switches, and per-stream event and byte counts
+   are retained in `overhead-paired/summary.jsonl`; warm-ups are retained only
+   in `warmup-summary.jsonl` and excluded from inference. The Guest writes only
+   a `collection_status=PASS` marker. After recovery, the Host analyzer computes
+   each block's
+   `[(expanded-user)@1024-(expanded-user)@0]/expanded_system_event_delta`,
+   exact rational block estimates, and an exact distribution-free 95% median
+   interval. Its statistical gates decide `USABLE_ESTIMATE` versus
+   `EXPLORATORY_LOW_CONFIDENCE`; collection success is never presented as an
+   accepted overhead conclusion.
+
+Each positive run is then passed through `verify-effects`, which independently
+replays the syscall, lifecycle and socket-state WALs, checks their canonical
+JSONL projections and exact origin links, and recomputes enabled endpoint-state
+comparisons.
+The retained `.output/validation/expanded-effects-vm/<run>/` directory contains
+measured inputs, QEMU argv/console, Guest stdout/stderr, recovered evidence,
+external image/QEMU hashes, and `SHA256SUMS`. This is a cooperative-workload
+functional gate, not a hostile-Guest containment or delegated-causality claim.
 
 ## Allox supervisor protocol VM acceptance
 

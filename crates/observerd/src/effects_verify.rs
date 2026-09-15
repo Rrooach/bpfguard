@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#![allow(dead_code)]
+#![cfg_attr(not(test), allow(unused_imports))]
 
 //! Offline verification for the independent system-effect artifact set.
 
+#[cfg(test)]
+use crate::effects_run::DomainStateVerdict;
 use crate::{
     effects_run::{self, FilesystemActorContractTrust, SystemStateDomainVector},
     object_resolution::ObjectResolutionMode,
@@ -16,6 +20,15 @@ use bpf_observer_filesystem_confirmer::{
     FILESYSTEM_CONFIRMATION_PROTOCOL_VERSION, HARD_MAX_ACTOR_CONTRACT_JSON_BYTES,
     HARD_MAX_COMPARISON_JSON_BYTES, HARD_MAX_SNAPSHOT_JSON_BYTES,
 };
+use bpf_observer_linux_state_confirmers::{
+    compare as compare_linux_state, EndpointDifferenceStatus as LinuxEndpointDifferenceStatus,
+    StateComparison as LinuxStateComparison, StateDomainComparisons as LinuxStateDomainComparisons,
+    StateScope as LinuxStateScope, StateSnapshot as LinuxStateSnapshot,
+    StateVerdict as LinuxStateVerdict, TerminalState as LinuxTerminalState,
+    HARD_MAX_COMPARISON_JSON_BYTES as HARD_MAX_LINUX_STATE_COMPARISON_JSON_BYTES,
+    HARD_MAX_SNAPSHOT_JSON_BYTES as HARD_MAX_LINUX_STATE_SNAPSHOT_JSON_BYTES,
+    LINUX_STATE_CONFIRMATION_DOMAIN, LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+};
 use bpf_observer_oracle::validate_snapshot_resource_bounds;
 use bpf_observer_schema::{
     ArtifactDigest, Attribution, ClaimScope, CompletenessStatus, ObjectExclusions, RunStatus,
@@ -23,21 +36,34 @@ use bpf_observer_schema::{
     MAX_WORKLOAD_OUTPUT_BYTES,
 };
 use bpf_observer_system_effects::{
-    coverage_gaps_for, describe_policy, policy_sha256, AttributionContract, CaptureSource,
-    CaptureStatus, CapturedArgument, CoverageStatus, EffectAttribution, EffectOperation, EventKind,
-    FileObjectResolutionMode, FilePathObservation, FilesystemClass, KernelEvent,
-    KernelObjectResolver, ObjectIdentity, ObjectReference, ObjectResolution,
-    ObjectResolutionAuthority, ObjectResolutionQuality, ObjectResolutionStatus, ObjectRole,
-    PathResolutionAuthority, PathResolutionQuality, PolicyDescription, PolicyProfile, ResolvedPath,
-    ResultStatus, SystemEffectEvent, SystemEffectHealth, TransportStatus,
-    EFFECT_EVENT_SCHEMA_VERSION, FILE_PATH_NOT_REQUESTED, FILE_PATH_RESOLVED_AT_HOOK,
-    FILE_PATH_UNAVAILABLE, FLAG_OBJECT_DELETE_FAILED, FLAG_OBJECT_JOIN_AMBIGUOUS,
+    coverage_gaps_for, describe_policy,
+    lifecycle::{
+        recover_process_lifecycle_wal, verify_process_lifecycle_artifacts, ProcessLifecycleHealth,
+        ProcessLifecycleStatus, ProcessLifecycleVerificationBinding,
+        PROCESS_LIFECYCLE_ENROLLMENT_LIMITATION, PROCESS_LIFECYCLE_HEALTH_NAME,
+        PROCESS_LIFECYCLE_JSONL_NAME, PROCESS_LIFECYCLE_SCHEMA_VERSION, PROCESS_LIFECYCLE_WAL_NAME,
+    },
+    policy_sha256,
+    socket_state::{
+        verify_socket_state_artifacts, SocketStateArtifactVerification, SocketStateHealth,
+        SocketStateProducerSeal, SocketStateRunVerification, SocketStateStatus,
+        SocketStateVerificationBinding, MAX_SOCKET_STATE_WAL_BYTES, SOCKET_STATE_HEALTH_NAME,
+        SOCKET_STATE_JSONL_NAME, SOCKET_STATE_SCHEMA_VERSION, SOCKET_STATE_WAL_NAME,
+    },
+    verify_system_effect_artifacts, AttributionContract, CaptureSource, CaptureStatus,
+    CapturedArgument, CgroupMatchMode, CoverageStatus, EffectAttribution, EffectOperation,
+    EffectProcessIdentity, EffectProcessIdentityAuthority, EventKind, FileObjectResolutionMode,
+    FilesystemClass, KernelEvent, KernelObjectResolver, ObjectIdentity, ObjectReference,
+    ObjectResolution, ObjectResolutionAuthority, ObjectResolutionQuality, ObjectResolutionStatus,
+    ObjectRole, PolicyDescription, PolicyProfile, ResultStatus, SystemEffectEvent,
+    SystemEffectHealth, SystemEffectRunVerification, SystemEffectVerificationBinding,
+    TransportStatus, EFFECT_EVENT_SCHEMA_VERSION, FILE_PATH_NOT_REQUESTED,
+    FILE_PATH_RESOLVED_AT_HOOK, FLAG_OBJECT_DELETE_FAILED, FLAG_OBJECT_JOIN_AMBIGUOUS,
     FLAG_OBJECT_JOIN_MISSING, FLAG_OBJECT_PATH_UNAVAILABLE, FLAG_OBJECT_READ_FAILED,
-    FLAG_PAYLOAD1_INVALID_LENGTH, FLAG_PAYLOAD1_READ_FAILED, FLAG_PAYLOAD1_TRUNCATED,
-    FLAG_PAYLOAD2_INVALID_LENGTH, FLAG_PAYLOAD2_READ_FAILED, FLAG_PAYLOAD2_TRUNCATED,
-    FLAG_PENDING_DELETE_FAILED, FLAG_PENDING_INSERT_FAILED, FLAG_PENDING_MISSING,
-    FLAG_PENDING_POISONED, FLAG_POLICY_INVALID, FLAG_SYSCALL_MISMATCH,
-    OBJECT_IDENTITY_PROTOCOL_VERSION,
+    FLAG_OBJECT_UNSUPPORTED, FLAG_PAYLOAD1_INVALID_LENGTH, FLAG_PAYLOAD1_READ_FAILED,
+    FLAG_PAYLOAD1_TRUNCATED, FLAG_PAYLOAD2_INVALID_LENGTH, FLAG_PAYLOAD2_READ_FAILED,
+    FLAG_PAYLOAD2_TRUNCATED, FLAG_PENDING_DELETE_FAILED, FLAG_PENDING_INSERT_FAILED,
+    FLAG_PENDING_MISSING, FLAG_PENDING_POISONED, FLAG_POLICY_INVALID, FLAG_SYSCALL_MISMATCH,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,13 +94,16 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SMALL_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_WAL_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_JSONL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_LIFECYCLE_WAL_BYTES: u64 = 264 * 1_000_000;
+const MAX_LIFECYCLE_JSONL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SOCKET_STATE_JSONL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EVENT_JSON_BYTES: u64 = 64 * 1024;
 const MAX_EVENTS: u64 = 1_000_000;
 const CALLBACK_QUEUE_CAPACITY: u64 = 4_096;
 const MAX_WORKLOAD_ARGV_BYTES: usize = 1024 * 1024;
-const WAL_COMPACT_EVENT_BYTES: usize = 152;
-const WAL_FILE_OBJECT_EVENT_BYTES: usize = 328;
-const WAL_FULL_EVENT_BYTES: usize = 344;
+const WAL_COMPACT_EVENT_BYTES: usize = 160;
+const WAL_FILE_OBJECT_EVENT_BYTES: usize = 336;
+const WAL_FULL_EVENT_BYTES: usize = 352;
 const EVENT_ATTEMPT: u16 = 1;
 const EVENT_RESULT: u16 = 2;
 const PAYLOAD_NONE: u8 = 0;
@@ -109,6 +138,14 @@ pub struct EffectsVerificationReport {
     pub object_resolution_mode: ObjectResolutionMode,
     pub external_recorder_digest_checked: bool,
     pub transport_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_lifecycle_status: Option<ProcessLifecycleStatus>,
+    pub process_lifecycle_artifacts_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_state_status: Option<SocketStateStatus>,
+    pub socket_state_artifacts_verified: bool,
+    pub socket_state_events_verified: u64,
+    pub syscall_lifecycle_identity_correlation_verified: bool,
     pub attribution_contract: AttributionContract,
     pub direct_event_attribution_validated: bool,
     pub causal_attribution_complete: bool,
@@ -135,6 +172,13 @@ pub struct EffectsVerificationReport {
     pub filesystem_causal_attribution: Option<CausalAttributionStatus>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filesystem_limitations: Vec<String>,
+    pub linux_state_artifact_consistency_verified: bool,
+    pub external_linux_state_scope_exact_match: bool,
+    pub auto_process_residual_scope_reconstructed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linux_state_scope_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linux_state_limitations: Vec<String>,
     pub state_domains: SystemStateDomainVector,
 }
 
@@ -200,6 +244,22 @@ struct FilesystemStateConfirmation {
     atomic_with_other_confirmation_domains: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxStateConfirmation {
+    protocol_version: u32,
+    confirmation_domain: String,
+    scope_sha256: String,
+    s0_artifact: String,
+    s1_artifact: String,
+    comparison_artifact: String,
+    auto_process_residual_bound: bool,
+    domains: LinuxStateDomainComparisons,
+    operation_events_are_state_diff: bool,
+    atomic_with_other_confirmation_domains: bool,
+    whole_linux_unchanged_authorized: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EffectsManifest {
@@ -224,6 +284,10 @@ struct EffectsManifest {
     policy_artifact: String,
     expected_recorder_object_sha256: String,
     loaded_recorder_object_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_lifecycle: Option<ProcessLifecycleEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    socket_state: Option<SocketStateEvidence>,
     kernel_release: String,
     boot_id: String,
     observer_version: String,
@@ -236,9 +300,43 @@ struct EffectsManifest {
     bpf_state_confirmation: Option<BpfStateConfirmation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_state_confirmation: Option<FilesystemStateConfirmation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linux_state_confirmation: Option<LinuxStateConfirmation>,
     artifacts: BTreeMap<String, ArtifactDigest>,
     failure: Option<String>,
     notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessLifecycleEvidence {
+    protocol_version: u32,
+    expected_object_sha256: String,
+    loaded_object_sha256: String,
+    observer_exclusions: ObjectExclusions,
+    wal_artifact: String,
+    jsonl_artifact: String,
+    health_artifact: String,
+    status: ProcessLifecycleStatus,
+    event_published: u64,
+    event_dropped: u64,
+    task_read_failed: u64,
+    lineage: Option<bpf_observer_system_effects::lifecycle::ProcessLineageSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SocketStateEvidence {
+    protocol_version: u32,
+    wal_artifact: String,
+    jsonl_artifact: String,
+    health_artifact: String,
+    status: SocketStateStatus,
+    event_published: u64,
+    event_dropped: u64,
+    destroy_events_persisted: u64,
+    owners_retired_at_barrier: u64,
+    async_producer_seal: SocketStateProducerSeal,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -323,6 +421,7 @@ impl AttemptReplayState {
     }
 }
 
+#[cfg(test)]
 pub fn verify_run(
     directory: &Path,
     expected_recorder_sha256: &str,
@@ -331,6 +430,61 @@ pub fn verify_run(
     expected_bpf_state_scope: Option<&ClaimScope>,
     expected_filesystem_state_scope: Option<&FilesystemScope>,
     expected_filesystem_actor_contract: Option<&ActorQuiescenceContract>,
+) -> Result<EffectsVerificationReport> {
+    verify_run_with_linux_state(
+        directory,
+        expected_recorder_sha256,
+        expected_profile,
+        expected_object_resolution,
+        expected_bpf_state_scope,
+        expected_filesystem_state_scope,
+        expected_filesystem_actor_contract,
+        None,
+        false,
+    )
+}
+
+// The explicit trust inputs intentionally remain separate at this boundary:
+// bundling them would make it easier for a caller to confuse independently
+// trusted scopes/contracts with values recovered from the artifact directory.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_run_with_linux_state(
+    directory: &Path,
+    expected_recorder_sha256: &str,
+    expected_profile: PolicyProfile,
+    expected_object_resolution: ObjectResolutionMode,
+    expected_bpf_state_scope: Option<&ClaimScope>,
+    expected_filesystem_state_scope: Option<&FilesystemScope>,
+    expected_filesystem_actor_contract: Option<&ActorQuiescenceContract>,
+    expected_linux_state_scope: Option<&LinuxStateScope>,
+    confirm_process_residual: bool,
+) -> Result<EffectsVerificationReport> {
+    verify_run_with_linux_state_and_lifecycle(
+        directory,
+        expected_recorder_sha256,
+        None,
+        expected_profile,
+        expected_object_resolution,
+        expected_bpf_state_scope,
+        expected_filesystem_state_scope,
+        expected_filesystem_actor_contract,
+        expected_linux_state_scope,
+        confirm_process_residual,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_run_with_linux_state_and_lifecycle(
+    directory: &Path,
+    expected_recorder_sha256: &str,
+    expected_process_lifecycle_sha256: Option<&str>,
+    expected_profile: PolicyProfile,
+    expected_object_resolution: ObjectResolutionMode,
+    expected_bpf_state_scope: Option<&ClaimScope>,
+    expected_filesystem_state_scope: Option<&FilesystemScope>,
+    expected_filesystem_actor_contract: Option<&ActorQuiescenceContract>,
+    expected_linux_state_scope: Option<&LinuxStateScope>,
+    confirm_process_residual: bool,
 ) -> Result<EffectsVerificationReport> {
     let directory_state = validate_directory(directory)?;
     validate_sha256(
@@ -343,6 +497,7 @@ pub fn verify_run(
     validate_manifest(
         &manifest,
         expected_recorder_sha256,
+        expected_process_lifecycle_sha256,
         expected_profile,
         expected_object_resolution,
     )?;
@@ -353,16 +508,54 @@ pub fn verify_run(
     let health: SystemEffectHealth = artifacts.read_json(HEALTH_NAME, MAX_SMALL_JSON_BYTES)?;
     validate_health(&manifest, &health)?;
 
-    let policy_by_syscall = policy
-        .entries
-        .iter()
-        .map(|entry| (entry.syscall_nr, entry))
-        .collect::<HashMap<_, _>>();
-    if policy_by_syscall.len() != policy.entries.len() {
-        bail!("system-effect policy contains duplicate syscall numbers");
+    artifacts.verify_only(WAL_NAME, MAX_WAL_BYTES)?;
+    artifacts.verify_only(JSONL_NAME, MAX_JSONL_BYTES)?;
+    let stream_verification = verify_system_effect_artifacts(
+        &directory.join(WAL_NAME),
+        &directory.join(JSONL_NAME),
+        &SystemEffectVerificationBinding {
+            run_id: manifest.run_id.clone(),
+            boot_id: manifest.boot_id.clone(),
+            profile: manifest.policy_profile,
+            object_resolution_mode: recorder_resolution_mode(manifest.object_resolution_mode),
+            cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+            runs: vec![SystemEffectRunVerification {
+                cgroup_id: manifest.cgroup_id,
+                run_epoch: manifest.run_epoch,
+                published: health.event_published,
+                dropped: health.event_dropped,
+            }],
+        },
+    )
+    .context("strictly replay system-effect WAL and canonical JSONL")?;
+    if stream_verification.policy_sha256 != manifest.policy_sha256
+        || stream_verification.runs.len() != 1
+        || !stream_verification.runs[0].pairing_complete
+        || stream_verification.runs[0].fatal_correlation_events != 0
+    {
+        bail!("strict system-effect replay disagrees with finalized manifest/health");
     }
-
-    let events_verified = artifacts.verify_event_streams(&manifest, &health, &policy_by_syscall)?;
+    let events_verified = stream_verification.wal_event_count;
+    let verified_socket_state = verify_socket_state_evidence(&manifest, &health, &mut artifacts)?;
+    let verified_lifecycle = verify_process_lifecycle_evidence(&manifest, &mut artifacts)?;
+    let syscall_lifecycle_identity_correlation_verified =
+        if let Some(lifecycle) = verified_lifecycle.as_ref() {
+            for reference in &stream_verification.process_references {
+                if !lifecycle.identities.contains(&(
+                    reference.pid,
+                    reference.tgid,
+                    reference.start_boottime_ns,
+                )) {
+                    bail!(
+                        "system-effect event {} has no matching lifecycle process identity",
+                        reference.event_seq
+                    );
+                }
+            }
+            true
+        } else {
+            false
+        };
     artifacts.verify_only(STDOUT_NAME, MAX_WORKLOAD_OUTPUT_BYTES)?;
     artifacts.verify_only(STDERR_NAME, MAX_WORKLOAD_OUTPUT_BYTES)?;
     let bpf_state_verdict =
@@ -373,16 +566,23 @@ pub fn verify_run(
         expected_filesystem_state_scope,
         expected_filesystem_actor_contract,
     )?;
+    let linux_state_comparison = verify_linux_state_confirmation(
+        &manifest,
+        &mut artifacts,
+        expected_linux_state_scope,
+        confirm_process_residual,
+    )?;
     let artifacts_verified = expected_artifact_names(&manifest).len();
     artifacts.finish()?;
     verify_manifest_path(directory, manifest_state)?;
     verify_directory_path(directory, directory_state)?;
 
-    let state_domains = effects_run::system_state_domain_vector(
+    let state_domains = effects_run::system_state_domain_vector_with_linux(
         bpf_state_verdict.as_ref(),
         filesystem_comparison
             .as_ref()
             .map(|comparison| comparison.verdict),
+        linux_state_comparison.as_ref(),
     );
     Ok(EffectsVerificationReport {
         schema_version: EFFECT_EVENT_SCHEMA_VERSION,
@@ -396,6 +596,15 @@ pub fn verify_run(
         object_resolution_mode: manifest.object_resolution_mode,
         external_recorder_digest_checked: true,
         transport_complete: true,
+        process_lifecycle_status: verified_lifecycle.as_ref().map(|value| value.health.status),
+        process_lifecycle_artifacts_verified: verified_lifecycle.is_some(),
+        socket_state_status: health.socket_state.as_ref().map(|value| value.status),
+        socket_state_artifacts_verified: verified_socket_state.is_some(),
+        socket_state_events_verified: verified_socket_state
+            .as_ref()
+            .map(|value| value.events_verified)
+            .unwrap_or(0),
+        syscall_lifecycle_identity_correlation_verified,
         attribution_contract: manifest.attribution_contract,
         direct_event_attribution_validated: true,
         causal_attribution_complete: false,
@@ -432,6 +641,18 @@ pub fn verify_run(
             .as_ref()
             .map(|comparison| comparison.causal_attribution_status),
         filesystem_limitations: filesystem_comparison
+            .as_ref()
+            .map(|comparison| comparison.limitations.clone())
+            .unwrap_or_default(),
+        linux_state_artifact_consistency_verified: linux_state_comparison.is_some(),
+        external_linux_state_scope_exact_match: linux_state_comparison.is_some()
+            && (expected_linux_state_scope.is_some() || confirm_process_residual),
+        auto_process_residual_scope_reconstructed: linux_state_comparison.is_some()
+            && confirm_process_residual,
+        linux_state_scope_sha256: linux_state_comparison
+            .as_ref()
+            .map(|comparison| comparison.scope_sha256.clone()),
+        linux_state_limitations: linux_state_comparison
             .as_ref()
             .map(|comparison| comparison.limitations.clone())
             .unwrap_or_default(),
@@ -480,6 +701,23 @@ fn verify_bpf_state_confirmation(
     {
         bail!("BPF state confirmation omitted recorder-owned object exclusions");
     }
+    if let Some(lifecycle) = manifest.process_lifecycle.as_ref() {
+        if !lifecycle
+            .observer_exclusions
+            .program_ids
+            .is_subset(&confirmation.observer_exclusions.program_ids)
+            || !lifecycle
+                .observer_exclusions
+                .map_ids
+                .is_subset(&confirmation.observer_exclusions.map_ids)
+            || !lifecycle
+                .observer_exclusions
+                .link_ids
+                .is_subset(&confirmation.observer_exclusions.link_ids)
+        {
+            bail!("BPF endpoint confirmation omitted lifecycle recorder exclusions");
+        }
+    }
 
     let s0: Snapshot =
         artifacts.read_json(effects_run::BPF_STATE_S0_NAME, MAX_SNAPSHOT_JSON_BYTES)?;
@@ -523,6 +761,176 @@ fn verify_bpf_state_confirmation(
         bail!("BPF state confirmation summary does not match its conservative verdict");
     }
     Ok(Some(verdict.state_verdict))
+}
+
+struct VerifiedLifecycle {
+    health: ProcessLifecycleHealth,
+    identities: BTreeSet<(u32, u32, u64)>,
+}
+
+fn verify_socket_state_evidence(
+    manifest: &EffectsManifest,
+    system_health: &SystemEffectHealth,
+    artifacts: &mut VerifiedArtifacts<'_>,
+) -> Result<Option<SocketStateArtifactVerification>> {
+    let (evidence, health) = match (
+        manifest.socket_state.as_ref(),
+        system_health.socket_state.as_ref(),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(evidence), Some(health)) => (evidence, health),
+        _ => bail!("socket-state manifest and system health disagree on evidence presence"),
+    };
+    let stored: SocketStateHealth =
+        artifacts.read_json(SOCKET_STATE_HEALTH_NAME, MAX_SMALL_JSON_BYTES)?;
+    if stored != *health
+        || evidence.protocol_version != SOCKET_STATE_SCHEMA_VERSION
+        || evidence.wal_artifact != SOCKET_STATE_WAL_NAME
+        || evidence.jsonl_artifact != SOCKET_STATE_JSONL_NAME
+        || evidence.health_artifact != SOCKET_STATE_HEALTH_NAME
+        || evidence.status != health.status
+        || evidence.event_published != health.event_published
+        || evidence.event_dropped != health.event_dropped
+        || evidence.destroy_events_persisted != health.destroy_events_persisted
+        || evidence.owners_retired_at_barrier != health.owners_retired_at_barrier
+        || evidence.async_producer_seal != health.async_producer_seal
+        || !evidence.async_producer_seal.is_required_complete()
+    {
+        bail!("socket-state evidence summary disagrees with its health artifact");
+    }
+    artifacts.verify_only(SOCKET_STATE_WAL_NAME, MAX_SOCKET_STATE_WAL_BYTES)?;
+    artifacts.verify_only(SOCKET_STATE_JSONL_NAME, MAX_SOCKET_STATE_JSONL_BYTES)?;
+    let verification = verify_socket_state_artifacts(
+        &artifacts.directory.join(SOCKET_STATE_WAL_NAME),
+        &artifacts.directory.join(SOCKET_STATE_JSONL_NAME),
+        &artifacts.directory.join(WAL_NAME),
+        &SocketStateVerificationBinding {
+            run_id: manifest.run_id.clone(),
+            boot_id: manifest.boot_id.clone(),
+            cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+            runs: vec![SocketStateRunVerification {
+                cgroup_id: manifest.cgroup_id,
+                run_epoch: manifest.run_epoch,
+                published: health.event_published,
+                dropped: health.event_dropped,
+            }],
+        },
+        std::slice::from_ref(health),
+    )
+    .context("strictly replay socket-state WAL, canonical JSONL, health, and syscall origins")?;
+    if !verification.jsonl_projection_verified
+        || verification.runs.len() != 1
+        || verification.runs[0].destroy_events_verified != health.destroy_events_persisted
+    {
+        bail!("socket-state strict replay disagrees with finalized health");
+    }
+    Ok(Some(verification))
+}
+
+fn verify_process_lifecycle_evidence(
+    manifest: &EffectsManifest,
+    artifacts: &mut VerifiedArtifacts<'_>,
+) -> Result<Option<VerifiedLifecycle>> {
+    let Some(evidence) = manifest.process_lifecycle.as_ref() else {
+        return Ok(None);
+    };
+    let health: ProcessLifecycleHealth =
+        artifacts.read_json(PROCESS_LIFECYCLE_HEALTH_NAME, MAX_SMALL_JSON_BYTES)?;
+    health
+        .validate_partial_enrollment_contract()
+        .context("validate process-lifecycle partial-enrollment contract")?;
+    if evidence.protocol_version != PROCESS_LIFECYCLE_SCHEMA_VERSION
+        || evidence.wal_artifact != PROCESS_LIFECYCLE_WAL_NAME
+        || evidence.jsonl_artifact != PROCESS_LIFECYCLE_JSONL_NAME
+        || evidence.health_artifact != PROCESS_LIFECYCLE_HEALTH_NAME
+        || health.schema_version != PROCESS_LIFECYCLE_SCHEMA_VERSION
+        || health.run_id != manifest.run_id
+        || health.run_epoch != manifest.run_epoch
+        || health.cgroup_id != manifest.cgroup_id
+        || health.status != evidence.status
+        || health.event_published != evidence.event_published
+        || health.event_dropped != evidence.event_dropped
+        || health.task_read_failed != evidence.task_read_failed
+        || health.lineage != evidence.lineage
+        || health.event_attempted
+            != health
+                .event_published
+                .checked_add(health.event_dropped)
+                .context("process-lifecycle event accounting overflow")?
+        || health.event_published != health.events_persisted
+        || health.event_published == 0
+        || health.event_dropped != 0
+        || health.task_read_failed != 0
+        || health.userspace_failures != 0
+        || !health.producer_barrier_complete
+        || !health.drain_completed
+        || !health.wal_durable
+        || !health.reasons.is_empty()
+        || health.status != ProcessLifecycleStatus::Partial
+        || !health
+            .limitations
+            .iter()
+            .any(|limitation| limitation == PROCESS_LIFECYCLE_ENROLLMENT_LIMITATION)
+    {
+        bail!("process-lifecycle health is not bound partial-enrollment evidence");
+    }
+    let lineage = health
+        .lineage
+        .as_ref()
+        .context("process-lifecycle health omitted independently replayable lineage")?;
+    if lineage.event_count != health.event_published
+        || lineage.task_identities != lineage.exited_task_identities
+    {
+        bail!("process-lifecycle health lineage is not terminal and lossless");
+    }
+    lineage.validate()?;
+    if evidence
+        .observer_exclusions
+        .program_ids
+        .iter()
+        .chain(evidence.observer_exclusions.map_ids.iter())
+        .chain(evidence.observer_exclusions.link_ids.iter())
+        .any(|id| *id == 0)
+    {
+        bail!("process-lifecycle observer exclusions contain a zero BPF object ID");
+    }
+
+    artifacts.verify_only(PROCESS_LIFECYCLE_WAL_NAME, MAX_LIFECYCLE_WAL_BYTES)?;
+    artifacts.verify_only(PROCESS_LIFECYCLE_JSONL_NAME, MAX_LIFECYCLE_JSONL_BYTES)?;
+    let verification = verify_process_lifecycle_artifacts(
+        &artifacts.directory.join(PROCESS_LIFECYCLE_WAL_NAME),
+        &artifacts.directory.join(PROCESS_LIFECYCLE_JSONL_NAME),
+        &ProcessLifecycleVerificationBinding {
+            run_id: manifest.run_id.clone(),
+            boot_id: manifest.boot_id.clone(),
+            run_epoch: manifest.run_epoch,
+            cgroup_id: manifest.cgroup_id,
+            cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+            published: health.event_published,
+            dropped: health.event_dropped,
+        },
+    )
+    .context("strictly replay process-lifecycle WAL and canonical JSONL")?;
+    if verification.lineage != *lineage
+        || verification.wal_event_count != health.event_published
+        || !verification.jsonl_projection_verified
+    {
+        bail!("process-lifecycle replay disagrees with health/manifest");
+    }
+
+    let recovery =
+        recover_process_lifecycle_wal(&artifacts.directory.join(PROCESS_LIFECYCLE_WAL_NAME))?;
+    if recovery.truncated_tail {
+        bail!("process-lifecycle WAL has a truncated tail after strict replay");
+    }
+    let mut identities = BTreeSet::new();
+    for event in recovery.events {
+        identities.insert((event.pid, event.tgid, event.start_boottime_ns));
+        if event.old_pid != 0 {
+            identities.insert((event.old_pid, event.tgid, event.start_boottime_ns));
+        }
+    }
+    Ok(Some(VerifiedLifecycle { health, identities }))
 }
 
 fn verify_filesystem_state_confirmation(
@@ -652,6 +1060,111 @@ fn verify_filesystem_state_confirmation(
     Ok(Some(recomputed))
 }
 
+fn verify_linux_state_confirmation(
+    manifest: &EffectsManifest,
+    artifacts: &mut VerifiedArtifacts<'_>,
+    expected_base_scope: Option<&LinuxStateScope>,
+    expected_auto_process_residual: bool,
+) -> Result<Option<LinuxStateComparison>> {
+    let confirmation = match manifest.linux_state_confirmation.as_ref() {
+        None => {
+            if expected_base_scope.is_some() || expected_auto_process_residual {
+                bail!("externally required Linux state confirmation is absent");
+            }
+            return Ok(None);
+        }
+        Some(confirmation) => confirmation,
+    };
+    if confirmation.auto_process_residual_bound != expected_auto_process_residual {
+        bail!("automatic process residual binding does not match external verification policy");
+    }
+    if let Some(scope) = expected_base_scope {
+        scope
+            .validate()
+            .context("validate externally trusted Linux state scope")?;
+    }
+    let expected_scope = effects_run::effective_linux_state_scope(
+        expected_base_scope,
+        expected_auto_process_residual,
+        Path::new(&manifest.cgroup_path),
+        manifest.cgroup_id,
+    )?
+    .context("Linux state confirmation requires an externally trusted or auto-derived scope")?;
+    if confirmation.protocol_version != LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION
+        || confirmation.confirmation_domain != LINUX_STATE_CONFIRMATION_DOMAIN
+        || confirmation.scope_sha256 != expected_scope.sha256()?
+        || confirmation.s0_artifact != effects_run::LINUX_STATE_S0_NAME
+        || confirmation.s1_artifact != effects_run::LINUX_STATE_S1_NAME
+        || confirmation.comparison_artifact != effects_run::LINUX_STATE_COMPARISON_NAME
+        || confirmation.operation_events_are_state_diff
+        || confirmation.atomic_with_other_confirmation_domains
+        || confirmation.whole_linux_unchanged_authorized
+    {
+        bail!("Linux state confirmation declares an unsupported or overstated contract");
+    }
+
+    let s0: LinuxStateSnapshot = artifacts.read_json(
+        effects_run::LINUX_STATE_S0_NAME,
+        HARD_MAX_LINUX_STATE_SNAPSHOT_JSON_BYTES,
+    )?;
+    let s1: LinuxStateSnapshot = artifacts.read_json(
+        effects_run::LINUX_STATE_S1_NAME,
+        HARD_MAX_LINUX_STATE_SNAPSHOT_JSON_BYTES,
+    )?;
+    let stored: LinuxStateComparison = artifacts.read_json(
+        effects_run::LINUX_STATE_COMPARISON_NAME,
+        HARD_MAX_LINUX_STATE_COMPARISON_JSON_BYTES,
+    )?;
+    if s0.snapshot_id
+        != effects_run::linux_state_snapshot_id(&manifest.run_id, manifest.run_epoch, "S0")
+        || s1.snapshot_id
+            != effects_run::linux_state_snapshot_id(&manifest.run_id, manifest.run_epoch, "S1")
+        || s0.phase != bpf_observer_linux_state_confirmers::SnapshotPhase::S0
+        || s1.phase != bpf_observer_linux_state_confirmers::SnapshotPhase::S1
+        || s0.scope != expected_scope
+        || s1.scope != expected_scope
+        || s0.scope_sha256 != confirmation.scope_sha256
+        || s1.scope_sha256 != confirmation.scope_sha256
+        || s0.boot_id != manifest.boot_id
+        || s1.boot_id != manifest.boot_id
+        || s0.captured_unix_ns < manifest.started_unix_ns
+        || s1.captured_unix_ns < s0.captured_unix_ns
+        || Some(s1.captured_unix_ns) > manifest.finalized_unix_ns
+    {
+        bail!("Linux state snapshots are not bound to the effects run and external scope");
+    }
+    let recomputed =
+        compare_linux_state(&s0, &s1).context("recompute Linux endpoint-state comparison")?;
+    if stored != recomputed {
+        bail!("stored Linux state comparison does not match verified endpoint snapshots");
+    }
+    if confirmation.domains != recomputed.domains {
+        bail!("Linux state manifest domain vector does not match recomputed comparison");
+    }
+    if expected_auto_process_residual {
+        let s0_residual = s0
+            .process_residual
+            .as_ref()
+            .context("automatic process residual S0 domain is absent")?;
+        let s1_residual = s1
+            .process_residual
+            .as_ref()
+            .context("automatic process residual S1 domain is absent")?;
+        let result = &recomputed.domains.process_residual;
+        if !s0_residual.records.is_empty()
+            || !s1_residual.records.is_empty()
+            || result.state_completeness.status
+                != bpf_observer_linux_state_confirmers::CompletenessStatus::Complete
+            || result.endpoint_difference != LinuxEndpointDifferenceStatus::ObservedIdentical
+            || result.verdict != LinuxStateVerdict::Inconclusive
+            || result.terminal_state != LinuxTerminalState::EmptyWithinScope
+        {
+            bail!("automatic process residual evidence does not prove an empty scoped endpoint");
+        }
+    }
+    Ok(Some(recomputed))
+}
+
 fn validate_directory(directory: &Path) -> Result<FileState> {
     let metadata = fs::symlink_metadata(directory).with_context(|| {
         format!(
@@ -668,13 +1181,18 @@ fn validate_directory(directory: &Path) -> Result<FileState> {
 fn validate_manifest(
     manifest: &EffectsManifest,
     trusted_digest: &str,
+    trusted_lifecycle_digest: Option<&str>,
     trusted_profile: PolicyProfile,
     trusted_object_resolution: ObjectResolutionMode,
 ) -> Result<()> {
     let evidence_kind_valid = (manifest.evidence_kind == effects_run::EVIDENCE_KIND_V1
-        && manifest.filesystem_state_confirmation.is_none())
+        && manifest.filesystem_state_confirmation.is_none()
+        && manifest.linux_state_confirmation.is_none())
         || (manifest.evidence_kind == effects_run::EVIDENCE_KIND_FILESYSTEM_V2
-            && manifest.filesystem_state_confirmation.is_some());
+            && manifest.filesystem_state_confirmation.is_some()
+            && manifest.linux_state_confirmation.is_none())
+        || (manifest.evidence_kind == effects_run::EVIDENCE_KIND_SCOPED_STATE_V3
+            && manifest.linux_state_confirmation.is_some());
     if manifest.schema_version != EFFECT_EVENT_SCHEMA_VERSION
         || !evidence_kind_valid
         || manifest.run_status != EffectRunStatus::Finalized
@@ -743,6 +1261,38 @@ fn validate_manifest(
     }
     if trusted_object_resolution != manifest.object_resolution_mode {
         bail!("system-effect object resolution does not match external trust policy");
+    }
+    match (
+        manifest.object_resolution_mode,
+        manifest.process_lifecycle.as_ref(),
+        trusted_lifecycle_digest,
+    ) {
+        (ObjectResolutionMode::KernelObjectExpandedPartial, Some(lifecycle), Some(trusted)) => {
+            validate_sha256(trusted, "externally trusted process-lifecycle object")?;
+            validate_sha256(
+                &lifecycle.expected_object_sha256,
+                "manifest expected process-lifecycle object",
+            )?;
+            validate_sha256(
+                &lifecycle.loaded_object_sha256,
+                "manifest loaded process-lifecycle object",
+            )?;
+            if lifecycle.expected_object_sha256 != lifecycle.loaded_object_sha256
+                || lifecycle.loaded_object_sha256 != trusted
+            {
+                bail!("process-lifecycle object digest does not match external trust policy");
+            }
+        }
+        (ObjectResolutionMode::KernelObjectExpandedPartial, _, _) => {
+            bail!("expanded object run lacks externally bound process-lifecycle evidence")
+        }
+        (_, None, None) => {}
+        _ => bail!("non-expanded run unexpectedly contains lifecycle evidence or trust input"),
+    }
+    if (manifest.object_resolution_mode == ObjectResolutionMode::KernelObjectExpandedPartial)
+        != manifest.socket_state.is_some()
+    {
+        bail!("socket-state evidence presence does not match expanded object mode");
     }
     if manifest.kernel_release.is_empty()
         || manifest.kernel_release.contains('\0')
@@ -827,6 +1377,9 @@ fn recorder_resolution_mode(mode: ObjectResolutionMode) -> FileObjectResolutionM
         ObjectResolutionMode::KernelFileOpenWritePartial => {
             FileObjectResolutionMode::KernelFileOpenWritePartial
         }
+        ObjectResolutionMode::KernelObjectExpandedPartial => {
+            FileObjectResolutionMode::KernelObjectExpandedPartial
+        }
     }
 }
 
@@ -844,6 +1397,12 @@ fn validate_policy(manifest: &EffectsManifest, policy: &PolicyArtifact) -> Resul
         bail!("system-effect policy artifact does not match the compiled frozen policy");
     }
     Ok(())
+}
+
+fn combined_callback_queue_high_water(system: u64, socket: Option<u64>) -> Result<u64> {
+    system
+        .checked_add(socket.unwrap_or(0))
+        .context("combined system/socket callback high-water overflow")
 }
 
 fn validate_health(manifest: &EffectsManifest, health: &SystemEffectHealth) -> Result<()> {
@@ -879,6 +1438,7 @@ fn validate_health(manifest: &EffectsManifest, health: &SystemEffectHealth) -> R
         || health.object_pending_remaining != 0
         || health.userspace_failures != 0
         || health.fatal_kernel_flags != 0
+        || health.task_read_failed != 0
         || health.events_persisted == 0
         || health.events_persisted > MAX_EVENTS
     {
@@ -895,17 +1455,23 @@ fn validate_health(manifest: &EffectsManifest, health: &SystemEffectHealth) -> R
                 || health.object_read_failed != 0
                 || health.object_delete_failed != 0
                 || health.object_path_unavailable != 0
+                || health.object_unsupported != 0
+                || health.socket_state.is_some()
             {
                 bail!("user-input health contains kernel file-object activity");
             }
         }
         FileObjectResolutionMode::KernelFileOpenPartial
-        | FileObjectResolutionMode::KernelFileOpenWritePartial => {
+        | FileObjectResolutionMode::KernelFileOpenWritePartial
+        | FileObjectResolutionMode::KernelObjectExpandedPartial => {
             if health
                 .object_resolution_resolved
                 .checked_add(health.object_resolution_unresolved)
                 != Some(health.object_resolution_attempted)
-                || health.object_resolution_failed_syscalls != health.object_resolution_unresolved
+                || health
+                    .object_resolution_failed_syscalls
+                    .checked_add(health.object_unsupported)
+                    != Some(health.object_resolution_unresolved)
                 || health.object_join_missing != 0
                 || health.object_join_ambiguous != 0
                 || health.object_read_failed != 0
@@ -915,12 +1481,28 @@ fn validate_health(manifest: &EffectsManifest, health: &SystemEffectHealth) -> R
             }
         }
     }
+    if (manifest.object_resolution_mode == ObjectResolutionMode::KernelObjectExpandedPartial)
+        != health.socket_state.is_some()
+    {
+        bail!("system-effect health socket-state presence disagrees with expanded mode");
+    }
+    // poll() persists both ring-buffer callback queues before it returns, so
+    // its observed batch maximum is bounded by the sum of their independently
+    // measured high-water marks in expanded mode. In every other mode the
+    // optional component is zero and this reduces to the original invariant.
+    let combined_queue_high_water = combined_callback_queue_high_water(
+        health.callback_queue_high_water,
+        health
+            .socket_state
+            .as_ref()
+            .map(|socket| socket.callback_queue_high_water),
+    )?;
     if health.poll_calls == 0
         || health.callback_queue_capacity != CALLBACK_QUEUE_CAPACITY
         || health.callback_queue_high_water == 0
         || health.maximum_events_per_poll == 0
         || health.callback_queue_high_water > health.callback_queue_capacity
-        || health.maximum_events_per_poll > health.callback_queue_high_water
+        || health.maximum_events_per_poll > combined_queue_high_water
         || health.capture_read_failures > health.operation_attempted
         || health.capture_truncations > health.operation_attempted
         || health.capture_invalid_lengths > health.operation_attempted
@@ -1159,6 +1741,7 @@ fn verify_stream_records(
     let mut object_read_failed = 0u64;
     let mut object_delete_failed = 0u64;
     let mut object_path_unavailable = 0u64;
+    let mut object_unsupported = 0u64;
     let mut count = 0u64;
 
     loop {
@@ -1214,6 +1797,7 @@ fn verify_stream_records(
         object_read_failed += u64::from(raw.flags & FLAG_OBJECT_READ_FAILED != 0);
         object_delete_failed += u64::from(raw.flags & FLAG_OBJECT_DELETE_FAILED != 0);
         object_path_unavailable += u64::from(raw.flags & FLAG_OBJECT_PATH_UNAVAILABLE != 0);
+        object_unsupported += u64::from(raw.flags & FLAG_OBJECT_UNSUPPORTED != 0);
         let object_accounting =
             replay_object_resolution(manifest.object_resolution_mode, &raw, policy)?;
 
@@ -1234,6 +1818,10 @@ fn verify_stream_records(
                         object_resolution_attempted += 1;
                         object_resolution_unresolved += 1;
                         object_resolution_failed_syscalls += 1;
+                    }
+                    ReplayedObjectResolution::Unsupported => {
+                        object_resolution_attempted += 1;
+                        object_resolution_unresolved += 1;
                     }
                 }
                 attempts.complete(&raw)?;
@@ -1259,6 +1847,7 @@ fn verify_stream_records(
         || object_read_failed != health.object_read_failed
         || object_delete_failed != health.object_delete_failed
         || object_path_unavailable != health.object_path_unavailable
+        || object_unsupported != health.object_unsupported
     {
         bail!("system-effect streams do not reproduce health accounting");
     }
@@ -1270,6 +1859,7 @@ enum ReplayedObjectResolution {
     NotApplicable,
     Resolved,
     FailedSyscall,
+    Unsupported,
 }
 
 fn replay_object_resolution(
@@ -1277,38 +1867,91 @@ fn replay_object_resolution(
     raw: &KernelEvent,
     policy: &PolicyDescription,
 ) -> Result<ReplayedObjectResolution> {
-    let resolver = KernelObjectResolver::for_operation(policy.operation);
-    let required = if raw.kind != EVENT_RESULT {
-        false
-    } else {
-        match mode {
-            ObjectResolutionMode::UserInput => false,
-            ObjectResolutionMode::KernelFileOpenPartial => {
-                resolver == KernelObjectResolver::FileOpen
-            }
-            ObjectResolutionMode::KernelFileOpenWritePartial => match resolver {
-                KernelObjectResolver::FileOpen => true,
-                KernelObjectResolver::FilePermissionWrite => raw.return_value > 0,
-                KernelObjectResolver::None => false,
-            },
-        }
+    let resolver = policy.object_resolver;
+    let enabled = match mode {
+        ObjectResolutionMode::UserInput => false,
+        ObjectResolutionMode::KernelFileOpenPartial => resolver == KernelObjectResolver::FileOpen,
+        ObjectResolutionMode::KernelFileOpenWritePartial => matches!(
+            resolver,
+            KernelObjectResolver::FileOpen | KernelObjectResolver::FilePermissionWrite
+        ),
+        ObjectResolutionMode::KernelObjectExpandedPartial => resolver != KernelObjectResolver::None,
     };
-    if !required {
-        if raw.file_object.is_some() {
-            bail!("system-effect stream contains FILE_OBJECT evidence outside the selected mode and eligible result set");
+    let applicable = raw.kind == EVENT_RESULT
+        && enabled
+        && match resolver {
+            KernelObjectResolver::None => false,
+            KernelObjectResolver::FilePermissionWrite => raw.return_value > 0,
+            KernelObjectResolver::MmapFileWrite => mmap_object_eligible(raw),
+            KernelObjectResolver::FileOpen
+            | KernelObjectResolver::PathCreateParent
+            | KernelObjectResolver::PathUnlink
+            | KernelObjectResolver::PathRenameSource
+            | KernelObjectResolver::PathSetattr
+            | KernelObjectResolver::InodeXattr
+            | KernelObjectResolver::SocketConnect
+            | KernelObjectResolver::SocketBind
+            | KernelObjectResolver::SocketAccept
+            | KernelObjectResolver::PathLinkSource
+            | KernelObjectResolver::MprotectFileWrite => true,
+        };
+    if !applicable {
+        if raw.file_object.is_some()
+            || raw.socket_object.is_some()
+            || raw.flags & FLAG_OBJECT_UNSUPPORTED != 0
+        {
+            bail!("system-effect stream contains object evidence outside the selected mode and eligible result set");
         }
         return Ok(ReplayedObjectResolution::NotApplicable);
     }
-    if resolver == KernelObjectResolver::FileOpen && raw.return_value < 0 {
-        if raw.file_object.is_some() {
-            bail!("failed file-open result contains FILE_OBJECT evidence");
+
+    let socket_resolver = matches!(
+        resolver,
+        KernelObjectResolver::SocketConnect
+            | KernelObjectResolver::SocketBind
+            | KernelObjectResolver::SocketAccept
+    );
+    if raw.file_object.is_some() && socket_resolver {
+        bail!("socket resolver produced FILE_OBJECT evidence");
+    }
+    if raw.socket_object.is_some() && !socket_resolver {
+        bail!("non-socket resolver produced SOCKET_OBJECT evidence");
+    }
+    if raw.flags & FLAG_OBJECT_UNSUPPORTED != 0 {
+        if !matches!(
+            resolver,
+            KernelObjectResolver::SocketAccept | KernelObjectResolver::MprotectFileWrite
+        ) || raw.file_object.is_some()
+            || raw.socket_object.is_some()
+        {
+            bail!("unsupported object result has an impossible resolver or retained identity");
+        }
+        return Ok(ReplayedObjectResolution::Unsupported);
+    }
+
+    if raw.return_value < 0 && !socket_resolver {
+        if raw.file_object.is_some() || raw.socket_object.is_some() {
+            bail!("failed non-socket operation retained kernel object evidence");
         }
         return Ok(ReplayedObjectResolution::FailedSyscall);
     }
-    if raw.file_object.is_none() {
-        bail!("eligible successful file-object result silently downgraded without FILE_OBJECT evidence");
+    if raw.return_value < 0 && socket_resolver && raw.socket_object.is_none() {
+        return Ok(ReplayedObjectResolution::FailedSyscall);
+    }
+    if socket_resolver {
+        if raw.socket_object.is_none() {
+            bail!("eligible socket result silently downgraded without SOCKET_OBJECT evidence");
+        }
+    } else if raw.file_object.is_none() {
+        bail!("eligible file result silently downgraded without FILE_OBJECT evidence");
     }
     Ok(ReplayedObjectResolution::Resolved)
+}
+
+fn mmap_object_eligible(raw: &KernelEvent) -> bool {
+    raw.args[2] & libc::PROT_WRITE as u64 != 0
+        && raw.args[3] & libc::MAP_SHARED as u64 != 0
+        && raw.args[3] & libc::MAP_ANONYMOUS as u64 == 0
 }
 
 fn validate_event_policy(raw: &KernelEvent, policy: &PolicyDescription) -> Result<()> {
@@ -1387,7 +2030,8 @@ fn validate_json_event(
         || json.semantics != EVENT_SEMANTICS
         || json.captures != expected_captures(raw)
         || json.object_resolution != expected_object_resolution(raw, &manifest.boot_id)
-        || json.attribution != EffectAttribution::from_kernel_event(raw)
+        || json.attribution
+            != EffectAttribution::from_kernel_event(raw, CgroupMatchMode::ExactCurrent)
     {
         bail!("system-effect JSONL event does not derive from its WAL record");
     }
@@ -1395,95 +2039,7 @@ fn validate_json_event(
 }
 
 fn expected_object_resolution(raw: &KernelEvent, boot_id: &str) -> ObjectResolution {
-    let captures = expected_captures(raw);
-    let objects = if let Some(object) = &raw.file_object {
-        let path_len = usize::from(object.path_len);
-        let path = match object.path_quality {
-            FILE_PATH_NOT_REQUESTED => FilePathObservation::default(),
-            FILE_PATH_UNAVAILABLE => FilePathObservation {
-                quality: PathResolutionQuality::Unavailable,
-                authority: PathResolutionAuthority::None,
-                resolved_path: None,
-            },
-            FILE_PATH_RESOLVED_AT_HOOK => {
-                let bytes = &object.path[..path_len];
-                FilePathObservation {
-                    quality: PathResolutionQuality::ResolvedAtHook,
-                    authority: PathResolutionAuthority::KernelPathSnapshot,
-                    resolved_path: Some(ResolvedPath {
-                        display: String::from_utf8_lossy(bytes).into_owned(),
-                        raw_hex: hex(bytes),
-                    }),
-                }
-            }
-            _ => unreachable!("KernelEvent decoder rejected unknown file path quality"),
-        };
-        vec![ObjectReference {
-            slot: 0,
-            role: ObjectRole::Primary,
-            identity: ObjectIdentity::FileObject {
-                boot_id: boot_id.to_owned(),
-                mount_id_unique: object.mount_id_unique,
-                device_major: object.device_major,
-                device_minor: object.device_minor,
-                inode: object.inode,
-                inode_generation: (object.generation_valid == 1).then_some(object.inode_generation),
-                filesystem_magic: object.filesystem_magic,
-                filesystem_class: filesystem_class(object.filesystem_magic),
-                path,
-            },
-        }]
-    } else if raw.kind == EVENT_ATTEMPT {
-        captures
-            .iter()
-            .enumerate()
-            .filter(|(_, capture)| {
-                matches!(
-                    capture.status,
-                    CaptureStatus::Captured | CaptureStatus::Truncated
-                )
-            })
-            .map(|(slot, capture)| ObjectReference {
-                slot: slot as u8,
-                role: ObjectRole::SyscallArgument,
-                identity: ObjectIdentity::UserInputOnly {
-                    argument_index: capture.argument_index,
-                    source: capture.source,
-                    status: capture.status,
-                },
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let (quality, authority) = if raw.file_object.is_some() {
-        (
-            ObjectResolutionQuality::KernelResolved,
-            ObjectResolutionAuthority::KernelObjectHook,
-        )
-    } else if objects.is_empty() {
-        (
-            ObjectResolutionQuality::Unresolved,
-            ObjectResolutionAuthority::None,
-        )
-    } else {
-        (
-            ObjectResolutionQuality::UserInputOnly,
-            ObjectResolutionAuthority::SyscallEntryUserMemory,
-        )
-    };
-    ObjectResolution {
-        protocol_version: OBJECT_IDENTITY_PROTOCOL_VERSION,
-        source_event_seq: raw.event_seq,
-        operation_attempt_seq: if raw.kind == EVENT_ATTEMPT {
-            raw.event_seq
-        } else {
-            raw.related_attempt_seq
-        },
-        quality,
-        authority,
-        objects,
-    }
+    ObjectResolution::from_kernel_event(raw, &expected_captures(raw), boot_id)
 }
 
 fn filesystem_class(magic: u64) -> FilesystemClass {
@@ -1751,6 +2307,27 @@ fn expected_artifact_names(manifest: &EffectsManifest) -> BTreeSet<String> {
             expected.insert(effects_run::FILESYSTEM_ACTOR_CONTRACT_NAME.to_owned());
         }
     }
+    if manifest.linux_state_confirmation.is_some() {
+        expected.extend([
+            effects_run::LINUX_STATE_S0_NAME.to_owned(),
+            effects_run::LINUX_STATE_S1_NAME.to_owned(),
+            effects_run::LINUX_STATE_COMPARISON_NAME.to_owned(),
+        ]);
+    }
+    if manifest.process_lifecycle.is_some() {
+        expected.extend([
+            PROCESS_LIFECYCLE_WAL_NAME.to_owned(),
+            PROCESS_LIFECYCLE_JSONL_NAME.to_owned(),
+            PROCESS_LIFECYCLE_HEALTH_NAME.to_owned(),
+        ]);
+    }
+    if manifest.socket_state.is_some() {
+        expected.extend([
+            SOCKET_STATE_WAL_NAME.to_owned(),
+            SOCKET_STATE_JSONL_NAME.to_owned(),
+            SOCKET_STATE_HEALTH_NAME.to_owned(),
+        ]);
+    }
     expected
 }
 
@@ -1844,18 +2421,33 @@ mod tests {
         capture as capture_filesystem, CaptureRequest as FilesystemCaptureRequest,
         FilesystemCaptureLimits, FilesystemCapturePolicy,
     };
+    use bpf_observer_linux_state_confirmers::{
+        capture as capture_linux_state, CaptureRequest as LinuxCaptureRequest,
+        SnapshotPhase as LinuxSnapshotPhase, SysctlScope as LinuxSysctlScope,
+    };
     use bpf_observer_schema::{
         Completeness, MapContentState, MapMetadata, MapSampleStatus, MapState,
         ObjectIdentity as BpfObjectIdentity, ObjectType, SCHEMA_VERSION,
     };
     use bpf_observer_system_effects::{
-        KernelFileObject, FLAG_USER_MEMORY_SNAPSHOT, KERNEL_FILE_PATH_BYTES,
+        KernelFileObject, KernelSocketObject, FLAG_USER_MEMORY_SNAPSHOT, KERNEL_FILE_PATH_BYTES,
+        MAX_SOCKET_ENDPOINT_BYTES, SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_BOOT_ID: &str = "00000000-0000-0000-0000-000000000001";
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn expanded_poll_batch_is_bounded_by_both_callback_queues() {
+        assert_eq!(
+            combined_callback_queue_high_water(66, Some(12)).unwrap(),
+            78
+        );
+        assert_eq!(combined_callback_queue_high_water(66, None).unwrap(), 66);
+        assert!(combined_callback_queue_high_water(u64::MAX, Some(1)).is_err());
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1917,15 +2509,34 @@ mod tests {
             pid: raw.pid_tgid as u32,
             tgid: (raw.pid_tgid >> 32) as u32,
             comm: nul_terminated_lossy(&raw.comm),
+            process_identity: expected_process_identity(raw, TEST_BOOT_ID),
             raw_arguments: raw.args,
             captures: expected_captures(raw),
             object_resolution: expected_object_resolution(raw, TEST_BOOT_ID),
-            attribution: EffectAttribution::from_kernel_event(raw),
+            attribution: EffectAttribution::from_kernel_event(raw, CgroupMatchMode::ExactCurrent),
             return_value: (raw.kind == EVENT_RESULT).then_some(raw.return_value),
             result_status: (raw.kind == EVENT_RESULT)
                 .then(|| classify_result(policy.operation, raw.return_value)),
             flags: raw.flags,
             semantics: EVENT_SEMANTICS.to_owned(),
+        }
+    }
+
+    fn expected_process_identity(raw: &KernelEvent, boot_id: &str) -> EffectProcessIdentity {
+        let pid = raw.pid_tgid as u32;
+        let tgid = (raw.pid_tgid >> 32) as u32;
+        EffectProcessIdentity {
+            boot_id: boot_id.to_owned(),
+            run_epoch: raw.run_epoch,
+            cgroup_id: raw.cgroup_id,
+            pid,
+            tgid,
+            start_boottime_ns: Some(raw.task_start_boottime_ns),
+            authority: EffectProcessIdentityAuthority::KernelTaskStartBoottimeAtSyscallEntry,
+            stable_key: Some(format!(
+                "{boot_id}/cgroup:{}/epoch:{}/tgid:{tgid}/pid:{pid}/start:{}",
+                raw.cgroup_id, raw.run_epoch, raw.task_start_boottime_ns
+            )),
         }
     }
 
@@ -2027,11 +2638,13 @@ mod tests {
             return_value: 8,
             args: [6, 0x1000, 8, 0, 0, 0],
             comm: [0; 16],
+            task_start_boottime_ns: 44,
             payload_lens: [0; 2],
             payload_kinds: [PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: Some(file_object),
+            socket_object: None,
         };
 
         assert_eq!(
@@ -2106,11 +2719,13 @@ mod tests {
             return_value: 6,
             args: [libc::AT_FDCWD as u64, 0x1000, 0x2000, 24, 0, 0],
             comm: [0; 16],
+            task_start_boottime_ns: 44,
             payload_lens: [0; 2],
             payload_kinds: [PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
 
         for mode in [
@@ -2120,6 +2735,128 @@ mod tests {
             let error = replay_object_resolution(mode, &result, &policy).unwrap_err();
             assert!(error.to_string().contains("silently downgraded"));
         }
+    }
+
+    #[test]
+    fn expanded_replay_accepts_path_and_socket_objects_with_canonical_roles() {
+        let policies = describe_policy(PolicyProfile::Full).unwrap();
+        let file_object = KernelFileObject {
+            mount_id_unique: 44,
+            inode: 55,
+            filesystem_magic: 0xef53,
+            device_major: 8,
+            device_minor: 2,
+            inode_generation: 9,
+            path_len: 0,
+            generation_valid: 1,
+            path_quality: FILE_PATH_NOT_REQUESTED,
+            path: [0; KERNEL_FILE_PATH_BYTES],
+        };
+        for (syscall_nr, role) in [
+            (libc::SYS_mkdirat as i32, ObjectRole::Parent),
+            (libc::SYS_renameat2 as i32, ObjectRole::Source),
+            (libc::SYS_linkat as i32, ObjectRole::Source),
+        ] {
+            let policy = policies
+                .iter()
+                .find(|entry| entry.syscall_nr == syscall_nr)
+                .unwrap();
+            let raw = KernelEvent {
+                schema_version: EFFECT_EVENT_SCHEMA_VERSION,
+                kind: EVENT_RESULT,
+                domain: policy.domain as u16,
+                operation: policy.operation as u32,
+                flags: 0,
+                syscall_nr,
+                run_epoch: 1,
+                event_seq: 2,
+                related_attempt_seq: 1,
+                ktime_ns: 2,
+                cgroup_id: 3,
+                pid_tgid: (4u64 << 32) | 5,
+                return_value: 0,
+                args: [0; 6],
+                comm: [0; 16],
+                task_start_boottime_ns: 44,
+                payload_lens: [0; 2],
+                payload_kinds: [PAYLOAD_NONE; 2],
+                payload_arg_indices: [0; 2],
+                payloads: [[0; CAPTURE_BYTES]; 2],
+                file_object: Some(file_object.clone()),
+                socket_object: None,
+            };
+            assert_eq!(
+                replay_object_resolution(
+                    ObjectResolutionMode::KernelObjectExpandedPartial,
+                    &raw,
+                    policy,
+                )
+                .unwrap(),
+                ReplayedObjectResolution::Resolved
+            );
+            assert_eq!(
+                expected_object_resolution(&raw, TEST_BOOT_ID).objects[0].role,
+                role
+            );
+        }
+
+        let policy = policies
+            .iter()
+            .find(|entry| entry.syscall_nr == libc::SYS_connect as i32)
+            .unwrap();
+        let mut endpoint = [0u8; MAX_SOCKET_ENDPOINT_BYTES];
+        endpoint[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        endpoint[2..4].copy_from_slice(&443u16.to_be_bytes());
+        endpoint[4..8].copy_from_slice(&[192, 0, 2, 9]);
+        let raw = KernelEvent {
+            schema_version: EFFECT_EVENT_SCHEMA_VERSION,
+            kind: EVENT_RESULT,
+            domain: policy.domain as u16,
+            operation: policy.operation as u32,
+            flags: 0,
+            syscall_nr: policy.syscall_nr,
+            run_epoch: 1,
+            event_seq: 2,
+            related_attempt_seq: 1,
+            ktime_ns: 2,
+            cgroup_id: 3,
+            pid_tgid: (4u64 << 32) | 5,
+            return_value: 0,
+            args: [0; 6],
+            comm: [0; 16],
+            task_start_boottime_ns: 44,
+            payload_lens: [0; 2],
+            payload_kinds: [PAYLOAD_NONE; 2],
+            payload_arg_indices: [0; 2],
+            payloads: [[0; CAPTURE_BYTES]; 2],
+            file_object: None,
+            socket_object: Some(KernelSocketObject {
+                network_namespace_cookie: 1,
+                socket_cookie: 2,
+                address_family: libc::AF_INET as u32,
+                socket_type: libc::SOCK_STREAM as u32,
+                protocol: libc::IPPROTO_TCP as u32,
+                endpoint_address_family: libc::AF_INET as u32,
+                endpoint_len: 16,
+                endpoint_role: 2,
+                endpoint_quality: 1,
+                endpoint,
+                endpoint_authority: SOCKET_ENDPOINT_AUTHORITY_LSM_ARGUMENT,
+            }),
+        };
+        assert_eq!(
+            replay_object_resolution(
+                ObjectResolutionMode::KernelObjectExpandedPartial,
+                &raw,
+                policy,
+            )
+            .unwrap(),
+            ReplayedObjectResolution::Resolved
+        );
+        assert_eq!(
+            expected_object_resolution(&raw, TEST_BOOT_ID).objects[0].role,
+            ObjectRole::Peer
+        );
     }
 
     #[test]
@@ -2140,11 +2877,13 @@ mod tests {
             return_value: 0,
             args: [0; 6],
             comm: [0; 16],
+            task_start_boottime_ns: 44,
             payload_lens: [0; 2],
             payload_kinds: [PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
         let mut replay = AttemptReplayState::default();
         replay.start(&first_attempt).unwrap();
@@ -2185,6 +2924,31 @@ mod tests {
     }
 
     #[test]
+    fn expanded_socket_manifest_requires_the_async_producer_seal() {
+        let mut value = serde_json::json!({
+            "protocol_version": SOCKET_STATE_SCHEMA_VERSION,
+            "wal_artifact": SOCKET_STATE_WAL_NAME,
+            "jsonl_artifact": SOCKET_STATE_JSONL_NAME,
+            "health_artifact": SOCKET_STATE_HEALTH_NAME,
+            "status": "COMPLETE",
+            "event_published": 3,
+            "event_dropped": 0,
+            "destroy_events_persisted": 1,
+            "owners_retired_at_barrier": 0,
+            "async_producer_seal": {
+                "complete": true,
+                "links_expected": bpf_observer_system_effects::socket_state::SOCKET_STATE_ASYNC_PRODUCER_LINKS,
+                "links_detached": bpf_observer_system_effects::socket_state::SOCKET_STATE_ASYNC_PRODUCER_LINKS
+            }
+        });
+        let parsed: SocketStateEvidence = serde_json::from_value(value.clone()).unwrap();
+        assert!(parsed.async_producer_seal.is_required_complete());
+
+        value.as_object_mut().unwrap().remove("async_producer_seal");
+        assert!(serde_json::from_value::<SocketStateEvidence>(value).is_err());
+    }
+
+    #[test]
     fn verifies_a_complete_closed_artifact_set() {
         let directory = TestDirectory::create();
         let profile = PolicyProfile::Control;
@@ -2221,11 +2985,13 @@ mod tests {
             return_value: 0,
             args: [0; 6],
             comm,
+            task_start_boottime_ns: 44,
             payload_lens: [0; 2],
             payload_kinds: [PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
         let mut wal = Vec::new();
         append_wal(&mut wal, &attempt);
@@ -2284,6 +3050,9 @@ mod tests {
             object_delete_failed: 0,
             object_path_unavailable: 0,
             object_pending_remaining: 0,
+            task_read_failed: 0,
+            object_unsupported: 0,
+            socket_state: None,
             producer_barrier_complete: true,
             drain_completed: true,
             wal_durable: true,
@@ -2356,6 +3125,8 @@ mod tests {
             policy_artifact: POLICY_NAME.to_owned(),
             expected_recorder_object_sha256: recorder_digest.clone(),
             loaded_recorder_object_sha256: Some(recorder_digest.clone()),
+            process_lifecycle: None,
+            socket_state: None,
             kernel_release: "test-kernel".to_owned(),
             boot_id: TEST_BOOT_ID.to_owned(),
             observer_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -2377,6 +3148,7 @@ mod tests {
             },
             bpf_state_confirmation: None,
             filesystem_state_confirmation: None,
+            linux_state_confirmation: None,
             artifacts,
             failure: None,
             notes: vec![
@@ -2467,7 +3239,7 @@ mod tests {
 
             let mut missing = original_values.clone();
             missing[0].as_object_mut().unwrap().remove("attribution");
-            assert!(format!("{:#}", verify_forged(missing)).contains("attribution protocol"));
+            assert!(format!("{:#}", verify_forged(missing)).contains("strictly replay"));
 
             for (field, forged_value) in [
                 ("mode", "DELEGATED"),
@@ -2477,13 +3249,12 @@ mod tests {
                 let mut forged = original_values.clone();
                 forged[0]["attribution"][field] =
                     serde_json::Value::String(forged_value.to_owned());
-                assert!(format!("{:#}", verify_forged(forged))
-                    .contains("parse system-effect JSONL event"));
+                assert!(format!("{:#}", verify_forged(forged)).contains("strictly replay"));
             }
 
             let mut bad_sequence = original_values;
             bad_sequence[0]["attribution"]["operation_attempt_seq"] = serde_json::Value::from(2);
-            assert!(format!("{:#}", verify_forged(bad_sequence)).contains("attribution protocol"));
+            assert!(format!("{:#}", verify_forged(bad_sequence)).contains("strictly replay"));
         }
         manifest.artifacts.insert(
             JSONL_NAME.to_owned(),
@@ -2687,7 +3458,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("object-resolution protocol"));
+        assert!(format!("{error:#}").contains("strictly replay"));
 
         // Restore the trusted operation stream, then extend the closed run
         // with real filesystem S0/S1 artifacts. The verifier must require the
@@ -2905,6 +3676,148 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{downgrade:#}").contains("valid committed FINALIZED run"));
+
+        // Add a real bounded Linux endpoint scope. Verification must require
+        // that external scope, read all three digest-bound artifacts, and
+        // independently recompute the domain vector.
+        let linux_scope = LinuxStateScope {
+            protocol_version: LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+            sysctl: Some(
+                LinuxSysctlScope::new(Path::new("/proc/sys"), vec!["kernel/ostype".to_owned()])
+                    .unwrap(),
+            ),
+            mounts: None,
+            network: None,
+            modules: None,
+            process_residual: None,
+        };
+        let mut linux_s0 = capture_linux_state(
+            &linux_scope,
+            &LinuxCaptureRequest {
+                snapshot_id: effects_run::linux_state_snapshot_id(&run_id, 7, "S0"),
+                phase: LinuxSnapshotPhase::S0,
+            },
+        )
+        .unwrap();
+        let mut linux_s1 = capture_linux_state(
+            &linux_scope,
+            &LinuxCaptureRequest {
+                snapshot_id: effects_run::linux_state_snapshot_id(&run_id, 7, "S1"),
+                phase: LinuxSnapshotPhase::S1,
+            },
+        )
+        .unwrap();
+        linux_s0.boot_id = TEST_BOOT_ID.to_owned();
+        linux_s1.boot_id = TEST_BOOT_ID.to_owned();
+        linux_s0.captured_unix_ns = 1;
+        linux_s1.captured_unix_ns = 2;
+        let linux_comparison = compare_linux_state(&linux_s0, &linux_s1).unwrap();
+        assert_eq!(
+            linux_comparison.domains.sysctl.verdict,
+            LinuxStateVerdict::Inconclusive
+        );
+        for (name, bytes) in [
+            (
+                effects_run::LINUX_STATE_S0_NAME,
+                serde_json::to_vec(&linux_s0).unwrap(),
+            ),
+            (
+                effects_run::LINUX_STATE_S1_NAME,
+                serde_json::to_vec(&linux_s1).unwrap(),
+            ),
+            (
+                effects_run::LINUX_STATE_COMPARISON_NAME,
+                serde_json::to_vec(&linux_comparison).unwrap(),
+            ),
+        ] {
+            manifest
+                .artifacts
+                .insert(name.to_owned(), write_artifact(&directory.0, name, &bytes));
+        }
+        manifest.evidence_kind = effects_run::EVIDENCE_KIND_SCOPED_STATE_V3.to_owned();
+        manifest.linux_state_confirmation = Some(LinuxStateConfirmation {
+            protocol_version: LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+            confirmation_domain: LINUX_STATE_CONFIRMATION_DOMAIN.to_owned(),
+            scope_sha256: linux_scope.sha256().unwrap(),
+            s0_artifact: effects_run::LINUX_STATE_S0_NAME.to_owned(),
+            s1_artifact: effects_run::LINUX_STATE_S1_NAME.to_owned(),
+            comparison_artifact: effects_run::LINUX_STATE_COMPARISON_NAME.to_owned(),
+            auto_process_residual_bound: false,
+            domains: linux_comparison.domains.clone(),
+            operation_events_are_state_diff: false,
+            atomic_with_other_confirmation_domains: false,
+            whole_linux_unchanged_authorized: false,
+        });
+        fs::write(
+            directory.0.join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let missing_linux_scope = verify_run(
+            &directory.0,
+            &recorder_digest,
+            profile,
+            ObjectResolutionMode::UserInput,
+            Some(&scope),
+            Some(&filesystem_scope),
+            Some(&filesystem_contract),
+        )
+        .unwrap_err();
+        assert!(format!("{missing_linux_scope:#}").contains("trusted or auto-derived scope"));
+        let report = verify_run_with_linux_state(
+            &directory.0,
+            &recorder_digest,
+            profile,
+            ObjectResolutionMode::UserInput,
+            Some(&scope),
+            Some(&filesystem_scope),
+            Some(&filesystem_contract),
+            Some(&linux_scope),
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.artifacts_verified, 16);
+        assert!(report.linux_state_artifact_consistency_verified);
+        assert!(report.external_linux_state_scope_exact_match);
+        assert!(!report.auto_process_residual_scope_reconstructed);
+        assert_eq!(
+            report.state_domains.sysctl,
+            DomainStateVerdict::Inconclusive
+        );
+        assert_eq!(
+            report.state_domains.remote_network_effect,
+            DomainStateVerdict::NotConfirmable
+        );
+
+        let mut forged_linux_comparison = linux_comparison;
+        forged_linux_comparison.domains.sysctl.verdict = LinuxStateVerdict::ChangedWithinScope;
+        manifest.artifacts.insert(
+            effects_run::LINUX_STATE_COMPARISON_NAME.to_owned(),
+            write_artifact(
+                &directory.0,
+                effects_run::LINUX_STATE_COMPARISON_NAME,
+                &serde_json::to_vec(&forged_linux_comparison).unwrap(),
+            ),
+        );
+        fs::write(
+            directory.0.join(MANIFEST_NAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let forged_linux = verify_run_with_linux_state(
+            &directory.0,
+            &recorder_digest,
+            profile,
+            ObjectResolutionMode::UserInput,
+            Some(&scope),
+            Some(&filesystem_scope),
+            Some(&filesystem_contract),
+            Some(&linux_scope),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{forged_linux:#}").contains("does not match verified endpoint snapshots"));
     }
 
     #[test]
@@ -2950,11 +3863,13 @@ mod tests {
                 0,
             ],
             comm,
+            task_start_boottime_ns: 44,
             payload_lens: [captured_path_bytes.len() as u16, 0],
             payload_kinds: [PAYLOAD_USER_STRING, PAYLOAD_NONE],
             payload_arg_indices: [1, 0],
             payloads: [captured_path, [0; CAPTURE_BYTES]],
             file_object: None,
+            socket_object: None,
         };
         let mut resolved_path = [0u8; KERNEL_FILE_PATH_BYTES];
         let resolved_path_bytes = b"/tmp/result";
@@ -2982,6 +3897,7 @@ mod tests {
                 path_quality: FILE_PATH_RESOLVED_AT_HOOK,
                 path: resolved_path,
             }),
+            socket_object: None,
             ..attempt
         };
         let failed_attempt = KernelEvent {
@@ -3001,6 +3917,7 @@ mod tests {
             payload_arg_indices: [0; 2],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
             ..attempt
         };
 
@@ -3068,6 +3985,9 @@ mod tests {
             object_delete_failed: 0,
             object_path_unavailable: 0,
             object_pending_remaining: 0,
+            task_read_failed: 0,
+            object_unsupported: 0,
+            socket_state: None,
             producer_barrier_complete: true,
             drain_completed: true,
             wal_durable: true,
@@ -3142,6 +4062,8 @@ mod tests {
             policy_artifact: POLICY_NAME.to_owned(),
             expected_recorder_object_sha256: recorder_digest.clone(),
             loaded_recorder_object_sha256: Some(recorder_digest.clone()),
+            process_lifecycle: None,
+            socket_state: None,
             kernel_release: "test-kernel".to_owned(),
             boot_id: TEST_BOOT_ID.to_owned(),
             observer_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -3163,6 +4085,7 @@ mod tests {
             },
             bpf_state_confirmation: None,
             filesystem_state_confirmation: None,
+            linux_state_confirmation: None,
             artifacts,
             failure: None,
             notes: vec![
@@ -3238,7 +4161,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(format!("{json_error:#}").contains("does not derive from its WAL"));
+        assert!(format!("{json_error:#}").contains("strictly replay"));
     }
 
     #[test]
@@ -3282,11 +4205,13 @@ mod tests {
             return_value: 0,
             args: [0; 6],
             comm: [0; 16],
+            task_start_boottime_ns: 44,
             payload_lens: [0; 2],
             payload_kinds: kinds,
             payload_arg_indices: indices,
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
         assert!(validate_event_policy(&event, &policy).is_err());
     }

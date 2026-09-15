@@ -22,6 +22,9 @@ BPF_OBJECT := $(OUTPUT)/recorder.bpf.o
 SYSTEM_EFFECTS_BPF_SOURCE := bpf/system_effects.bpf.c
 SYSTEM_EFFECTS_BPF_HEADER := bpf/system_effects.h
 SYSTEM_EFFECTS_BPF_OBJECT := $(OUTPUT)/system_effects.bpf.o
+PROCESS_LIFECYCLE_BPF_SOURCE := bpf/process_lifecycle.bpf.c
+PROCESS_LIFECYCLE_BPF_HEADER := bpf/process_lifecycle.h
+PROCESS_LIFECYCLE_BPF_OBJECT := $(OUTPUT)/process_lifecycle.bpf.o
 BPF_UAPI_HEADERS := \
 	$(KERNEL_ROOT)/tools/include/uapi/linux/bpf.h \
 	$(KERNEL_ROOT)/tools/include/uapi/linux/types.h
@@ -43,6 +46,13 @@ STRICT_INIT_SOURCE := vm/strict-init.c
 STRICT_INIT_BINARY := $(OUTPUT)/vm/strict-init
 STRICT_GUEST_RUNNER := vm/guest-strict-e2e.sh
 EFFECTS_SUPERVISOR_E2E_DRIVER := vm/effects-supervisor-e2e.sh
+EXPANDED_EFFECTS_HOST_RUNNER := vm/run-expanded-effects-e2e.sh
+EXPANDED_EFFECTS_GUEST_RUNNER := vm/guest-expanded-effects-e2e.sh
+EXPANDED_EFFECTS_DEPLOYMENT_RUNNER := vm/guest-deployment-ancestor-e2e.sh
+EXPANDED_EFFECTS_SYNTHETIC_RUNNER := vm/guest-deployment-live-synthetic-e2e.sh
+EXPANDED_EFFECTS_STATE_WORKLOAD := workloads/system-effects-state-change.sh
+EXPANDED_EFFECTS_RESIDUAL_WORKLOAD := workloads/system-effects-residual-process.sh
+EXPANDED_EFFECTS_OVERHEAD_ANALYZER := experiments/system-effects-overhead/analyze-expanded.js
 STRICT_INIT_CFLAGS ?= -Os -std=c11 -Wall -Wextra -Werror -static
 
 AGENT_LAUNCHER_SOURCE := experiments/codex-deepseek/vm/codex-task-launcher.c
@@ -65,9 +75,10 @@ VM_SSH_PORT ?= 10022
 
 .DEFAULT_GOAL := all
 
-.PHONY: all release check check-all test fmt-check clippy bpf system-effects-bpf workloads \
+.PHONY: all release check check-all test fmt-check clippy bpf system-effects-bpf process-lifecycle-bpf workloads \
 	vm-strict vm-strict-check agent-collection-launcher \
 	agent-collection-check overhead-check system-effects-overhead-check \
+	expanded-effects-check \
 	overhead-e2e vm-kernel vm-effects-kernel vm-e2e \
 	clean help dirs
 
@@ -80,7 +91,7 @@ release: dirs
 check: fmt-check test
 
 check-all: check clippy bpf workloads vm-strict-check agent-collection-check \
-	overhead-check system-effects-overhead-check
+	overhead-check system-effects-overhead-check expanded-effects-check
 
 test: dirs
 	$(CARGO_ENV) $(CARGO) test --workspace --locked
@@ -91,9 +102,11 @@ fmt-check: dirs
 clippy: dirs
 	$(CARGO_ENV) $(CARGO) clippy --workspace --all-targets --locked -- -D warnings
 
-bpf: $(BPF_OBJECT) $(SYSTEM_EFFECTS_BPF_OBJECT)
+bpf: $(BPF_OBJECT) $(SYSTEM_EFFECTS_BPF_OBJECT) $(PROCESS_LIFECYCLE_BPF_OBJECT)
 
 system-effects-bpf: $(SYSTEM_EFFECTS_BPF_OBJECT)
+
+process-lifecycle-bpf: $(PROCESS_LIFECYCLE_BPF_OBJECT)
 
 workloads: $(WORKLOAD_BINS)
 
@@ -126,9 +139,18 @@ overhead-check: workloads
 	bash -n $(OVERHEAD_HOST_RUNNER)
 	node --check $(OVERHEAD_ANALYZER)
 
-system-effects-overhead-check: system-effects-bpf
-	bash experiments/system-effects-overhead/check-bpf-fast-path.sh $(SYSTEM_EFFECTS_BPF_OBJECT)
+system-effects-overhead-check: system-effects-bpf process-lifecycle-bpf
+	bash experiments/system-effects-overhead/check-bpf-fast-path.sh \
+		$(SYSTEM_EFFECTS_BPF_OBJECT) $(PROCESS_LIFECYCLE_BPF_OBJECT)
 	bash experiments/system-effects-overhead/check.sh
+
+expanded-effects-check:
+	bash -n $(EXPANDED_EFFECTS_HOST_RUNNER) $(EXPANDED_EFFECTS_GUEST_RUNNER) \
+		$(EXPANDED_EFFECTS_DEPLOYMENT_RUNNER) \
+		$(EXPANDED_EFFECTS_SYNTHETIC_RUNNER) \
+		$(EXPANDED_EFFECTS_STATE_WORKLOAD) $(EXPANDED_EFFECTS_RESIDUAL_WORKLOAD)
+	node --check $(EXPANDED_EFFECTS_OVERHEAD_ANALYZER)
+	node $(EXPANDED_EFFECTS_OVERHEAD_ANALYZER) --self-test
 
 overhead-e2e: overhead-check release bpf
 	@test -n "$(KERNEL_BZIMAGE)" || { \
@@ -192,6 +214,10 @@ $(SYSTEM_EFFECTS_BPF_OBJECT): $(SYSTEM_EFFECTS_BPF_SOURCE) \
 		$(SYSTEM_EFFECTS_BPF_HEADER) $(BPF_UAPI_HEADERS) $(BPF_HELPER_DEFS) | dirs
 	TMPDIR=$(BUILD_TMPDIR) $(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDES) -c $< -o $@
 
+$(PROCESS_LIFECYCLE_BPF_OBJECT): $(PROCESS_LIFECYCLE_BPF_SOURCE) \
+		$(PROCESS_LIFECYCLE_BPF_HEADER) $(BPF_UAPI_HEADERS) $(BPF_HELPER_DEFS) | dirs
+	TMPDIR=$(BUILD_TMPDIR) $(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDES) -c $< -o $@
+
 $(BPF_HELPER_DEFS): $(KERNEL_ROOT)/scripts/bpf_doc.py \
 		$(KERNEL_ROOT)/tools/include/uapi/linux/bpf.h | dirs
 	mkdir -p $(dir $@)
@@ -224,11 +250,13 @@ help:
 	@echo '  clippy     run Clippy with warnings denied'
 	@echo '  bpf        build the self-contained raw-syscall recorder object'
 	@echo '  system-effects-bpf  build the general system-effect recorder object'
+	@echo '  process-lifecycle-bpf  build the fork/exec/exit correlation object'
 	@echo '  workloads  build dependency-free fixture workloads'
 	@echo '  vm-strict  build the static exclusive-boot PID1 supervisor'
 	@echo '  agent-collection-check  build/check the Codex collection VM helpers'
 	@echo '  overhead-check  build/check the overhead benchmark helpers'
 	@echo '  system-effects-overhead-check  check the general effect benchmark helpers'
+	@echo '  expanded-effects-check  syntax-check the expanded object/state VM acceptance assets'
 	@echo '  overhead-e2e  run the paired overhead benchmark in disposable KVM'
 	@echo '  vm-kernel  build the disposable x86 smoke-test kernel'
 	@echo '  vm-effects-kernel  build the BTF+BPF-LSM object-observer test kernel'

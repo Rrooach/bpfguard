@@ -39,10 +39,15 @@ pub enum CheckStatus {
 
 pub fn inspect(
     bpf_object: Option<&Path>,
+    process_lifecycle_object: Option<&Path>,
     cgroup_root: &Path,
     object_resolution_mode: ObjectResolutionMode,
 ) -> DoctorReport {
-    let object_resolution = object_resolution::inspect(object_resolution_mode, bpf_object);
+    let object_resolution = object_resolution::inspect_with_lifecycle(
+        object_resolution_mode,
+        bpf_object,
+        process_lifecycle_object,
+    );
     let mut checks = vec![
         cgroup_v2_filesystem_check(Path::new("/sys/fs/cgroup")),
         any_exists_check(
@@ -440,6 +445,7 @@ mod tests {
     fn report_has_required_checks() {
         let report = inspect(
             None,
+            None,
             Path::new("/sys/fs/cgroup/bpf-state-observer"),
             ObjectResolutionMode::UserInput,
         );
@@ -469,7 +475,12 @@ mod tests {
             ObjectResolutionMode::KernelFileOpenPartial,
             ObjectResolutionMode::KernelFileOpenWritePartial,
         ] {
-            let report = inspect(None, Path::new("/sys/fs/cgroup/bpf-state-observer"), mode);
+            let report = inspect(
+                None,
+                None,
+                Path::new("/sys/fs/cgroup/bpf-state-observer"),
+                mode,
+            );
             let check = report
                 .checks
                 .iter()

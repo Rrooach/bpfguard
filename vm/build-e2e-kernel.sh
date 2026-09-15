@@ -26,8 +26,10 @@ default baseline starts with x86_64_defconfig, merges the Observer requirements
 and disposable-VM overlay, disables BTF/BPF_PRELOAD, and builds out of tree.
 
 The effects-object profile adds a final, explicit BTF+BPF-LSM overlay for the
-sleepable file_open object-resolution E2E. It requires pahole >= 1.22; select a
-non-system binary with PAHOLE=/absolute/path/to/pahole.
+expanded VFS/socket/lifecycle object-resolution E2E, plus built-in nftables,
+virtual-link, and representative traffic-control support for endpoint-state
+confirmation. It requires pahole >= 1.22; select a non-system binary with
+PAHOLE=/absolute/path/to/pahole.
 EOF
 }
 
@@ -180,7 +182,31 @@ if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
 		CONFIG_BPF_LSM=y \
 		CONFIG_SECURITY=y \
 		CONFIG_SECURITYFS=y \
+		CONFIG_SECURITY_PATH=y \
 		CONFIG_OVERLAY_FS=y \
+		CONFIG_NETFILTER=y \
+		CONFIG_NETFILTER_NETLINK=y \
+		CONFIG_NF_TABLES=y \
+		CONFIG_NF_TABLES_INET=y \
+		CONFIG_NF_TABLES_NETDEV=y \
+		CONFIG_IPV6_MULTIPLE_TABLES=y \
+		CONFIG_DUMMY=y \
+		CONFIG_VETH=y \
+		CONFIG_TUN=y \
+		CONFIG_NET_SCHED=y \
+		CONFIG_NET_SCH_HTB=y \
+		CONFIG_NET_SCH_TBF=y \
+		CONFIG_NET_SCH_FQ=y \
+		CONFIG_NET_SCH_FQ_CODEL=y \
+		CONFIG_NET_CLS_ACT=y \
+		CONFIG_NET_SCH_INGRESS=y \
+		CONFIG_NET_CLS_U32=y \
+		CONFIG_NET_CLS_BPF=y \
+		CONFIG_NET_CLS_FLOWER=y \
+		CONFIG_NET_CLS_MATCHALL=y \
+		CONFIG_NET_ACT_GACT=y \
+		CONFIG_NET_ACT_MIRRED=y \
+		CONFIG_NET_ACT_BPF=y \
 		CONFIG_DEBUG_INFO=y \
 		CONFIG_DEBUG_INFO_BTF=y; do
 		grep -qx "$setting" "$OUTPUT_DIR/.config" || {
@@ -198,16 +224,29 @@ elif grep -qx 'CONFIG_DEBUG_INFO_BTF=y' "$OUTPUT_DIR/.config"; then
 	exit 1
 fi
 
+BUILD_TARGETS=(bzImage)
+if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
+	# The expanded endpoint-state E2E builds one empty, test-only module
+	# against this exact output.  Building modules here produces the matching
+	# Module.symvers; modules_prepare alone deliberately cannot do that.
+	BUILD_TARGETS+=(modules)
+fi
 TMPDIR="$BUILD_TMPDIR" make -C "$KERNEL_ROOT" \
-	O="$OUTPUT_DIR" PAHOLE="$PAHOLE_BIN" -j "$VM_KERNEL_JOBS" bzImage
+	O="$OUTPUT_DIR" PAHOLE="$PAHOLE_BIN" -j "$VM_KERNEL_JOBS" \
+	"${BUILD_TARGETS[@]}"
 
 if [[ "$VM_KERNEL_PROFILE" == effects-object ]]; then
 	readelf -S "$OUTPUT_DIR/vmlinux" | grep -q '\.BTF' || {
 		echo "effects-object vmlinux has no .BTF section" >&2
 		exit 1
 	}
+	[[ -s "$OUTPUT_DIR/Module.symvers" ]] || {
+		echo "effects-object build did not produce Module.symvers" >&2
+		exit 1
+	}
 	sha256sum "$OUTPUT_DIR/arch/x86/boot/bzImage" \
-		"$OUTPUT_DIR/vmlinux" "$OUTPUT_DIR/.config"
+		"$OUTPUT_DIR/vmlinux" "$OUTPUT_DIR/.config" \
+		"$OUTPUT_DIR/Module.symvers"
 else
 	sha256sum "$OUTPUT_DIR/arch/x86/boot/bzImage" "$OUTPUT_DIR/.config"
 fi

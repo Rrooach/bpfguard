@@ -18,8 +18,9 @@ records selected filesystem, network, namespace, kernel-control, security, and
 I/O syscall attempts/results from one exact cgroup. Those records are useful
 operation history, but are **not** a whole-kernel state diff and never support
 an `UNCHANGED_WITHIN_SCOPE` claim by themselves. Optional, independently scoped
-BPF-object and filesystem path-tree S0/S1 confirmers publish separate
-per-domain results; they do not create an aggregate whole-system verdict. See
+BPF-object, filesystem path-tree, and explicitly scoped Linux endpoint-state
+S0/S1 confirmers publish separate per-domain results; they do not create an
+aggregate whole-system verdict. See
 the [system-effect recorder guide](docs/system-effects-observer.md).
 The framework-independent implementation boundary and follow-up work are kept
 in the
@@ -33,21 +34,40 @@ in the
   `balanced`, and `full` profiles. Its global fast path rejects unselected
   syscalls after one policy-Map lookup; only selected operations from a
   registered cgroup allocate pending state or publish ring-buffer events.
-- Two narrow kernel object-resolution opt-ins: selected successful native file
-  opens with exactly one `file_open` join, and those opens plus the VFS
-  `struct file` for positive-byte native write-family results observed by
-  `file_permission` (including pipefs/socketfs pseudo-files, but not socket
-  endpoints or persistent-state proof). Missing required joins, `O_PATH`, and
-  duplicate stacked-filesystem open hooks fail evidence closed. These are
-  explicitly
-  `kernel-file-open-partial` and
-  `kernel-file-open-write-partial`; there is no general kernel-object or socket
-  resolution mode.
-- Optional, independently verified S0/S1 endpoint confirmation for BPF objects
-  and for bounded generic filesystem path trees. Filesystem capture covers the
-  explicit roots and selected metadata/content/symlink/xattr fields only. The
-  observe outcome and verifier report expose a per-domain `state_domains`
-  vector rather than promoting either result to a whole-system verdict.
+- Three explicit partial kernel object-resolution modes. The first two cover
+  selected successful opens and positive-byte native write-family VFS objects.
+  `kernel-object-expanded-partial` additionally joins selected path/inode LSM
+  hooks for create/link/unlink/rename/chmod/chown/xattr operations, eligible
+  file-backed `MAP_SHARED|PROT_WRITE` mmap establishment, single-VMA shared
+  file-backed `mprotect(PROT_WRITE)` permission transitions, bind/connect
+  socket objects and requested endpoints, and accepted TCP peer objects. A separate
+  stream records correlated AF_INET/AF_INET6 TCP state transitions and destroy
+  events. Missing, duplicate, or unreadable
+  required joins fail evidence closed. This is still operation-specific rather
+  than general kernel-object provenance.
+- A separately built and independently attested process-lifecycle recorder in
+  expanded mode. It records direct-cgroup `fork`, successful `exec`, and
+  `exit`, uses PID/TGID plus task start-boottime identity to avoid PID-reuse
+  ambiguity, and lets the offline verifier replay terminal lineage for events
+  admitted by those hooks and correlate matching syscall identities. Schema v2
+  has no authoritative S0 task/thread ledger and no cgroup migration or
+  `CLONE_INTO_CGROUP` enrollment hook, so lifecycle status is capped at
+  `PARTIAL`; it never claims complete process-tree association. An exec
+  pathname is descriptive kernel-copied evidence, not executable file
+  identity.
+- Optional, independently verified S0/S1 endpoint confirmation for BPF
+  objects, bounded generic filesystem path trees, explicit sysctl keys, one
+  mount namespace, selected local-network address/route/rule/tc/nft state,
+  selected loaded modules and readable parameters, and residual processes in
+  the exact tracked cgroup tree. The observe outcome and verifier report expose
+  a per-domain `state_domains` vector rather than promoting any result to a
+  whole-system verdict.
+- A one-shot deployment observer for an already frozen direct process tree,
+  Docker container, or Kata host-side sandbox. It discovers and revalidates
+  process/cgroup/namespace identity, registers all discovered exact cgroup IDs
+  in one shared system recorder and one lifecycle recorder, and emits a closed,
+  offline-verifiable artifact set. Kata scope is intentionally the target-Linux
+  runtime/QEMU/virtiofs/disk/network backend; it never claims guest syscalls.
 - A bounded delegation-ledger protocol and structural validator. No delegation
   broker, request signer/authenticator, helper-cgroup runtime, manifest
   integration, or broker-to-syscall causal chain is implemented.
@@ -84,9 +104,10 @@ in the
   `verify-run` checks the manifest, both raw event streams, event
   pairing/accounting, snapshot identity, and recomputes the verdict.
 
-Seven Rust library crates separate schema, BPF and filesystem state capture,
-BPF and general-effect event recording, comparison, and authenticated harness
-protocol. An eighth workspace crate, `crates/observerd`, coordinates a run.
+Workspace crates separate schema, BPF/filesystem/Linux endpoint capture,
+system-effect and lifecycle recording, comparison, deployment discovery, and
+authenticated harness protocols. `crates/observerd` coordinates standalone
+runs, while `crates/deployment-observer` coordinates already-running targets.
 
 ## Deliberately not implemented yet
 
@@ -105,10 +126,16 @@ protocol. An eighth workspace crate, `crates/observerd`, coordinates a run.
   orchestrator's responsibility.
 - Target-specific attachment queries, compat-ABI canaries, FD-lifetime/VFS
   event capture, writable-Map-mmap tracking, and kernel-internal writers.
-- Kernel object resolution beyond selected opens and selected positive-byte
-  write-family VFS file identities. Rename, unlink, setattr, mmap/io_uring,
-  socket endpoints, and delegated-daemon targets are not kernel-resolved by
-  the current producer.
+- Complete object resolution for all kernel mutation paths. In expanded mode a
+  create identifies its parent rather than the not-yet-created child, hard-link
+  identifies the source inode, rename identifies only the source, xattr hooks
+  lack a mount identity, and mmap evidence proves only establishment of an
+  eligible shared writable file mapping—not a later dirty page. The mprotect
+  resolver proves only a write-permission channel for one shared file-backed
+  VMA; anonymous/private, mixed, and multi-VMA ranges remain explicitly
+  unresolved. `io_uring`, `SCM_RIGHTS`, socketpair/send destinations,
+  non-INET/TCP socket state, delegated-daemon effects, delayed kernel workers,
+  and compat/x32 coverage remain outside the object contract.
 - Authentication or enforcement of a filesystem actor/quiescence contract in
   `observe-effects`. A supplied contract is external input that the observer
   validates and exact-matches during verification; the observer does not check
@@ -123,6 +150,14 @@ protocol. An eighth workspace crate, `crates/observerd`, coordinates a run.
 - Automatic recovery after an uncatchable daemon death. The direct workload
   child gets `PR_SET_PDEATHSIG(SIGKILL)`, but descendants still require VM or
   service-manager cleanup.
+- Unbounded ancestor-root scaling or complete lifecycle enrollment. Deployment
+  adapters now install at most eight non-overlapping, FD-pinned cgroup-v2
+  ancestor roots; every selected syscall and lifecycle hook uses
+  `bpf_current_task_under_cgroup`, so dynamic and ephemeral descendants report
+  `DYNAMIC_ANCESTOR_COMPLETE` for the selected hook set. An exact-cgroup miss
+  pays a linear scan of those roots, and lifecycle remains `PARTIAL` because
+  schema v2 has no authoritative S0 task/thread ledger, migration stream, or
+  `CLONE_INTO_CGROUP` enrollment proof.
 
 These are functional boundaries, not future features that the current result
 implicitly assumes.
@@ -136,6 +171,7 @@ make
 make release
 make bpf
 make system-effects-bpf
+make process-lifecycle-bpf
 make workloads
 make check
 make check-all
@@ -158,8 +194,10 @@ toolchain is recommended. The recorder build defaults to `clang-14` and the
 x86 BPF target; override `CLANG` and `BPF_ARCH` for the target architecture.
 The native `bpf(2)` state recorder uses the fixed `raw_syscalls` tracepoint
 ABI and does not require CO-RE or `vmlinux.h`. The system-effect recorder's
-two partial kernel file-object modes are different: they use CO-RE BPF LSM
-hooks and require readable kernel BTF plus an active `bpf` LSM.
+three partial kernel-object modes use CO-RE BPF LSM hooks and require readable
+kernel BTF plus an active `bpf` LSM. Expanded mode additionally requires the
+separately attested process-lifecycle object and its
+`tp_btf/sched_process_{fork,exec,exit}` ABI.
 
 ## Runtime prerequisites
 
@@ -266,6 +304,53 @@ in the replay ABI, and open paths that invoke multiple stacked-filesystem
 valid VFS `FILE_OBJECT` identities, but they are not `SOCKET_OBJECT` endpoint
 evidence and do not prove persistent file state.
 
+For the expanded partial object contract, build and independently trust both
+ELFs. The separate lifecycle digest is mandatory on collection and
+verification:
+
+```sh
+make system-effects-bpf process-lifecycle-bpf
+LIFECYCLE_OBJECT=$(realpath .output/process_lifecycle.bpf.o)
+TRUSTED_LIFECYCLE_SHA256=$(sha256sum "$LIFECYCLE_OBJECT" | awk '{print $1}')
+
+sudo "$BIN" doctor \
+  --recorder-object "$EFFECT_OBJECT" \
+  --process-lifecycle-object "$LIFECYCLE_OBJECT" \
+  --object-resolution kernel-object-expanded-partial
+
+sudo "$BIN" observe-effects \
+  --recorder-object "$EFFECT_OBJECT" \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --process-lifecycle-object "$LIFECYCLE_OBJECT" \
+  --expected-process-lifecycle-sha256 "$TRUSTED_LIFECYCLE_SHA256" \
+  --output-dir /var/lib/bpf-observer/effects/expanded-1 \
+  --run-id expanded-1 \
+  --profile full \
+  --object-resolution kernel-object-expanded-partial \
+  --confirm-process-residual \
+  -- /path/to/workload
+
+sudo "$BIN" verify-effects \
+  --run-dir /var/lib/bpf-observer/effects/expanded-1 \
+  --expected-recorder-sha256 "$TRUSTED_EFFECT_SHA256" \
+  --expected-process-lifecycle-sha256 "$TRUSTED_LIFECYCLE_SHA256" \
+  --expected-profile full \
+  --expected-object-resolution kernel-object-expanded-partial \
+  --confirm-process-residual
+```
+
+Expanded mode resolves only the enumerated operations. Create-family hooks
+identify the parent, hard-link identifies the source, rename identifies only
+the source, eligible mmap means a file-backed shared writable mapping request,
+eligible mprotect means one shared file-backed VMA gained write permission,
+and bind/connect endpoints are kernel-copied requested endpoints. Successful
+accept/accept4 resolves the accepted socket and peer from kernel socket state.
+The separate socket-state stream records AF_INET/AF_INET6 TCP accept snapshots,
+state transitions, and destroy events and binds them to the originating
+bind/connect/accept syscall-entry identity. It does not observe later mmap page
+dirtying or prove that an mprotect-enabled page was written, guarantee an assigned ephemeral bind port without a later eligible
+TCP state event, cover non-TCP sockets, or decode `io_uring` effects.
+
 Add `--bpf-state-scope config/default-scope.json` to `observe-effects` when a
 separate BPF-object S0/S1 confirmation is required, and pass the same trusted
 file back to `verify-effects` as
@@ -339,25 +424,44 @@ not authenticated or matched to enforcement evidence. A future signed
 supervisor contract must add freshness and bind boot, cgroup, and real barrier
 evidence before strong negative filesystem verdicts become reachable.
 
-Both commands return `state_domains`: `filesystem` and `bpf` reflect only
-their enabled confirmer, local network configuration, sysctl, mounts, modules,
-and keyrings remain `NOT_CONFIRMED`, and remote network effect is
-`NOT_CONFIRMABLE`. Consumers must keep this vector intact; there is no rule
-that folds it into “system changed,” “system unchanged,” or rollback `CLEAN`.
+`--linux-state-scope PATH` enables a separately bounded scope for explicit
+sysctl keys, one mount namespace, selected local addresses/routes/rules/tc/nft
+collectors, and selected loaded-module records and optional readable
+parameters. Every enabled network scope must bind
+`normalization: NETWORK_CONFIGURATION_ONLY_V1`; this removes only declared
+volatile counters/handles while preserving configuration semantics.
+`--confirm-process-residual` adds a scope bound by the observer to
+the exact run cgroup and recursively checks for remaining tasks. The same
+external Linux-state scope and residual flag must be supplied to
+`verify-effects`. These collectors produce
+`linux-state-s0.json`, `linux-state-s1.json`, and
+`linux-state-comparison.json`; they execute only at the two barriers.
+
+Both commands return `state_domains`: enabled filesystem, BPF, sysctl,
+mount, local-network, module, and process-residual entries reflect only their
+own confirmer; an omitted domain remains `NOT_CONFIRMED`, keyrings remain
+`NOT_CONFIRMED`, and remote network effect is `NOT_CONFIRMABLE`. A complete
+identical endpoint is still `INCONCLUSIVE`; only a complete observed
+difference becomes `CHANGED_WITHIN_SCOPE`. Consumers must keep this vector
+intact and must not fold it into “system unchanged” or rollback `CLEAN`.
 
 Use `control` (the CLI default) for the lowest-volume control/metadata signal,
 select `balanced` explicitly when file writes and network sends matter, and
-select `full` only when the additional noisy `mmap`/`mprotect`, sync, `ioctl`,
-`prctl`, and `setsockopt` interfaces are required. The exact policy used is
+select `full` only when the additional write-direction `mmap`/`mprotect`, sync,
+`ioctl`, `prctl`, and `setsockopt` interfaces are required. mmap/mprotect calls
+without `PROT_WRITE` are rejected before cgroup lookup and event construction.
+The exact policy used is
 written to `system-effects.policy.json`; never infer coverage from a profile
 name alone.
 `verify-effects` requires the externally trusted object digest, expected
 profile, expected object-resolution mode, and every externally selected
-confirmer scope. It verifies the closed six-file operation set plus exactly the
-declared extensions: three BPF files, three filesystem files, and, when
-present, one copied filesystem actor-contract file. It checks hashes, WAL
-framing and CRC, decoded JSONL, sequence/pairing, frozen policy, health
-counters, snapshots, comparisons, and coverage claims; its successful report
+confirmer scope. It verifies the closed operation set plus exactly the declared
+extensions: three BPF files, three filesystem files, the optional copied
+filesystem actor contract, three Linux-state files, and in expanded mode the
+lifecycle WAL/JSONL/health triple. It checks hashes, WAL framing and CRC,
+decoded projections, sequence/pairing, frozen policy, lifecycle lineage and
+syscall-task correlation, health counters, snapshots, comparisons, and
+coverage claims; its successful report
 still says `coverage_complete=false`,
 `causal_attribution_complete=false`, and
 `operation_events_are_state_diff=false`.
@@ -367,6 +471,22 @@ coverage gaps, inspection commands, and the paired overhead benchmark. The
 records the exact-build object, filesystem, and fail-closed gates. The
 [2026-09-12 validation](docs/system-effects-validation-2026-09-12.md) retains
 the paired overhead measurements.
+
+To attach the same recorder pair to an already existing direct process tree,
+Docker container, or Kata host-side sandbox, use the one-shot
+`deployment-observe` adapter. The caller freezes/resumes the discovered roots
+around its READY/FINISH protocol; the adapter never invokes a container CLI or
+enters a Kata guest. Selected hooks cover dynamic descendants through bounded,
+FD-pinned cgroup-v2 ancestor roots. Optional BPF, explicit-path filesystem, and
+Linux-state S0/S1 confirmers run only at the frozen barriers; expanded mode also
+commits a separately verified socket-state stream. At FINISH it freezes every
+producer root, detaches exactly the two asynchronous TCP state/destroy links
+once, and only then drains all roots and retires owners. Expanded `COMPLETE`
+requires the same complete `2/2` producer seal in every root health record. The
+offline verifier replays every enabled WAL and independently recomputes endpoint
+comparisons under an exact closed artifact set. Configuration, evidence, and
+verification examples are in the
+[deployment observer guide](crates/deployment-observer/README.md).
 
 ## Observe one workload
 

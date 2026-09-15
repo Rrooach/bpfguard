@@ -20,6 +20,7 @@ sha2 = "=0.10.6"
 bpf-observer-schema = { path = "../schema" }
 bpf-observer-comparator = { path = "../comparator" }
 bpf-observer-filesystem-confirmer = { path = "../filesystem-confirmer" }
+bpf-observer-linux-state-confirmers = { path = "../linux-state-confirmers" }
 bpf-observer-oracle = { package = "bpf-observer-state-oracle", path = "../state-oracle" }
 bpf-observer-recorder = { path = "../recorder" }
 bpf-observer-system-effects = { path = "../system-effects-recorder" }

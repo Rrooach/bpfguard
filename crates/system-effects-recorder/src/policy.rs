@@ -8,6 +8,9 @@ use std::fmt;
 use std::str::FromStr;
 
 pub const POLICY_MAP_ENTRIES: u32 = 1024;
+// Linux UAPI number from the architecture-independent post-asm-generic range.
+// Some supported experiment-host libc headers predate SYS_fchmodat2.
+const SYS_FCHMODAT2: libc::c_long = 452;
 
 pub const CAPTURE_NONE: u8 = 0;
 pub const CAPTURE_USER_STRING: u8 = 1;
@@ -20,6 +23,17 @@ pub enum KernelObjectResolver {
     None = 0,
     FileOpen = 1,
     FilePermissionWrite = 2,
+    PathCreateParent = 3,
+    PathUnlink = 4,
+    PathRenameSource = 5,
+    PathSetattr = 6,
+    InodeXattr = 7,
+    MmapFileWrite = 8,
+    SocketConnect = 9,
+    SocketBind = 10,
+    PathLinkSource = 11,
+    SocketAccept = 12,
+    MprotectFileWrite = 13,
 }
 
 impl KernelObjectResolver {
@@ -29,6 +43,24 @@ impl KernelObjectResolver {
                 Self::FileOpen
             }
             EffectOperation::FdWrite => Self::FilePermissionWrite,
+            EffectOperation::DirectoryCreate
+            | EffectOperation::SymlinkCreate
+            | EffectOperation::DeviceNodeCreate => Self::PathCreateParent,
+            EffectOperation::FileUnlink
+            | EffectOperation::DirectoryRemove
+            | EffectOperation::PathEntryRemove => Self::PathUnlink,
+            EffectOperation::FileRename => Self::PathRenameSource,
+            EffectOperation::HardLinkCreate => Self::PathLinkSource,
+            EffectOperation::PermissionsChange | EffectOperation::OwnershipChange => {
+                Self::PathSetattr
+            }
+            EffectOperation::ExtendedAttributeSet | EffectOperation::ExtendedAttributeRemove => {
+                Self::InodeXattr
+            }
+            EffectOperation::MemoryWriteChannel => Self::MmapFileWrite,
+            EffectOperation::SocketConnect => Self::SocketConnect,
+            EffectOperation::SocketBind => Self::SocketBind,
+            EffectOperation::SocketAccept => Self::SocketAccept,
             _ => Self::None,
         }
     }
@@ -85,12 +117,17 @@ pub enum EffectOperation {
     FdRangeTransfer = 17,
     FileSync = 18,
     MemoryWriteChannel = 19,
+    /// Conservative classification for unlinkat(2): arg2 decides whether the
+    /// removed directory entry names a non-directory or a directory, and the
+    /// fixed ARRAY policy ABI deliberately does not fabricate one answer.
+    PathEntryRemove = 20,
     SocketCreate = 100,
     SocketConnect = 101,
     SocketBind = 102,
     SocketListen = 103,
     NetworkSend = 104,
     SocketConfigure = 105,
+    SocketAccept = 106,
     Mount = 200,
     Unmount = 201,
     PivotRoot = 202,
@@ -142,12 +179,14 @@ impl EffectOperation {
             17 => Self::FdRangeTransfer,
             18 => Self::FileSync,
             19 => Self::MemoryWriteChannel,
+            20 => Self::PathEntryRemove,
             100 => Self::SocketCreate,
             101 => Self::SocketConnect,
             102 => Self::SocketBind,
             103 => Self::SocketListen,
             104 => Self::NetworkSend,
             105 => Self::SocketConfigure,
+            106 => Self::SocketAccept,
             200 => Self::Mount,
             201 => Self::Unmount,
             202 => Self::PivotRoot,
@@ -273,6 +312,10 @@ pub struct PolicyDescription {
     pub syscall_name: String,
     pub domain: EffectDomain,
     pub operation: EffectOperation,
+    /// Frozen kernel resolver selection. This is authenticated as part of the
+    /// policy digest and lets offline replay distinguish syscalls which share
+    /// one public operation class (notably mmap and mprotect).
+    pub object_resolver: KernelObjectResolver,
     pub capture: Vec<CaptureDescription>,
     pub kernel_filter: Option<FilterDescription>,
 }
@@ -344,6 +387,11 @@ impl Spec {
         self
     }
 
+    const fn resolver(mut self, resolver: KernelObjectResolver) -> Self {
+        self.object_resolver = resolver;
+        self
+    }
+
     fn enabled_for(self, profile: PolicyProfile) -> bool {
         rank(profile) >= rank(self.minimum_profile)
     }
@@ -400,6 +448,7 @@ impl Spec {
             syscall_name: self.name.to_owned(),
             domain: self.domain,
             operation: self.operation,
+            object_resolver: self.object_resolver,
             capture,
             kernel_filter,
         })
@@ -447,6 +496,8 @@ pub(crate) struct EventPolicyIdentity {
     pub domain: EffectDomain,
     pub operation: EffectOperation,
     pub capture: [CapturePolicy; 2],
+    pub object_resolver: KernelObjectResolver,
+    pub filter: Option<(u8, u64)>,
 }
 
 pub(crate) fn event_policy_identities(
@@ -460,6 +511,8 @@ pub(crate) fn event_policy_identities(
             domain: spec.domain,
             operation: spec.operation,
             capture: spec.capture,
+            object_resolver: spec.object_resolver,
+            filter: spec.filter,
         };
         if identities.insert(number as i32, identity).is_some() {
             bail!("duplicate native syscall identity number {number}");
@@ -489,7 +542,6 @@ fn specs() -> Vec<Spec> {
         | 0x10000000
         | 0x20000000
         | 0x40000000;
-
     let mut list = vec![
         Spec::new(
             libc::SYS_openat,
@@ -548,7 +600,7 @@ fn specs() -> Vec<Spec> {
             libc::SYS_unlinkat,
             "unlinkat",
             Filesystem,
-            FileUnlink,
+            PathEntryRemove,
             Control,
         )
         .paths(1, None),
@@ -585,6 +637,14 @@ fn specs() -> Vec<Spec> {
         )
         .paths(1, None),
         Spec::new(
+            SYS_FCHMODAT2,
+            "fchmodat2",
+            Filesystem,
+            PermissionsChange,
+            Control,
+        )
+        .paths(1, None),
+        Spec::new(
             libc::SYS_fchownat,
             "fchownat",
             Filesystem,
@@ -592,6 +652,20 @@ fn specs() -> Vec<Spec> {
             Control,
         )
         .paths(1, None),
+        Spec::new(
+            libc::SYS_fchmod,
+            "fchmod",
+            Filesystem,
+            PermissionsChange,
+            Control,
+        ),
+        Spec::new(
+            libc::SYS_fchown,
+            "fchown",
+            Filesystem,
+            OwnershipChange,
+            Control,
+        ),
         Spec::new(
             libc::SYS_mknodat,
             "mknodat",
@@ -607,7 +681,7 @@ fn specs() -> Vec<Spec> {
             ExtendedAttributeSet,
             Control,
         )
-        .paths(0, None),
+        .paths(0, Some(1)),
         Spec::new(
             libc::SYS_lsetxattr,
             "lsetxattr",
@@ -615,14 +689,15 @@ fn specs() -> Vec<Spec> {
             ExtendedAttributeSet,
             Control,
         )
-        .paths(0, None),
+        .paths(0, Some(1)),
         Spec::new(
             libc::SYS_fsetxattr,
             "fsetxattr",
             Filesystem,
             ExtendedAttributeSet,
             Control,
-        ),
+        )
+        .paths(1, None),
         Spec::new(
             libc::SYS_removexattr,
             "removexattr",
@@ -630,7 +705,7 @@ fn specs() -> Vec<Spec> {
             ExtendedAttributeRemove,
             Control,
         )
-        .paths(0, None),
+        .paths(0, Some(1)),
         Spec::new(
             libc::SYS_lremovexattr,
             "lremovexattr",
@@ -638,14 +713,15 @@ fn specs() -> Vec<Spec> {
             ExtendedAttributeRemove,
             Control,
         )
-        .paths(0, None),
+        .paths(0, Some(1)),
         Spec::new(
             libc::SYS_fremovexattr,
             "fremovexattr",
             Filesystem,
             ExtendedAttributeRemove,
             Control,
-        ),
+        )
+        .paths(1, None),
         Spec::new(
             libc::SYS_fallocate,
             "fallocate",
@@ -670,14 +746,17 @@ fn specs() -> Vec<Spec> {
         ),
         Spec::new(libc::SYS_fsync, "fsync", Filesystem, FileSync, Full),
         Spec::new(libc::SYS_fdatasync, "fdatasync", Filesystem, FileSync, Full),
-        Spec::new(libc::SYS_mmap, "mmap", Filesystem, MemoryWriteChannel, Full),
+        Spec::new(libc::SYS_mmap, "mmap", Filesystem, MemoryWriteChannel, Full)
+            .any_bits(2, libc::PROT_WRITE as u64),
         Spec::new(
             libc::SYS_mprotect,
             "mprotect",
             Filesystem,
             MemoryWriteChannel,
             Full,
-        ),
+        )
+        .any_bits(2, libc::PROT_WRITE as u64)
+        .resolver(KernelObjectResolver::MprotectFileWrite),
         Spec::new(libc::SYS_socket, "socket", Network, SocketCreate, Control),
         Spec::new(
             libc::SYS_socketpair,
@@ -695,6 +774,11 @@ fn specs() -> Vec<Spec> {
         )
         .sockaddr(1, 2),
         Spec::new(libc::SYS_bind, "bind", Network, SocketBind, Control).sockaddr(1, 2),
+        // accept/accept4 sockaddr buffers are kernel outputs. Reading them at
+        // syscall entry would fabricate input evidence; the expanded resolver
+        // instead joins successful do_accept return state before fd install.
+        Spec::new(libc::SYS_accept, "accept", Network, SocketAccept, Control),
+        Spec::new(libc::SYS_accept4, "accept4", Network, SocketAccept, Control),
         Spec::new(libc::SYS_listen, "listen", Network, SocketListen, Control),
         Spec::new(libc::SYS_sendto, "sendto", Network, NetworkSend, Balanced).sockaddr(4, 5),
         Spec::new(libc::SYS_sendmsg, "sendmsg", Network, NetworkSend, Balanced),
@@ -1018,6 +1102,15 @@ fn specs() -> Vec<Spec> {
     #[cfg(target_arch = "x86_64")]
     list.extend([
         Spec::new(
+            libc::SYS_pkey_mprotect,
+            "pkey_mprotect",
+            Filesystem,
+            MemoryWriteChannel,
+            Full,
+        )
+        .any_bits(2, libc::PROT_WRITE as u64)
+        .resolver(KernelObjectResolver::MprotectFileWrite),
+        Spec::new(
             libc::SYS_open,
             "open",
             Filesystem,
@@ -1143,6 +1236,108 @@ mod tests {
         }
         let ftruncate = specs.iter().find(|spec| spec.name == "ftruncate").unwrap();
         assert_eq!(ftruncate.object_resolver, KernelObjectResolver::None);
+    }
+
+    #[test]
+    fn memory_write_channels_are_filtered_before_cgroup_and_event_work() {
+        let policies = specs();
+        let mmap = policies
+            .iter()
+            .find(|policy| policy.name == "mmap")
+            .unwrap();
+        let mprotect = policies
+            .iter()
+            .find(|policy| policy.name == "mprotect")
+            .unwrap();
+        for policy in [mmap, mprotect] {
+            assert_eq!(policy.filter, Some((2, libc::PROT_WRITE as u64)));
+            assert_eq!(policy.operation, EffectOperation::MemoryWriteChannel);
+        }
+        assert_eq!(mmap.object_resolver, KernelObjectResolver::MmapFileWrite);
+        assert_eq!(
+            mprotect.object_resolver,
+            KernelObjectResolver::MprotectFileWrite
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            let pkey_mprotect = policies
+                .iter()
+                .find(|policy| policy.name == "pkey_mprotect")
+                .unwrap();
+            assert_eq!(
+                pkey_mprotect.object_resolver,
+                KernelObjectResolver::MprotectFileWrite
+            );
+            assert_eq!(pkey_mprotect.filter, Some((2, libc::PROT_WRITE as u64)));
+        }
+    }
+
+    #[test]
+    fn unlinkat_does_not_fabricate_file_or_directory_type() {
+        let unlinkat = specs()
+            .into_iter()
+            .find(|spec| spec.name == "unlinkat")
+            .unwrap();
+        assert_eq!(unlinkat.operation, EffectOperation::PathEntryRemove);
+        assert_eq!(unlinkat.object_resolver, KernelObjectResolver::PathUnlink);
+    }
+
+    #[test]
+    fn xattr_policy_captures_the_attribute_name() {
+        let policies = specs();
+        for (name, path_argument) in [
+            ("setxattr", Some(0)),
+            ("lsetxattr", Some(0)),
+            ("fsetxattr", None),
+            ("removexattr", Some(0)),
+            ("lremovexattr", Some(0)),
+            ("fremovexattr", None),
+        ] {
+            let policy = policies.iter().find(|policy| policy.name == name).unwrap();
+            let expected = match path_argument {
+                Some(index) => [CapturePolicy::path(index), CapturePolicy::path(1)],
+                None => [CapturePolicy::path(1), CapturePolicy::NONE],
+            };
+            assert_eq!(policy.capture, expected, "{name}");
+            assert_eq!(policy.object_resolver, KernelObjectResolver::InodeXattr);
+        }
+    }
+
+    #[test]
+    fn fchmodat2_is_observed_with_path_setattr_resolution() {
+        let policy = specs()
+            .into_iter()
+            .find(|policy| policy.name == "fchmodat2")
+            .unwrap();
+        assert_eq!(policy.nr, SYS_FCHMODAT2);
+        assert_eq!(policy.capture[0], CapturePolicy::path(1));
+        assert_eq!(policy.object_resolver, KernelObjectResolver::PathSetattr);
+    }
+
+    #[test]
+    fn hard_link_uses_source_object_resolver() {
+        let linkat = specs()
+            .into_iter()
+            .find(|spec| spec.name == "linkat")
+            .unwrap();
+        assert_eq!(linkat.object_resolver, KernelObjectResolver::PathLinkSource);
+        assert_eq!(linkat.capture[0], CapturePolicy::path(1));
+        assert_eq!(linkat.capture[1], CapturePolicy::path(3));
+    }
+
+    #[test]
+    fn accept_output_buffers_are_not_captured_and_use_post_accept_resolver() {
+        let policies = specs();
+        for number in [libc::SYS_accept as i32, libc::SYS_accept4 as i32] {
+            let policy = policies
+                .iter()
+                .find(|policy| policy.nr == libc::c_long::from(number))
+                .expect("native accept syscall is in the frozen policy");
+            assert_eq!(policy.domain, EffectDomain::Network);
+            assert_eq!(policy.operation, EffectOperation::SocketAccept);
+            assert_eq!(policy.object_resolver, KernelObjectResolver::SocketAccept);
+            assert_eq!(policy.capture, [CapturePolicy::NONE; 2]);
+        }
     }
 
     #[test]

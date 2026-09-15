@@ -182,11 +182,13 @@ mod tests {
             return_value: 0,
             args: [0; 6],
             comm: [0; 16],
+            task_start_boottime_ns: 4,
             payload_lens: [0; 2],
             payload_kinds: [PAYLOAD_NONE; 2],
             payload_arg_indices: [0; 2],
             payloads: [[0; crate::protocol::CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         }
     }
 

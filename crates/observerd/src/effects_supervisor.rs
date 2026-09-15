@@ -19,17 +19,18 @@ use anyhow::{anyhow, bail, Context, Result};
 use bpf_observer_schema::ArtifactDigest;
 use bpf_observer_system_effects::{
     coverage_gaps, describe_policy, policy_sha256, AttributionContract, CaptureSource,
-    CaptureStatus, CapturedArgument, CoverageStatus, EffectAttribution, EffectOperation, EventKind,
-    FileObjectResolutionMode, KernelEvent, ObjectIdentity, ObjectReference, ObjectResolution,
-    ObjectResolutionAuthority, ObjectResolutionQuality, ObjectResolutionStatus, ObjectRole,
-    PolicyDescription, PolicyProfile, ResultStatus, SystemEffectEvent, SystemEffectHealth,
-    SystemEffectRecorder, TransportStatus, EFFECT_EVENT_SCHEMA_VERSION, FLAG_OBJECT_DELETE_FAILED,
-    FLAG_OBJECT_JOIN_AMBIGUOUS, FLAG_OBJECT_JOIN_MISSING, FLAG_OBJECT_PATH_UNAVAILABLE,
-    FLAG_OBJECT_READ_FAILED, FLAG_PAYLOAD1_INVALID_LENGTH, FLAG_PAYLOAD1_READ_FAILED,
-    FLAG_PAYLOAD1_TRUNCATED, FLAG_PAYLOAD2_INVALID_LENGTH, FLAG_PAYLOAD2_READ_FAILED,
-    FLAG_PAYLOAD2_TRUNCATED, FLAG_PENDING_DELETE_FAILED, FLAG_PENDING_INSERT_FAILED,
-    FLAG_PENDING_MISSING, FLAG_PENDING_POISONED, FLAG_POLICY_INVALID, FLAG_SYSCALL_MISMATCH,
-    KERNEL_FILE_EVENT_SIZE, OBJECT_IDENTITY_PROTOCOL_VERSION,
+    CaptureStatus, CapturedArgument, CgroupMatchMode, CoverageStatus, EffectAttribution,
+    EffectOperation, EventKind, FileObjectResolutionMode, KernelEvent, ObjectIdentity,
+    ObjectReference, ObjectResolution, ObjectResolutionAuthority, ObjectResolutionQuality,
+    ObjectResolutionStatus, ObjectRole, PolicyDescription, PolicyProfile, ResultStatus,
+    SystemEffectEvent, SystemEffectHealth, SystemEffectRecorder, TransportStatus,
+    EFFECT_EVENT_SCHEMA_VERSION, FLAG_OBJECT_DELETE_FAILED, FLAG_OBJECT_JOIN_AMBIGUOUS,
+    FLAG_OBJECT_JOIN_MISSING, FLAG_OBJECT_PATH_UNAVAILABLE, FLAG_OBJECT_READ_FAILED,
+    FLAG_PAYLOAD1_INVALID_LENGTH, FLAG_PAYLOAD1_READ_FAILED, FLAG_PAYLOAD1_TRUNCATED,
+    FLAG_PAYLOAD2_INVALID_LENGTH, FLAG_PAYLOAD2_READ_FAILED, FLAG_PAYLOAD2_TRUNCATED,
+    FLAG_PENDING_DELETE_FAILED, FLAG_PENDING_INSERT_FAILED, FLAG_PENDING_MISSING,
+    FLAG_PENDING_POISONED, FLAG_POLICY_INVALID, FLAG_SYSCALL_MISMATCH, KERNEL_FILE_EVENT_SIZE,
+    OBJECT_IDENTITY_PROTOCOL_VERSION,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1365,6 +1366,9 @@ fn expected_attribution(raw: &KernelEvent) -> EffectAttribution {
         component: contract.component,
         delegated_effects: contract.delegated_effects,
         causal_status: contract.causal_status,
+        cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+        matched_scope_cgroup_id: raw.cgroup_id,
+        leaf_cgroup_id_retained: true,
         cgroup_id_at_syscall_entry: raw.cgroup_id,
         source_event_seq: raw.event_seq,
         operation_attempt_seq: if raw.kind == EVENT_ATTEMPT {
@@ -1667,6 +1671,9 @@ mod tests {
             object_delete_failed: 0,
             object_path_unavailable: 0,
             object_pending_remaining: 0,
+            task_read_failed: 0,
+            object_unsupported: 0,
+            socket_state: None,
             producer_barrier_complete: true,
             drain_completed: true,
             wal_durable: true,
@@ -1946,11 +1953,13 @@ mod tests {
             return_value: 0,
             args: [1, 2, 3, 4, 5, 6],
             comm,
+            task_start_boottime_ns: 44,
             payload_lens: [0, 0],
             payload_kinds: [PAYLOAD_NONE, PAYLOAD_NONE],
             payload_arg_indices: [0, 0],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
         let mut json = SystemEffectEvent {
             schema_version: EFFECT_EVENT_SCHEMA_VERSION,
@@ -1968,6 +1977,7 @@ mod tests {
             pid: raw.pid_tgid as u32,
             tgid: (raw.pid_tgid >> 32) as u32,
             comm: "test".to_owned(),
+            process_identity: Default::default(),
             raw_arguments: raw.args,
             captures: Vec::new(),
             object_resolution: expected_object_resolution(&raw),
@@ -2009,11 +2019,13 @@ mod tests {
             return_value: 0,
             args: [1, 2, 3, 4, 5, 6],
             comm,
+            task_start_boottime_ns: 44,
             payload_lens: [0, 0],
             payload_kinds: [PAYLOAD_NONE, PAYLOAD_NONE],
             payload_arg_indices: [0, 0],
             payloads: [[0; CAPTURE_BYTES]; 2],
             file_object: None,
+            socket_object: None,
         };
         let mut result = attempt.clone();
         result.kind = EVENT_RESULT;
@@ -2044,6 +2056,7 @@ mod tests {
             pid: attempt.pid_tgid as u32,
             tgid: (attempt.pid_tgid >> 32) as u32,
             comm: "test".to_owned(),
+            process_identity: Default::default(),
             raw_arguments: attempt.args,
             captures: Vec::new(),
             object_resolution: expected_object_resolution(&attempt),

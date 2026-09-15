@@ -24,7 +24,26 @@ cleanup()
 		"$TEMP_ROOT/effects-observer/evidence/system-effects.raw.bin" \
 		"$TEMP_ROOT/effects-observer/evidence/system-effects.jsonl" \
 		"$TEMP_ROOT/effects-observer/evidence/workload.stdout" \
-		"$TEMP_ROOT/effects-observer/evidence/workload.stderr"
+		"$TEMP_ROOT/effects-observer/evidence/workload.stderr" \
+		"$TEMP_ROOT/effects-expanded/metrics.json" \
+		"$TEMP_ROOT/effects-expanded/observer.stdout" \
+		"$TEMP_ROOT/effects-expanded/observer.stderr" \
+		"$TEMP_ROOT/effects-expanded/evidence/system-effects.manifest.json" \
+		"$TEMP_ROOT/effects-expanded/evidence/system-effects.policy.json" \
+		"$TEMP_ROOT/effects-expanded/evidence/system-effects.health.json" \
+		"$TEMP_ROOT/effects-expanded/evidence/system-effects.raw.bin" \
+		"$TEMP_ROOT/effects-expanded/evidence/system-effects.jsonl" \
+		"$TEMP_ROOT/effects-expanded/evidence/process-lifecycle.health.json" \
+		"$TEMP_ROOT/effects-expanded/evidence/process-lifecycle.raw.bin" \
+		"$TEMP_ROOT/effects-expanded/evidence/process-lifecycle.jsonl" \
+		"$TEMP_ROOT/effects-expanded/evidence/workload.stdout" \
+		"$TEMP_ROOT/effects-expanded/evidence/workload.stderr" \
+		"$TEMP_ROOT/effects-expanded-workload.json" \
+		"$TEMP_ROOT/effects-expanded-workload.stderr" \
+		"$TEMP_ROOT/effects-expanded-wrapper.stdout" \
+		"$TEMP_ROOT/effects-expanded-wrapper.stderr"
+	rmdir "$TEMP_ROOT/effects-expanded/evidence" 2>/dev/null || true
+	rmdir "$TEMP_ROOT/effects-expanded" 2>/dev/null || true
 	rmdir "$TEMP_ROOT/effects-observer/evidence" 2>/dev/null || true
 	rmdir "$TEMP_ROOT/effects-observer" 2>/dev/null || true
 	rmdir "$TEMP_ROOT/observer" 2>/dev/null || true
@@ -83,5 +102,25 @@ grep -Fq '"events_persisted":2' "$TEMP_ROOT/effects-observer/metrics.json"
 grep -Fq 'resolution=kernel-file-open-write-partial' \
 	"$TEMP_ROOT/effects-observer/metrics.json"
 grep -Fq '"profile":"quiet"' "$TEMP_ROOT/effects-workload.json"
+env \
+	BPF_STATE_OBSERVER_BIN="$HERE/mock-observer-fixture.sh" \
+	BPF_STATE_OBSERVER_EFFECTS_OBJECT="$TEMP_ROOT/workload" \
+	BPF_STATE_OBSERVER_EFFECTS_SHA256="$(sha256sum "$TEMP_ROOT/workload" | awk '{print $1}')" \
+	BPF_STATE_OBSERVER_LIFECYCLE_OBJECT="$TEMP_ROOT/measure" \
+	BPF_STATE_OBSERVER_LIFECYCLE_SHA256="$(sha256sum "$TEMP_ROOT/measure" | awk '{print $1}')" \
+	BPF_STATE_OBSERVER_EFFECTS_PROFILE=balanced \
+	BPF_STATE_OBSERVER_EFFECTS_OBJECT_RESOLUTION=kernel-object-expanded-partial \
+	"$HERE/observer-wrapper.sh" \
+	--result-dir "$TEMP_ROOT/effects-expanded" \
+	--workload-stdout "$TEMP_ROOT/effects-expanded-workload.json" \
+	--workload-stderr "$TEMP_ROOT/effects-expanded-workload.stderr" -- \
+	"$TEMP_ROOT/workload" --profile quiet --iterations 1 \
+	--scratch-dir "$TEMP_ROOT/scratch" \
+	> "$TEMP_ROOT/effects-expanded-wrapper.stdout" \
+	2> "$TEMP_ROOT/effects-expanded-wrapper.stderr"
+grep -Fq 'lifecycle_events_persisted":3' "$TEMP_ROOT/effects-expanded/metrics.json"
+grep -Fq 'resolution=kernel-object-expanded-partial' "$TEMP_ROOT/effects-expanded/metrics.json"
+grep -Fq 'lifecycle=' "$TEMP_ROOT/effects-expanded/metrics.json"
+grep -Fq '"profile":"quiet"' "$TEMP_ROOT/effects-expanded-workload.json"
 [[ -z "$(find "$TEMP_ROOT/scratch" -mindepth 1 -print -quit)" ]]
 echo "system-effects overhead helper checks PASS"

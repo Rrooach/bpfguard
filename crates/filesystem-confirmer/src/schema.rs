@@ -350,6 +350,13 @@ pub enum SnapshotPhase {
     S1,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MountNamespaceCaptureSource {
+    CurrentProcess,
+    RetainedFileDescriptor,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRequest {
@@ -662,6 +669,12 @@ pub struct FilesystemSnapshot {
     pub captured_unix_ns: u128,
     pub boot_id: String,
     pub mount_namespace_inode: u64,
+    pub mount_namespace_capture_source: MountNamespaceCaptureSource,
+    /// Root directory object used for absolute path resolution after entering
+    /// the retained mount namespace. This prevents setns with a host root from
+    /// being mislabeled as container-root coverage.
+    pub mount_root_device: u64,
+    pub mount_root_inode: u64,
     pub scope: FilesystemScope,
     pub scope_sha256: String,
     pub roots: Vec<RootObservation>,
@@ -683,6 +696,7 @@ impl FilesystemSnapshot {
             || self.boot_id.len() > MAX_IDENTIFIER_BYTES
             || self.boot_id.contains('\0')
             || self.mount_namespace_inode == 0
+            || self.mount_root_inode == 0
         {
             bail!("filesystem snapshot has invalid environment identity");
         }
@@ -732,6 +746,7 @@ impl FilesystemSnapshot {
         }
 
         let mut previous_key: Option<(u32, Vec<u8>)> = None;
+        let mut decoded_keys = Vec::with_capacity(self.entries.len());
         let mut computed = CaptureStatistics::default();
         for entry in &self.entries {
             let path = decode_lower_hex(
@@ -752,6 +767,7 @@ impl FilesystemSnapshot {
                 bail!("filesystem entries are duplicate or non-canonical");
             }
             previous_key = Some(key);
+            decoded_keys.push((entry.root_index, path.clone()));
             validate_entry_observations(entry, &self.scope.capture, &self.scope.limits)?;
             computed.entries_captured += 1;
             computed.path_bytes_captured = computed
@@ -782,6 +798,39 @@ impl FilesystemSnapshot {
                         .checked_add(attribute.value_size_bytes.unwrap_or(0))
                         .context("filesystem xattr statistics overflow")?;
                 }
+            }
+        }
+        for (entry_index, (root_index, path)) in decoded_keys.iter().enumerate() {
+            if path.is_empty() {
+                continue;
+            }
+            let parent = path
+                .iter()
+                .rposition(|byte| *byte == b'/')
+                .map_or(&[][..], |separator| &path[..separator]);
+            let parent_index = decoded_keys
+                .binary_search_by(|(candidate_root, candidate_path)| {
+                    candidate_root
+                        .cmp(root_index)
+                        .then_with(|| candidate_path.as_slice().cmp(parent))
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "filesystem entry {} lacks its immediate parent entry",
+                        self.entries[entry_index].relative_path_display
+                    )
+                })?;
+            let parent_entry = &self.entries[parent_index];
+            if parent_entry.entry_type != FilesystemEntryType::Directory
+                || !matches!(
+                    parent_entry.traversal,
+                    TraversalStatus::Traversed | TraversalStatus::Incomplete
+                )
+            {
+                bail!(
+                    "filesystem entry {} has a non-directory or untraversed immediate parent",
+                    self.entries[entry_index].relative_path_display
+                );
             }
         }
         let total_xattr_bytes = computed

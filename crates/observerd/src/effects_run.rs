@@ -20,6 +20,19 @@ use bpf_observer_filesystem_confirmer::{
     FILESYSTEM_CONFIRMATION_PROTOCOL_VERSION, HARD_MAX_ACTOR_CONTRACT_JSON_BYTES,
     HARD_MAX_COMPARISON_JSON_BYTES, HARD_MAX_SCOPE_JSON_BYTES, HARD_MAX_SNAPSHOT_JSON_BYTES,
 };
+use bpf_observer_linux_state_confirmers::{
+    capture as capture_linux_state, compare as compare_linux_state, encode_absolute_path,
+    CaptureLimits as LinuxStateCaptureLimits, CaptureRequest as LinuxStateCaptureRequest,
+    CompletenessStatus as LinuxCompletenessStatus, DomainComparison as LinuxDomainComparison,
+    EndpointDifferenceStatus as LinuxEndpointDifferenceStatus, ProcessResidualScope,
+    SnapshotPhase as LinuxStateSnapshotPhase, StateComparison as LinuxStateComparison,
+    StateDomainComparisons as LinuxStateDomainComparisons, StateScope as LinuxStateScope,
+    StateVerdict as LinuxStateVerdict, TerminalState as LinuxTerminalState, ValueEvidenceMode,
+    HARD_MAX_COMPARISON_JSON_BYTES as HARD_MAX_LINUX_STATE_COMPARISON_JSON_BYTES,
+    HARD_MAX_SCOPE_JSON_BYTES as HARD_MAX_LINUX_STATE_SCOPE_JSON_BYTES,
+    HARD_MAX_SNAPSHOT_JSON_BYTES as HARD_MAX_LINUX_STATE_SNAPSHOT_JSON_BYTES,
+    LINUX_STATE_CONFIRMATION_DOMAIN, LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+};
 use bpf_observer_oracle::{capture, CaptureOptions};
 use bpf_observer_schema::{
     ArtifactDigest, Attribution, ClaimScope, CompletenessStatus, ContractCheck, EvidenceHealth,
@@ -28,9 +41,18 @@ use bpf_observer_schema::{
     MAX_VERDICT_JSON_BYTES, MAX_WORKLOAD_OUTPUT_BYTES,
 };
 use bpf_observer_system_effects::{
-    coverage_gaps_for, describe_policy, policy_sha256, AttributionContract,
-    FileObjectResolutionMode, PolicyDescription, PolicyProfile, SystemEffectHealth,
-    SystemEffectRecorder, TransportStatus, EFFECT_EVENT_SCHEMA_VERSION,
+    coverage_gaps_for, describe_policy,
+    lifecycle::{
+        ProcessLifecycleRecorder, ProcessLifecycleStatus, PROCESS_LIFECYCLE_HEALTH_NAME,
+        PROCESS_LIFECYCLE_JSONL_NAME, PROCESS_LIFECYCLE_SCHEMA_VERSION, PROCESS_LIFECYCLE_WAL_NAME,
+    },
+    policy_sha256,
+    socket_state::{
+        SocketStateProducerSeal, SocketStateStatus, SOCKET_STATE_HEALTH_NAME,
+        SOCKET_STATE_JSONL_NAME, SOCKET_STATE_SCHEMA_VERSION, SOCKET_STATE_WAL_NAME,
+    },
+    AttributionContract, FileObjectResolutionMode, PolicyDescription, PolicyProfile,
+    SystemEffectHealth, SystemEffectRecorder, TransportStatus, EFFECT_EVENT_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,10 +76,16 @@ const MAX_WORKLOAD_ARGV_BYTES: usize = 1024 * 1024;
 const MAX_SMALL_JSON_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EFFECT_WAL_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_EFFECT_JSONL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_LIFECYCLE_WAL_BYTES: u64 = 264 * 1_000_000;
+const MAX_LIFECYCLE_JSONL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SOCKET_STATE_WAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SOCKET_STATE_JSONL_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(crate) const EVIDENCE_KIND_V1: &str = "SYSTEM_EFFECT_OPERATION_STREAM_V1";
 pub(crate) const EVIDENCE_KIND_FILESYSTEM_V2: &str =
     "SYSTEM_EFFECT_OPERATION_AND_FILESYSTEM_ENDPOINT_STATE_V2";
+pub(crate) const EVIDENCE_KIND_SCOPED_STATE_V3: &str =
+    "SYSTEM_EFFECT_OPERATION_AND_SCOPED_ENDPOINT_STATE_V3";
 
 const MANIFEST_NAME: &str = "system-effects.manifest.json";
 const POLICY_NAME: &str = "system-effects.policy.json";
@@ -76,6 +104,9 @@ pub(crate) const FILESYSTEM_STATE_S0_NAME: &str = "filesystem-state-s0.json";
 pub(crate) const FILESYSTEM_STATE_S1_NAME: &str = "filesystem-state-s1.json";
 pub(crate) const FILESYSTEM_STATE_COMPARISON_NAME: &str = "filesystem-state-comparison.json";
 pub(crate) const FILESYSTEM_ACTOR_CONTRACT_NAME: &str = "filesystem-actor-contract.json";
+pub(crate) const LINUX_STATE_S0_NAME: &str = "linux-state-s0.json";
+pub(crate) const LINUX_STATE_S1_NAME: &str = "linux-state-s1.json";
+pub(crate) const LINUX_STATE_COMPARISON_NAME: &str = "linux-state-comparison.json";
 const BASE_FINAL_ARTIFACTS: [&str; 6] = [
     POLICY_NAME,
     HEALTH_NAME,
@@ -89,6 +120,8 @@ const BASE_FINAL_ARTIFACTS: [&str; 6] = [
 pub struct ObserveRequest {
     pub recorder_object: PathBuf,
     pub expected_recorder_sha256: String,
+    pub process_lifecycle_object: Option<PathBuf>,
+    pub expected_process_lifecycle_sha256: Option<String>,
     pub output_dir: PathBuf,
     pub cgroup_root: PathBuf,
     pub run_id: Option<String>,
@@ -109,6 +142,10 @@ pub struct ObserveRequest {
     /// artifact set for exact verification; this process does not authenticate
     /// the claim's issuer.
     pub filesystem_actor_contract: Option<PathBuf>,
+    /// Optional explicit sysctl/mount/network/module state scope.
+    pub linux_state_scope: Option<PathBuf>,
+    /// Inject a residual-process scope derived from the actual run cgroup.
+    pub confirm_process_residual: bool,
     pub workload: Vec<OsString>,
 }
 
@@ -120,6 +157,10 @@ pub struct ObserveOutcome {
     pub workload_exit_code: Option<i32>,
     pub workload_signal: Option<i32>,
     pub transport_status: TransportStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_lifecycle_status: Option<ProcessLifecycleStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_state_status: Option<SocketStateStatus>,
     pub attribution_contract: AttributionContract,
     pub operation_events_are_state_diff: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +179,10 @@ pub struct ObserveOutcome {
     pub filesystem_causal_attribution: Option<CausalAttributionStatus>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filesystem_limitations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linux_state_scope_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linux_state_limitations: Vec<String>,
     pub state_domains: SystemStateDomainVector,
     pub output_dir: String,
 }
@@ -168,6 +213,7 @@ pub struct SystemStateDomainVector {
     pub sysctl: DomainStateVerdict,
     pub mounts: DomainStateVerdict,
     pub modules: DomainStateVerdict,
+    pub process_residual: DomainStateVerdict,
     pub keyrings: DomainStateVerdict,
     pub remote_network_effect: DomainStateVerdict,
 }
@@ -244,6 +290,22 @@ pub(crate) struct FilesystemStateConfirmation {
     pub atomic_with_other_confirmation_domains: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LinuxStateConfirmation {
+    pub protocol_version: u32,
+    pub confirmation_domain: &'static str,
+    pub scope_sha256: String,
+    pub s0_artifact: &'static str,
+    pub s1_artifact: &'static str,
+    pub comparison_artifact: &'static str,
+    pub auto_process_residual_bound: bool,
+    pub domains: LinuxStateDomainComparisons,
+    pub operation_events_are_state_diff: bool,
+    pub atomic_with_other_confirmation_domains: bool,
+    pub whole_linux_unchanged_authorized: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct EffectsManifest {
@@ -268,6 +330,10 @@ struct EffectsManifest {
     policy_artifact: &'static str,
     expected_recorder_object_sha256: String,
     loaded_recorder_object_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_lifecycle: Option<ProcessLifecycleEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket_state: Option<SocketStateEvidence>,
     kernel_release: String,
     boot_id: String,
     observer_version: &'static str,
@@ -280,9 +346,43 @@ struct EffectsManifest {
     bpf_state_confirmation: Option<BpfStateConfirmation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filesystem_state_confirmation: Option<FilesystemStateConfirmation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linux_state_confirmation: Option<LinuxStateConfirmation>,
     artifacts: BTreeMap<String, ArtifactDigest>,
     failure: Option<String>,
     notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessLifecycleEvidence {
+    protocol_version: u32,
+    expected_object_sha256: String,
+    loaded_object_sha256: String,
+    observer_exclusions: ObjectExclusions,
+    wal_artifact: &'static str,
+    jsonl_artifact: &'static str,
+    health_artifact: &'static str,
+    status: ProcessLifecycleStatus,
+    event_published: u64,
+    event_dropped: u64,
+    task_read_failed: u64,
+    lineage: Option<bpf_observer_system_effects::lifecycle::ProcessLineageSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SocketStateEvidence {
+    protocol_version: u32,
+    wal_artifact: &'static str,
+    jsonl_artifact: &'static str,
+    health_artifact: &'static str,
+    status: SocketStateStatus,
+    event_published: u64,
+    event_dropped: u64,
+    destroy_events_persisted: u64,
+    owners_retired_at_barrier: u64,
+    async_producer_seal: SocketStateProducerSeal,
 }
 
 /// Observe selected native syscall operations from one newly-created cgroup.
@@ -297,6 +397,17 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         load_filesystem_state_scope(request.filesystem_state_scope.as_deref())?;
     let filesystem_actor_contract =
         load_filesystem_actor_contract(request.filesystem_actor_contract.as_deref())?;
+    let linux_state_base_scope = load_linux_state_scope(request.linux_state_scope.as_deref())?;
+    if request.confirm_process_residual
+        && linux_state_base_scope
+            .as_ref()
+            .and_then(|scope| scope.process_residual.as_ref())
+            .is_some()
+    {
+        bail!("--confirm-process-residual cannot override process_residual in --linux-state-scope");
+    }
+    let linux_state_requested =
+        linux_state_base_scope.is_some() || request.confirm_process_residual;
     if filesystem_actor_contract.is_some() && filesystem_state_scope.is_none() {
         bail!("filesystem actor contract requires --filesystem-state-scope");
     }
@@ -321,7 +432,9 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
     let started_unix_ns = environment::now_unix_ns();
     let mut manifest = EffectsManifest {
         schema_version: EFFECT_EVENT_SCHEMA_VERSION,
-        evidence_kind: if filesystem_state_scope.is_some() {
+        evidence_kind: if linux_state_requested {
+            EVIDENCE_KIND_SCOPED_STATE_V3
+        } else if filesystem_state_scope.is_some() {
             EVIDENCE_KIND_FILESYSTEM_V2
         } else {
             EVIDENCE_KIND_V1
@@ -345,6 +458,8 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         policy_artifact: POLICY_NAME,
         expected_recorder_object_sha256: request.expected_recorder_sha256.clone(),
         loaded_recorder_object_sha256: None,
+        process_lifecycle: None,
+        socket_state: None,
         kernel_release,
         boot_id: boot_id.clone(),
         observer_version: env!("CARGO_PKG_VERSION"),
@@ -355,6 +470,7 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         coverage: initial_coverage(request.profile, request.object_resolution_mode),
         bpf_state_confirmation: None,
         filesystem_state_confirmation: None,
+        linux_state_confirmation: None,
         artifacts: BTreeMap::new(),
         failure: None,
         notes: vec![
@@ -390,8 +506,31 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         if recorder.policy_sha256() != manifest.policy_sha256.as_str() {
             bail!("loaded recorder policy digest changed after preflight");
         }
+        let mut lifecycle = match (
+            request.process_lifecycle_object.as_deref(),
+            request.expected_process_lifecycle_sha256.as_deref(),
+        ) {
+            (Some(object), Some(expected_sha256)) => Some(
+                ProcessLifecycleRecorder::open(
+                    object,
+                    expected_sha256,
+                    &request.output_dir,
+                    &run_id,
+                    &boot_id,
+                )
+                .context("load process-lifecycle recorder")?,
+            ),
+            (None, None) => None,
+            _ => unreachable!("validate_request enforces lifecycle object/digest pairing"),
+        };
+        let lifecycle_exclusions = lifecycle
+            .as_ref()
+            .map(ProcessLifecycleRecorder::object_exclusions)
+            .transpose()?
+            .unwrap_or_default();
         let recorder_exclusions = if let Some(scope) = bpf_state_scope.as_ref() {
-            let exclusions = recorder.object_exclusions()?;
+            let mut exclusions = recorder.object_exclusions()?;
+            merge_exclusions(&mut exclusions, &lifecycle_exclusions);
             bpf_observer_oracle::validate_claim_scope_exclusions(scope, &exclusions)
                 .context("validate BPF state scope against recorder-owned exclusions")?;
             exclusions
@@ -410,6 +549,34 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         recorder
             .register_run(active_cgroup.id(), request.run_epoch)
             .context("register system-effect run")?;
+        if let Some(lifecycle) = lifecycle.as_mut() {
+            lifecycle
+                .register_run(active_cgroup.id(), request.run_epoch)
+                .context("register process-lifecycle run")?;
+        }
+        let linux_state_scope = effective_linux_state_scope(
+            linux_state_base_scope.as_ref(),
+            request.confirm_process_residual,
+            active_cgroup.path(),
+            active_cgroup.id(),
+        )?;
+        let linux_state_s0 = if let Some(scope) = linux_state_scope.as_ref() {
+            let snapshot = capture_linux_state(
+                scope,
+                &LinuxStateCaptureRequest {
+                    snapshot_id: linux_state_snapshot_id(&run_id, request.run_epoch, "S0"),
+                    phase: LinuxStateSnapshotPhase::S0,
+                },
+            )
+            .context("capture optional Linux endpoint state S0")?;
+            atomic_file::write_json_atomic(
+                &request.output_dir.join(LINUX_STATE_S0_NAME),
+                &snapshot,
+            )?;
+            Some(snapshot)
+        } else {
+            None
+        };
         let bpf_state_s0 = if let Some(scope) = bpf_state_scope.as_ref() {
             let options = bpf_capture_options(&run_id, "S0", &recorder_exclusions);
             let snapshot = capture(scope, &options).context("capture optional BPF state S0")?;
@@ -445,6 +612,7 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         };
         let (status, output) = execute_workload(
             &mut recorder,
+            lifecycle.as_mut(),
             active_cgroup,
             &request.workload,
             &request.output_dir,
@@ -461,6 +629,9 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
             .freeze_empty(CLOSING_BARRIER_TIMEOUT)
             .context("freeze empty system-effect cgroup")?;
         manifest.cgroup_frozen_at_close = true;
+        recorder
+            .seal_socket_state_producers()
+            .context("synchronously seal asynchronous TCP-state producers")?;
         let health = recorder
             .finish_run(
                 active_cgroup.id(),
@@ -470,6 +641,24 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
             )
             .context("drain system-effect recorder")?;
         atomic_file::write_json_atomic(&request.output_dir.join(HEALTH_NAME), &health)?;
+        if let Some(socket_health) = health.socket_state.as_ref() {
+            atomic_file::write_json_atomic(
+                &request.output_dir.join(SOCKET_STATE_HEALTH_NAME),
+                socket_health,
+            )?;
+            manifest.socket_state = Some(SocketStateEvidence {
+                protocol_version: SOCKET_STATE_SCHEMA_VERSION,
+                wal_artifact: SOCKET_STATE_WAL_NAME,
+                jsonl_artifact: SOCKET_STATE_JSONL_NAME,
+                health_artifact: SOCKET_STATE_HEALTH_NAME,
+                status: socket_health.status,
+                event_published: socket_health.event_published,
+                event_dropped: socket_health.event_dropped,
+                destroy_events_persisted: socket_health.destroy_events_persisted,
+                owners_retired_at_barrier: socket_health.owners_retired_at_barrier,
+                async_producer_seal: socket_health.async_producer_seal,
+            });
+        }
         apply_health(&mut manifest, &health);
         if !health.drain_completed {
             bail!("system-effect recorder did not reach a closed drain boundary");
@@ -482,6 +671,95 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
                 health.transport_status
             );
         }
+        let lifecycle_health = lifecycle
+            .as_mut()
+            .map(|lifecycle| {
+                lifecycle.finish_run(
+                    active_cgroup.id(),
+                    request.run_epoch,
+                    Duration::from_millis(request.drain_timeout_ms),
+                    true,
+                )
+            })
+            .transpose()
+            .context("drain process-lifecycle recorder")?;
+        if let Some(lifecycle_health) = lifecycle_health.as_ref() {
+            atomic_file::write_json_atomic(
+                &request.output_dir.join(PROCESS_LIFECYCLE_HEALTH_NAME),
+                lifecycle_health,
+            )?;
+            if !lifecycle_health.drain_completed {
+                bail!("process-lifecycle recorder did not reach a closed drain boundary");
+            }
+            if matches!(
+                lifecycle_health.status,
+                ProcessLifecycleStatus::Incomplete | ProcessLifecycleStatus::UnprovenNoEvents
+            ) && !request.allow_incomplete_transport
+            {
+                bail!(
+                    "process-lifecycle transport is {:?}; pass --allow-incomplete-transport only for diagnostic collection",
+                    lifecycle_health.status
+                );
+            }
+            let lifecycle_recorder = lifecycle
+                .as_ref()
+                .expect("lifecycle health requires a loaded recorder");
+            manifest.process_lifecycle = Some(ProcessLifecycleEvidence {
+                protocol_version: PROCESS_LIFECYCLE_SCHEMA_VERSION,
+                expected_object_sha256: request
+                    .expected_process_lifecycle_sha256
+                    .clone()
+                    .expect("expanded request has lifecycle digest"),
+                loaded_object_sha256: lifecycle_recorder.object_sha256().to_owned(),
+                observer_exclusions: lifecycle_exclusions,
+                wal_artifact: PROCESS_LIFECYCLE_WAL_NAME,
+                jsonl_artifact: PROCESS_LIFECYCLE_JSONL_NAME,
+                health_artifact: PROCESS_LIFECYCLE_HEALTH_NAME,
+                status: lifecycle_health.status,
+                event_published: lifecycle_health.event_published,
+                event_dropped: lifecycle_health.event_dropped,
+                task_read_failed: lifecycle_health.task_read_failed,
+                lineage: lifecycle_health.lineage.clone(),
+            });
+        }
+
+        let linux_state_comparison = if let (Some(scope), Some(s0)) =
+            (linux_state_scope.as_ref(), linux_state_s0.as_ref())
+        {
+            // Unlike operation events, this runs only at the endpoint. The
+            // tracked cgroup is empty, frozen, still registered, and the ring
+            // transport has reached its closed drain boundary.
+            let s1 = capture_linux_state(
+                scope,
+                &LinuxStateCaptureRequest {
+                    snapshot_id: linux_state_snapshot_id(&run_id, request.run_epoch, "S1"),
+                    phase: LinuxStateSnapshotPhase::S1,
+                },
+            )
+            .context("capture optional Linux endpoint state S1")?;
+            atomic_file::write_json_atomic(&request.output_dir.join(LINUX_STATE_S1_NAME), &s1)?;
+            let comparison =
+                compare_linux_state(s0, &s1).context("compare optional Linux endpoint state")?;
+            if request.confirm_process_residual {
+                validate_auto_process_residual(&comparison)?;
+            }
+            atomic_file::write_json_atomic(
+                &request.output_dir.join(LINUX_STATE_COMPARISON_NAME),
+                &comparison,
+            )?;
+            manifest.linux_state_confirmation = Some(linux_state_confirmation_summary(
+                scope,
+                &comparison,
+                request.confirm_process_residual,
+            )?);
+            manifest.notes.push(
+                "Linux endpoint confirmation is an explicit per-domain vector; it never authorizes a whole-Linux unchanged claim"
+                    .to_owned(),
+            );
+            Some(comparison)
+        } else {
+            None
+        };
 
         if let (Some(scope), Some(s0)) = (bpf_state_scope.as_ref(), bpf_state_s0.as_ref()) {
             // The cgroup is still empty, frozen, and registered here. This is
@@ -558,7 +836,13 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
         recorder
             .unregister_run(active_cgroup.id(), request.run_epoch)
             .context("unregister system-effect run")?;
+        if let Some(lifecycle) = lifecycle.as_mut() {
+            lifecycle
+                .unregister_run(active_cgroup.id(), request.run_epoch)
+                .context("unregister process-lifecycle run")?;
+        }
         drop(recorder);
+        drop(lifecycle);
 
         active_cgroup
             .cleanup()
@@ -568,6 +852,8 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
             manifest.bpf_state_confirmation.is_some(),
             manifest.filesystem_state_confirmation.is_some(),
             filesystem_actor_contract.is_some(),
+            manifest.linux_state_confirmation.is_some(),
+            manifest.process_lifecycle.is_some(),
         )?;
         manifest.run_status = EffectRunStatus::Finalized;
         manifest.finalized_unix_ns = Some(environment::now_unix_ns().max(started_unix_ns));
@@ -578,6 +864,8 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
             workload_exit_code: status.code(),
             workload_signal: status.signal(),
             transport_status: health.transport_status,
+            process_lifecycle_status: lifecycle_health.as_ref().map(|health| health.status),
+            socket_state_status: health.socket_state.as_ref().map(|health| health.status),
             attribution_contract: manifest.attribution_contract,
             operation_events_are_state_diff: false,
             bpf_state_verdict: manifest
@@ -614,7 +902,14 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
                 .as_ref()
                 .map(|confirmation| confirmation.causal_attribution_status),
             filesystem_limitations,
-            state_domains: system_state_domain_vector(
+            linux_state_scope_sha256: linux_state_comparison
+                .as_ref()
+                .map(|comparison| comparison.scope_sha256.clone()),
+            linux_state_limitations: linux_state_comparison
+                .as_ref()
+                .map(|comparison| comparison.limitations.clone())
+                .unwrap_or_default(),
+            state_domains: system_state_domain_vector_with_linux(
                 manifest
                     .bpf_state_confirmation
                     .as_ref()
@@ -623,6 +918,7 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
                     .filesystem_state_confirmation
                     .as_ref()
                     .map(|confirmation| confirmation.state_verdict),
+                linux_state_comparison.as_ref(),
             ),
             output_dir: request.output_dir.display().to_string(),
         };
@@ -656,9 +952,18 @@ pub fn observe(request: ObserveRequest) -> Result<ObserveOutcome> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn system_state_domain_vector(
     bpf: Option<&StateVerdict>,
     filesystem: Option<FilesystemVerdict>,
+) -> SystemStateDomainVector {
+    system_state_domain_vector_with_linux(bpf, filesystem, None)
+}
+
+pub(crate) fn system_state_domain_vector_with_linux(
+    bpf: Option<&StateVerdict>,
+    filesystem: Option<FilesystemVerdict>,
+    linux: Option<&LinuxStateComparison>,
 ) -> SystemStateDomainVector {
     let bpf = match bpf {
         Some(StateVerdict::ChangedWithinScope) => DomainStateVerdict::ChangedWithinScope,
@@ -672,13 +977,29 @@ pub(crate) fn system_state_domain_vector(
         Some(FilesystemVerdict::Inconclusive) => DomainStateVerdict::Inconclusive,
         None => DomainStateVerdict::NotConfirmed,
     };
+    let linux_verdict = |domain: &LinuxDomainComparison| match domain.verdict {
+        LinuxStateVerdict::ChangedWithinScope => DomainStateVerdict::ChangedWithinScope,
+        LinuxStateVerdict::Inconclusive => DomainStateVerdict::Inconclusive,
+        LinuxStateVerdict::NotConfirmed => DomainStateVerdict::NotConfirmed,
+    };
     SystemStateDomainVector {
         filesystem,
         bpf,
-        network_config: DomainStateVerdict::NotConfirmed,
-        sysctl: DomainStateVerdict::NotConfirmed,
-        mounts: DomainStateVerdict::NotConfirmed,
-        modules: DomainStateVerdict::NotConfirmed,
+        network_config: linux
+            .map(|comparison| linux_verdict(&comparison.domains.network))
+            .unwrap_or(DomainStateVerdict::NotConfirmed),
+        sysctl: linux
+            .map(|comparison| linux_verdict(&comparison.domains.sysctl))
+            .unwrap_or(DomainStateVerdict::NotConfirmed),
+        mounts: linux
+            .map(|comparison| linux_verdict(&comparison.domains.mounts))
+            .unwrap_or(DomainStateVerdict::NotConfirmed),
+        modules: linux
+            .map(|comparison| linux_verdict(&comparison.domains.modules))
+            .unwrap_or(DomainStateVerdict::NotConfirmed),
+        process_residual: linux
+            .map(|comparison| linux_verdict(&comparison.domains.process_residual))
+            .unwrap_or(DomainStateVerdict::NotConfirmed),
         keyrings: DomainStateVerdict::NotConfirmed,
         remote_network_effect: DomainStateVerdict::NotConfirmable,
     }
@@ -717,6 +1038,101 @@ fn load_filesystem_actor_contract(path: Option<&Path>) -> Result<Option<ActorQui
         .validate()
         .context("validate filesystem actor contract")?;
     Ok(Some(contract))
+}
+
+fn load_linux_state_scope(path: Option<&Path>) -> Result<Option<LinuxStateScope>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let scope: LinuxStateScope = input::read_json(path, HARD_MAX_LINUX_STATE_SCOPE_JSON_BYTES)
+        .context("read explicit Linux endpoint-state scope")?;
+    scope
+        .validate()
+        .context("validate Linux endpoint-state scope")?;
+    Ok(Some(scope))
+}
+
+pub(crate) fn effective_linux_state_scope(
+    base: Option<&LinuxStateScope>,
+    auto_process_residual: bool,
+    cgroup_path: &Path,
+    cgroup_id: u64,
+) -> Result<Option<LinuxStateScope>> {
+    if !auto_process_residual {
+        return Ok(base.cloned());
+    }
+    if cgroup_id == 0 {
+        bail!("automatic process residual confirmation requires a nonzero cgroup ID");
+    }
+    let mut scope = base.cloned().unwrap_or(LinuxStateScope {
+        protocol_version: LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+        sysctl: None,
+        mounts: None,
+        network: None,
+        modules: None,
+        process_residual: None,
+    });
+    if scope.process_residual.is_some() {
+        bail!("automatic process residual scope cannot override an explicit scope");
+    }
+    scope.process_residual = Some(ProcessResidualScope {
+        cgroup_path_bytes_hex: encode_absolute_path(cgroup_path)
+            .context("encode automatic residual cgroup path")?,
+        expected_cgroup_id: cgroup_id,
+        additional_roots: Vec::new(),
+        recursive: true,
+        require_cgroup2: true,
+        // PID/command bytes are not needed to compare endpoint identity; this
+        // minimizes evidence I/O while preserving exact record digests.
+        evidence: ValueEvidenceMode::Sha256Only,
+        limits: LinuxStateCaptureLimits::default(),
+    });
+    scope.validate()?;
+    Ok(Some(scope))
+}
+
+pub(crate) fn linux_state_snapshot_id(run_id: &str, run_epoch: u64, phase: &str) -> String {
+    format!("{run_id}-E{run_epoch}-EFFECTS-LINUX-STATE-{phase}")
+}
+
+fn linux_state_confirmation_summary(
+    scope: &LinuxStateScope,
+    comparison: &LinuxStateComparison,
+    auto_process_residual_bound: bool,
+) -> Result<LinuxStateConfirmation> {
+    if comparison.protocol_version != LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION
+        || comparison.domain != LINUX_STATE_CONFIRMATION_DOMAIN
+        || comparison.scope_sha256 != scope.sha256()?
+    {
+        bail!("Linux state comparison is not bound to the requested confirmation scope");
+    }
+    Ok(LinuxStateConfirmation {
+        protocol_version: LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+        confirmation_domain: LINUX_STATE_CONFIRMATION_DOMAIN,
+        scope_sha256: comparison.scope_sha256.clone(),
+        s0_artifact: LINUX_STATE_S0_NAME,
+        s1_artifact: LINUX_STATE_S1_NAME,
+        comparison_artifact: LINUX_STATE_COMPARISON_NAME,
+        auto_process_residual_bound,
+        domains: comparison.domains.clone(),
+        operation_events_are_state_diff: false,
+        atomic_with_other_confirmation_domains: false,
+        whole_linux_unchanged_authorized: false,
+    })
+}
+
+fn validate_auto_process_residual(comparison: &LinuxStateComparison) -> Result<()> {
+    let residual = &comparison.domains.process_residual;
+    if residual.state_completeness.status != LinuxCompletenessStatus::Complete
+        || residual.endpoint_difference != LinuxEndpointDifferenceStatus::ObservedIdentical
+        || residual.verdict != LinuxStateVerdict::Inconclusive
+        || residual.terminal_state != LinuxTerminalState::EmptyWithinScope
+    {
+        bail!(
+            "automatic process residual confirmation contradicts the empty/frozen cgroup barrier"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn filesystem_snapshot_id(run_id: &str, run_epoch: u64, phase: &str) -> String {
@@ -902,6 +1318,20 @@ fn validate_request(request: &ObserveRequest) -> Result<()> {
         bail!("workload and drain timeouts must be nonzero");
     }
     validate_sha256(&request.expected_recorder_sha256)?;
+    match (
+        request.object_resolution_mode,
+        request.process_lifecycle_object.as_ref(),
+        request.expected_process_lifecycle_sha256.as_deref(),
+    ) {
+        (ObjectResolutionMode::KernelObjectExpandedPartial, Some(_), Some(digest)) => {
+            validate_sha256(digest)?;
+        }
+        (ObjectResolutionMode::KernelObjectExpandedPartial, _, _) => {
+            bail!("expanded object resolution requires both process-lifecycle object and digest")
+        }
+        (_, None, None) => {}
+        _ => bail!("process-lifecycle object evidence is only valid in expanded object mode"),
+    }
     run::validate_cgroup_root(&request.cgroup_root)?;
     if let Some(run_id) = request.run_id.as_deref() {
         run::validate_run_id(run_id)?;
@@ -974,7 +1404,18 @@ fn recorder_resolution_mode(mode: ObjectResolutionMode) -> FileObjectResolutionM
         ObjectResolutionMode::KernelFileOpenWritePartial => {
             FileObjectResolutionMode::KernelFileOpenWritePartial
         }
+        ObjectResolutionMode::KernelObjectExpandedPartial => {
+            FileObjectResolutionMode::KernelObjectExpandedPartial
+        }
     }
+}
+
+fn merge_exclusions(target: &mut ObjectExclusions, source: &ObjectExclusions) {
+    target
+        .program_ids
+        .extend(source.program_ids.iter().copied());
+    target.map_ids.extend(source.map_ids.iter().copied());
+    target.link_ids.extend(source.link_ids.iter().copied());
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1048,6 +1489,7 @@ impl BoundedCapture {
 
 fn execute_workload(
     recorder: &mut SystemEffectRecorder,
+    mut lifecycle: Option<&mut ProcessLifecycleRecorder>,
     cgroup: &ManagedCgroup,
     workload: &[OsString],
     output_dir: &Path,
@@ -1091,7 +1533,12 @@ fn execute_workload(
 
     let monitored = (|| -> Result<ExitStatus> {
         loop {
-            recorder.poll(poll_duration(deadline))?;
+            recorder.poll(Duration::ZERO)?;
+            if let Some(lifecycle) = lifecycle.as_mut() {
+                lifecycle.poll(poll_duration(deadline))?;
+            } else {
+                recorder.poll(poll_duration(deadline))?;
+            }
             stdout.drain()?;
             stderr.drain()?;
             if root_status.is_none() {
@@ -1113,6 +1560,9 @@ fn execute_workload(
         Err(error) => {
             kill_and_reap_bounded(&mut child, cgroup);
             let _ = recorder.poll(Duration::ZERO);
+            if let Some(lifecycle) = lifecycle.as_mut() {
+                let _ = lifecycle.poll(Duration::ZERO);
+            }
             let _ = stdout.drain();
             let _ = stderr.drain();
             return Err(error);
@@ -1176,18 +1626,24 @@ fn collect_artifacts(
     includes_bpf_state: bool,
     includes_filesystem_state: bool,
     includes_filesystem_actor_contract: bool,
+    includes_linux_state: bool,
+    includes_process_lifecycle: bool,
 ) -> Result<BTreeMap<String, ArtifactDigest>> {
     validate_output_entries(
         output_dir,
         includes_bpf_state,
         includes_filesystem_state,
         includes_filesystem_actor_contract,
+        includes_linux_state,
+        includes_process_lifecycle,
     )?;
     let mut artifacts = BTreeMap::new();
-    for name in final_artifact_names(
+    for name in final_artifact_names_with_linux(
         includes_bpf_state,
         includes_filesystem_state,
         includes_filesystem_actor_contract,
+        includes_linux_state,
+        includes_process_lifecycle,
     )? {
         artifacts.insert(
             name.to_owned(),
@@ -1199,14 +1655,33 @@ fn collect_artifacts(
         includes_bpf_state,
         includes_filesystem_state,
         includes_filesystem_actor_contract,
+        includes_linux_state,
+        includes_process_lifecycle,
     )?;
     Ok(artifacts)
 }
 
+#[cfg(test)]
 fn final_artifact_names(
     includes_bpf_state: bool,
     includes_filesystem_state: bool,
     includes_filesystem_actor_contract: bool,
+) -> Result<Vec<&'static str>> {
+    final_artifact_names_with_linux(
+        includes_bpf_state,
+        includes_filesystem_state,
+        includes_filesystem_actor_contract,
+        false,
+        false,
+    )
+}
+
+fn final_artifact_names_with_linux(
+    includes_bpf_state: bool,
+    includes_filesystem_state: bool,
+    includes_filesystem_actor_contract: bool,
+    includes_linux_state: bool,
+    includes_process_lifecycle: bool,
 ) -> Result<Vec<&'static str>> {
     if includes_filesystem_actor_contract && !includes_filesystem_state {
         bail!("filesystem actor contract cannot exist without filesystem state evidence");
@@ -1225,6 +1700,23 @@ fn final_artifact_names(
     if includes_filesystem_actor_contract {
         names.push(FILESYSTEM_ACTOR_CONTRACT_NAME);
     }
+    if includes_linux_state {
+        names.extend([
+            LINUX_STATE_S0_NAME,
+            LINUX_STATE_S1_NAME,
+            LINUX_STATE_COMPARISON_NAME,
+        ]);
+    }
+    if includes_process_lifecycle {
+        names.extend([
+            PROCESS_LIFECYCLE_WAL_NAME,
+            PROCESS_LIFECYCLE_JSONL_NAME,
+            PROCESS_LIFECYCLE_HEALTH_NAME,
+            SOCKET_STATE_WAL_NAME,
+            SOCKET_STATE_JSONL_NAME,
+            SOCKET_STATE_HEALTH_NAME,
+        ]);
+    }
     Ok(names)
 }
 
@@ -1233,11 +1725,15 @@ fn validate_output_entries(
     includes_bpf_state: bool,
     includes_filesystem_state: bool,
     includes_filesystem_actor_contract: bool,
+    includes_linux_state: bool,
+    includes_process_lifecycle: bool,
 ) -> Result<()> {
-    let mut allowed = final_artifact_names(
+    let mut allowed = final_artifact_names_with_linux(
         includes_bpf_state,
         includes_filesystem_state,
         includes_filesystem_actor_contract,
+        includes_linux_state,
+        includes_process_lifecycle,
     )?
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -1260,13 +1756,20 @@ fn validate_output_entries(
 fn artifact_limit(name: &str) -> Result<u64> {
     match name {
         POLICY_NAME | HEALTH_NAME => Ok(MAX_SMALL_JSON_BYTES),
+        PROCESS_LIFECYCLE_HEALTH_NAME | SOCKET_STATE_HEALTH_NAME => Ok(MAX_SMALL_JSON_BYTES),
         BPF_STATE_S0_NAME | BPF_STATE_S1_NAME => Ok(MAX_SNAPSHOT_JSON_BYTES),
         BPF_STATE_VERDICT_NAME => Ok(MAX_VERDICT_JSON_BYTES),
         FILESYSTEM_STATE_S0_NAME | FILESYSTEM_STATE_S1_NAME => Ok(HARD_MAX_SNAPSHOT_JSON_BYTES),
         FILESYSTEM_STATE_COMPARISON_NAME => Ok(HARD_MAX_COMPARISON_JSON_BYTES),
         FILESYSTEM_ACTOR_CONTRACT_NAME => Ok(HARD_MAX_ACTOR_CONTRACT_JSON_BYTES),
+        LINUX_STATE_S0_NAME | LINUX_STATE_S1_NAME => Ok(HARD_MAX_LINUX_STATE_SNAPSHOT_JSON_BYTES),
+        LINUX_STATE_COMPARISON_NAME => Ok(HARD_MAX_LINUX_STATE_COMPARISON_JSON_BYTES),
         WAL_NAME => Ok(MAX_EFFECT_WAL_BYTES),
         JSONL_NAME => Ok(MAX_EFFECT_JSONL_BYTES),
+        PROCESS_LIFECYCLE_WAL_NAME => Ok(MAX_LIFECYCLE_WAL_BYTES),
+        PROCESS_LIFECYCLE_JSONL_NAME => Ok(MAX_LIFECYCLE_JSONL_BYTES),
+        SOCKET_STATE_WAL_NAME => Ok(MAX_SOCKET_STATE_WAL_BYTES),
+        SOCKET_STATE_JSONL_NAME => Ok(MAX_SOCKET_STATE_JSONL_BYTES),
         STDOUT_NAME | STDERR_NAME => Ok(MAX_WORKLOAD_OUTPUT_BYTES),
         _ => bail!("no size policy for system-effect artifact {name:?}"),
     }
@@ -1411,7 +1914,58 @@ mod tests {
         assert_eq!(final_artifact_names(true, false, false).unwrap().len(), 9);
         assert_eq!(final_artifact_names(false, true, false).unwrap().len(), 9);
         assert_eq!(final_artifact_names(true, true, true).unwrap().len(), 13);
+        assert_eq!(
+            final_artifact_names_with_linux(false, false, false, true, false)
+                .unwrap()
+                .len(),
+            9
+        );
+        assert_eq!(
+            final_artifact_names_with_linux(true, true, true, true, false)
+                .unwrap()
+                .len(),
+            16
+        );
         assert!(final_artifact_names(false, false, true).is_err());
+    }
+
+    #[test]
+    fn automatic_process_residual_scope_binds_the_recursive_run_cgroup() {
+        let scope = effective_linux_state_scope(
+            None,
+            true,
+            Path::new("/sys/fs/cgroup/bpf-state-observer-effects/test-run"),
+            77,
+        )
+        .unwrap()
+        .unwrap();
+        let residual = scope.process_residual.unwrap();
+        assert_eq!(residual.expected_cgroup_id, 77);
+        assert!(residual.recursive);
+        assert!(residual.require_cgroup2);
+        assert_eq!(
+            residual.cgroup_path_bytes_hex,
+            encode_absolute_path(Path::new(
+                "/sys/fs/cgroup/bpf-state-observer-effects/test-run",
+            ))
+            .unwrap()
+        );
+
+        let explicit = LinuxStateScope {
+            protocol_version: LINUX_STATE_CONFIRMATION_PROTOCOL_VERSION,
+            sysctl: None,
+            mounts: None,
+            network: None,
+            modules: None,
+            process_residual: Some(residual),
+        };
+        assert!(effective_linux_state_scope(
+            Some(&explicit),
+            true,
+            Path::new("/sys/fs/cgroup/other"),
+            88,
+        )
+        .is_err());
     }
 
     #[test]
