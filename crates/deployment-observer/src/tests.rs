@@ -31,6 +31,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RECOVERY_NONCE_2: &str = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RECOVERY_NONCE_3: &str = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[test]
 fn initial_ready_failure_exposes_bounded_typed_mismatch_diagnostics() {
@@ -85,6 +87,228 @@ fn protocol_rejects_wrong_nonce_without_advancing() {
     };
     assert!(machine.accept_finish(&command).is_err());
     assert_eq!(machine.state(), ProtocolState::Ready);
+}
+
+fn recovery_command(
+    kind: RecoveryCommandKind,
+    run_id: &str,
+    checkpoint_id: &str,
+    recovery_id: &str,
+    command_seq: u32,
+    nonce: &str,
+) -> RecoveryControlCommand {
+    let protocol_version = DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION;
+    let run_id = run_id.to_owned();
+    let checkpoint_id = checkpoint_id.to_owned();
+    let recovery_id = recovery_id.to_owned();
+    let nonce = nonce.to_owned();
+    match kind {
+        RecoveryCommandKind::AgentStarted => RecoveryControlCommand::AgentStarted {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+        RecoveryCommandKind::PreRestore => RecoveryControlCommand::PreRestore {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+        RecoveryCommandKind::Finish => RecoveryControlCommand::Finish {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+    }
+}
+
+fn recovery_machine() -> RecoveryProtocolMachine {
+    RecoveryProtocolMachine::new("run-abc", 7, "checkpoint-1", "recovery-1", NONCE).unwrap()
+}
+
+#[test]
+fn recovery_protocol_accepts_only_complete_abc_sequence() {
+    let mut machine = recovery_machine();
+    assert_eq!(machine.state(), RecoveryProtocolState::Initialized);
+    machine.mark_ready_a_committed().unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+
+    let agent_started = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+    assert_eq!(machine.expected_command_seq(), 2);
+    assert_eq!(machine.nonce(), RECOVERY_NONCE_2);
+
+    let pre_restore = recovery_command(
+        RecoveryCommandKind::PreRestore,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        2,
+        RECOVERY_NONCE_2,
+    );
+    machine
+        .accept_pre_restore(&pre_restore, RECOVERY_NONCE_3)
+        .unwrap();
+    machine.mark_b_committed().unwrap();
+    machine.mark_restoring().unwrap();
+    machine.mark_restore_complete().unwrap();
+    machine.mark_c_committed().unwrap();
+
+    let finish = recovery_command(
+        RecoveryCommandKind::Finish,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        3,
+        RECOVERY_NONCE_3,
+    );
+    machine.accept_finish(&finish).unwrap();
+    machine.mark_finished().unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::Finished);
+}
+
+#[test]
+fn recovery_protocol_rejects_out_of_order_and_duplicate_commands() {
+    let mut machine = recovery_machine();
+    let pre_restore = recovery_command(
+        RecoveryCommandKind::PreRestore,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        2,
+        RECOVERY_NONCE_2,
+    );
+    assert!(machine
+        .accept_pre_restore(&pre_restore, RECOVERY_NONCE_3)
+        .is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::Initialized);
+
+    machine.mark_ready_a_committed().unwrap();
+    let agent_started = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .unwrap();
+    assert!(machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+
+    assert!(machine.mark_b_committed().is_err());
+    let finish = recovery_command(
+        RecoveryCommandKind::Finish,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        3,
+        RECOVERY_NONCE_3,
+    );
+    assert!(machine.accept_finish(&finish).is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+}
+
+#[test]
+fn recovery_protocol_rejects_wrong_nonce_ids_and_sequence_without_advancing() {
+    let mut machine = recovery_machine();
+    machine.mark_ready_a_committed().unwrap();
+
+    for command in [
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "wrong-run",
+            "checkpoint-1",
+            "recovery-1",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "wrong-checkpoint",
+            "recovery-1",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "wrong-recovery",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "recovery-1",
+            1,
+            RECOVERY_NONCE_2,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "recovery-1",
+            2,
+            NONCE,
+        ),
+    ] {
+        assert!(machine
+            .accept_agent_started(&command, RECOVERY_NONCE_2)
+            .is_err());
+        assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+        assert_eq!(machine.expected_command_seq(), 1);
+        assert_eq!(machine.nonce(), NONCE);
+    }
+}
+
+#[test]
+fn recovery_protocol_requires_fresh_next_nonce_and_rejects_unknown_fields() {
+    let mut machine = recovery_machine();
+    machine.mark_ready_a_committed().unwrap();
+    let command = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    assert!(machine.accept_agent_started(&command, NONCE).is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+
+    let encoded = format!(
+        "{{\"command\":\"AGENT_STARTED\",\"protocol_version\":3,\"run_id\":\"run-abc\",\"epoch\":7,\"checkpoint_id\":\"checkpoint-1\",\"recovery_id\":\"recovery-1\",\"command_seq\":1,\"nonce\":\"{NONCE}\",\"unexpected\":true}}"
+    );
+    assert!(serde_json::from_str::<RecoveryControlCommand>(&encoded).is_err());
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! that the deployment caused a global state change.
 
 use anyhow::{bail, Context, Result};
-use bpf_observer_comparator::compare as compare_bpf;
+use bpf_observer_comparator::compare_phases as compare_bpf_phases;
 use bpf_observer_deployment::{DeploymentKind, DeploymentManifest, ProcessRole};
 use bpf_observer_filesystem_confirmer::{
     capture as capture_filesystem, capture_in_retained_mount_namespace,
@@ -313,6 +313,15 @@ pub(crate) fn capture_bpf_endpoint(
 }
 
 pub(crate) fn compare_bpf_endpoints(before: &Snapshot, after: &Snapshot) -> Result<Verdict> {
+    compare_bpf_endpoints_with_phases(before, after, "S0", "S1")
+}
+
+pub(crate) fn compare_bpf_endpoints_with_phases(
+    before: &Snapshot,
+    after: &Snapshot,
+    before_phase: &str,
+    after_phase: &str,
+) -> Result<Verdict> {
     let mut evidence = EvidenceHealth::default();
     evidence.reasons.push(
         "deployment operation streams do not establish the exclusive BPF_USER_SYSCALL evidence contract required for a negative global BPF-state claim"
@@ -326,7 +335,14 @@ pub(crate) fn compare_bpf_endpoints(before: &Snapshot, after: &Snapshot) -> Resu
         exclusive_actor_attribution: false,
         authentication: None,
     };
-    let mut verdict = compare_bpf(before, after, &evidence, quiescence)?;
+    let mut verdict = compare_bpf_phases(
+        before,
+        after,
+        before_phase,
+        after_phase,
+        &evidence,
+        quiescence,
+    )?;
     verdict.run_status = RunStatus::Provisional;
     verdict.limitations.push(
         "deployment cgroup freeze barriers do not exclude unrelated host BPF actors; a positive delta remains unattributed and an empty delta remains inconclusive"
@@ -351,6 +367,9 @@ pub(crate) fn capture_filesystem_endpoint(
     let phase_name = match phase {
         FilesystemSnapshotPhase::S0 => "S0",
         FilesystemSnapshotPhase::S1 => "S1",
+        FilesystemSnapshotPhase::A => "A",
+        FilesystemSnapshotPhase::B => "B",
+        FilesystemSnapshotPhase::C => "C",
     };
     let request = FilesystemCaptureRequest {
         snapshot_id: filesystem_snapshot_id(run_id, epoch, phase_name),

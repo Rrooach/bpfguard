@@ -7,10 +7,30 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 pub fn compare(before: &StateSnapshot, after: &StateSnapshot) -> Result<StateComparison> {
+    compare_phases(before, after, SnapshotPhase::S0, SnapshotPhase::S1)
+}
+
+/// Compare a supported pair of scoped Linux endpoint snapshots.
+///
+/// The result retains its legacy `s0_snapshot_id` and `s1_snapshot_id` wire
+/// field names. For A/B/C comparisons those fields contain the before and
+/// after snapshot IDs; recovery artifacts should map them to phase-neutral
+/// names rather than serialize this type directly.
+pub fn compare_phases(
+    before: &StateSnapshot,
+    after: &StateSnapshot,
+    expected_before: SnapshotPhase,
+    expected_after: SnapshotPhase,
+) -> Result<StateComparison> {
+    validate_distinct_phases(expected_before, expected_after)?;
     validate_snapshot(before)?;
     validate_snapshot(after)?;
-    if before.phase != SnapshotPhase::S0 || after.phase != SnapshotPhase::S1 {
-        bail!("Linux state comparison requires S0 followed by S1");
+    if before.phase != expected_before || after.phase != expected_after {
+        bail!(
+            "Linux state comparison requires {} followed by {}",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        );
     }
     if before.scope != after.scope || before.scope_sha256 != after.scope_sha256 {
         bail!("Linux state comparison scope mismatch");
@@ -23,18 +43,22 @@ pub fn compare(before: &StateSnapshot, after: &StateSnapshot) -> Result<StateCom
         s0_snapshot_id: before.snapshot_id.clone(),
         s1_snapshot_id: after.snapshot_id.clone(),
         domains: StateDomainComparisons {
-            sysctl: compare_domain(DomainKind::Sysctl, before.sysctl.as_ref(), after.sysctl.as_ref(), same_boot)?,
-            mounts: compare_domain(DomainKind::Mount, before.mounts.as_ref(), after.mounts.as_ref(), same_boot)?,
-            network: compare_domain(DomainKind::Network, before.network.as_ref(), after.network.as_ref(), same_boot)?,
-            modules: compare_domain(DomainKind::KernelModule, before.modules.as_ref(), after.modules.as_ref(), same_boot)?,
+            sysctl: compare_domain(DomainKind::Sysctl, before.sysctl.as_ref(), after.sysctl.as_ref(), same_boot, expected_before, expected_after)?,
+            mounts: compare_domain(DomainKind::Mount, before.mounts.as_ref(), after.mounts.as_ref(), same_boot, expected_before, expected_after)?,
+            network: compare_domain(DomainKind::Network, before.network.as_ref(), after.network.as_ref(), same_boot, expected_before, expected_after)?,
+            modules: compare_domain(DomainKind::KernelModule, before.modules.as_ref(), after.modules.as_ref(), same_boot, expected_before, expected_after)?,
             process_residual: compare_domain(
-                DomainKind::ProcessResidual, before.process_residual.as_ref(), after.process_residual.as_ref(), same_boot,
+                DomainKind::ProcessResidual, before.process_residual.as_ref(), after.process_residual.as_ref(), same_boot, expected_before, expected_after,
             )?,
         },
         limitations: vec![
             "results are an explicit per-domain vector and must never be collapsed into an all-Linux unchanged claim".to_owned(),
             "endpoint comparison does not establish causal attribution; operation history is separate evidence".to_owned(),
-            "an identical endpoint remains INCONCLUSIVE without authenticated exclusive-writer and S0/S1 quiescence evidence".to_owned(),
+            format!(
+                "an identical endpoint remains INCONCLUSIVE without authenticated exclusive-writer and {}/{} quiescence evidence",
+                phase_label(expected_before),
+                phase_label(expected_after)
+            ),
             "remote service or database effects are not confirmable by this target-Linux endpoint confirmer".to_owned(),
         ],
     };
@@ -50,6 +74,8 @@ fn compare_domain(
     before: Option<&DomainSnapshot>,
     after: Option<&DomainSnapshot>,
     same_boot: bool,
+    before_phase: SnapshotPhase,
+    after_phase: SnapshotPhase,
 ) -> Result<DomainComparison> {
     let limitations = limitations(kind);
     let (Some(before), Some(after)) = (before, after) else {
@@ -77,22 +103,44 @@ fn compare_domain(
     }
     let mut reasons = Vec::new();
     if before.completeness.status != CompletenessStatus::Complete {
-        reasons.push("S0 domain snapshot is incomplete".to_owned());
+        reasons.push(format!(
+            "{} domain snapshot is incomplete",
+            phase_label(before_phase)
+        ));
     }
     if after.completeness.status != CompletenessStatus::Complete {
-        reasons.push("S1 domain snapshot is incomplete".to_owned());
+        reasons.push(format!(
+            "{} domain snapshot is incomplete",
+            phase_label(after_phase)
+        ));
     }
     if !same_boot {
-        reasons.push("S0 and S1 kernel boot identities differ".to_owned());
+        reasons.push(format!(
+            "{} and {} kernel boot identities differ",
+            phase_label(before_phase),
+            phase_label(after_phase)
+        ));
     }
     if before.namespace_inode != after.namespace_inode {
-        reasons.push("S0 and S1 namespace identities differ".to_owned());
+        reasons.push(format!(
+            "{} and {} namespace identities differ",
+            phase_label(before_phase),
+            phase_label(after_phase)
+        ));
     }
     if before.namespace_context != after.namespace_context {
-        reasons.push("S0 and S1 namespace capture contexts differ".to_owned());
+        reasons.push(format!(
+            "{} and {} namespace capture contexts differ",
+            phase_label(before_phase),
+            phase_label(after_phase)
+        ));
     }
     if before.source_identity_sha256 != after.source_identity_sha256 {
-        reasons.push("S0 and S1 capture source/tool identities differ".to_owned());
+        reasons.push(format!(
+            "{} and {} capture source/tool identities differ",
+            phase_label(before_phase),
+            phase_label(after_phase)
+        ));
     }
     reasons.sort();
     reasons.dedup();
@@ -140,6 +188,28 @@ fn compare_domain(
         changes,
         limitations,
     })
+}
+
+fn validate_distinct_phases(before: SnapshotPhase, after: SnapshotPhase) -> Result<()> {
+    if before == after {
+        bail!(
+            "Linux state snapshot comparison phases must differ, got {} -> {}",
+            phase_label(before),
+            phase_label(after)
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn phase_label(phase: SnapshotPhase) -> &'static str {
+    match phase {
+        SnapshotPhase::S0 => "S0",
+        SnapshotPhase::S1 => "S1",
+        SnapshotPhase::A => "A",
+        SnapshotPhase::B => "B",
+        SnapshotPhase::C => "C",
+    }
 }
 
 fn is_process_residual_record_key(key: &str) -> bool {

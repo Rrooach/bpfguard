@@ -21,10 +21,37 @@ pub fn compare(
     after: &FilesystemSnapshot,
     actor_contract: Option<&ActorQuiescenceContract>,
 ) -> Result<FilesystemComparison> {
+    compare_phases(
+        before,
+        after,
+        SnapshotPhase::S0,
+        SnapshotPhase::S1,
+        actor_contract,
+    )
+}
+
+/// Compare a supported pair of filesystem endpoint snapshots.
+///
+/// The existing comparison artifact retains its `s0_snapshot_id` and
+/// `s1_snapshot_id` wire fields for compatibility; for A/B/C comparisons they
+/// mean the before and after snapshot IDs respectively. Callers that persist a
+/// recovery-specific artifact should map the result into phase-neutral fields.
+pub fn compare_phases(
+    before: &FilesystemSnapshot,
+    after: &FilesystemSnapshot,
+    expected_before: SnapshotPhase,
+    expected_after: SnapshotPhase,
+    actor_contract: Option<&ActorQuiescenceContract>,
+) -> Result<FilesystemComparison> {
+    validate_distinct_phases(expected_before, expected_after)?;
     before.validate()?;
     after.validate()?;
-    if before.phase != SnapshotPhase::S0 || after.phase != SnapshotPhase::S1 {
-        bail!("filesystem comparison requires an S0 snapshot followed by an S1 snapshot");
+    if before.phase != expected_before || after.phase != expected_after {
+        bail!(
+            "filesystem comparison requires a {} snapshot followed by a {} snapshot",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        );
     }
     if before.scope != after.scope || before.scope_sha256 != after.scope_sha256 {
         bail!("filesystem comparison scope mismatch");
@@ -37,24 +64,46 @@ pub fn compare(
     }
     let mut state_reasons = Vec::new();
     if before.completeness.status != CompletenessStatus::Complete {
-        state_reasons.push("S0 filesystem snapshot is incomplete".to_owned());
+        state_reasons.push(format!(
+            "{} filesystem snapshot is incomplete",
+            phase_label(expected_before)
+        ));
     }
     if after.completeness.status != CompletenessStatus::Complete {
-        state_reasons.push("S1 filesystem snapshot is incomplete".to_owned());
+        state_reasons.push(format!(
+            "{} filesystem snapshot is incomplete",
+            phase_label(expected_after)
+        ));
     }
     if before.boot_id != after.boot_id {
-        state_reasons.push("S0 and S1 kernel boot identities differ".to_owned());
+        state_reasons.push(format!(
+            "{} and {} kernel boot identities differ",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        ));
     }
     if before.mount_namespace_inode != after.mount_namespace_inode {
-        state_reasons.push("S0 and S1 mount namespace identities differ".to_owned());
+        state_reasons.push(format!(
+            "{} and {} mount namespace identities differ",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        ));
     }
     if before.mount_namespace_capture_source != after.mount_namespace_capture_source {
-        state_reasons.push("S0 and S1 mount namespace capture sources differ".to_owned());
+        state_reasons.push(format!(
+            "{} and {} mount namespace capture sources differ",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        ));
     }
     if before.mount_root_device != after.mount_root_device
         || before.mount_root_inode != after.mount_root_inode
     {
-        state_reasons.push("S0 and S1 absolute-path root object identities differ".to_owned());
+        state_reasons.push(format!(
+            "{} and {} absolute-path root object identities differ",
+            phase_label(expected_before),
+            phase_label(expected_after)
+        ));
     }
     state_reasons.sort();
     state_reasons.dedup();
@@ -140,6 +189,28 @@ pub fn compare(
         changes,
         limitations,
     })
+}
+
+fn validate_distinct_phases(before: SnapshotPhase, after: SnapshotPhase) -> Result<()> {
+    if before == after {
+        bail!(
+            "filesystem snapshot comparison phases must differ, got {} -> {}",
+            phase_label(before),
+            phase_label(after)
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn phase_label(phase: SnapshotPhase) -> &'static str {
+    match phase {
+        SnapshotPhase::S0 => "S0",
+        SnapshotPhase::S1 => "S1",
+        SnapshotPhase::A => "A",
+        SnapshotPhase::B => "B",
+        SnapshotPhase::C => "C",
+    }
 }
 
 fn validate_actor_contract(

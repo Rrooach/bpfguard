@@ -17,7 +17,7 @@ mod schema;
 
 pub use capture::{capture, capture_with_retained_namespaces};
 pub use command::trusted_collector_sha256;
-pub use compare::compare;
+pub use compare::{compare, compare_phases};
 pub use namespace::{RetainedNamespace, RetainedNamespaces, SysctlNamespaceTargets};
 pub use schema::*;
 

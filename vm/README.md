@@ -210,6 +210,129 @@ measured inputs, QEMU argv/console, Guest stdout/stderr, recovered evidence,
 external image/QEMU hashes, and `SHA256SUMS`. This is a cooperative-workload
 functional gate, not a hostile-Guest containment or delegated-causality claim.
 
+## A/B/C external-recovery VM acceptance
+
+[`guest-recovery-abc-e2e.sh`](guest-recovery-abc-e2e.sh) is the protocol-v3
+Guest-side acceptance driver. Run it **only in a disposable privileged VM**
+booted with the effects kernel, BTF/BPF LSM, cgroup v2, bpffs, `ip`, `tc`,
+`nft`, `insmod`, and `rmmod`. It uses the existing Linux-state and pinned-Map
+fixtures, plus a minimal pinned cgroup-SKB Program/Link fixture. The
+content-bound, root-owned [recovery helper](../workloads/deployment-recovery-helper.sh)
+is executed directly by Observer outside the frozen Agent cgroup. It removes
+only the test's named file, bpffs pins, residual child cgroup, module, network
+configuration, tmpfs mount, and restores the saved `ip_forward` value.
+
+The new [Host runner](run-recovery-abc-e2e.sh) creates a separate QEMU with
+`-drive file=...,format=raw,if=ide,snapshot=on`. It refuses an image already
+opened by another process, checks the module vermagic and SSH port, binds its
+own QEMU PID/start-time/executable/argv before cleanup, and hashes the raw
+base image before and after. Use an **unused raw image**, not the old writable
+Terminal-Bench VM disk:
+
+```sh
+bash vm/run-recovery-abc-e2e.sh \
+  --rootfs /absolute/path/to/unused-trixie.raw \
+  --ssh-key /absolute/path/to/trixie.id_rsa \
+  --module /absolute/path/to/bpf_observer_e2e_state.ko \
+  --ssh-port 10049
+```
+
+The result tree is retained under `.output/validation/recovery-abc-vm/`.
+The rootfs credential and image are external provisioning inputs; neither
+is copied into that tree. The Host runner builds the current release, BPF
+objects, and C fixtures before the boot.
+
+Build with `make release bpf workloads`, build the test-only module against
+the *same* effects-kernel build, and copy these inputs into the disposable
+Guest under a root-owned directory: `deployment-observe`,
+`deployment-observe-recovery-verify`, both BPF objects,
+`system-effects-state-change.sh`, `deployment-endpoint-state-change`,
+`deployment-recovery-bpf-state`, `deployment-recovery-helper.sh`, the test
+module, and `guest-recovery-abc-e2e.sh`. Give both shell fixtures executable
+mode. With those files at `/opt/observer`, run:
+
+```sh
+sudo /bin/bash /opt/observer/guest-recovery-abc-e2e.sh \
+  /opt/observer/deployment-observe \
+  /opt/observer/deployment-observe-recovery-verify \
+  /opt/observer/system_effects.bpf.o "$EFFECT_SHA256" \
+  /opt/observer/process_lifecycle.bpf.o "$LIFECYCLE_SHA256" \
+  /opt/observer/system-effects-state-change.sh \
+  /opt/observer/deployment-endpoint-state-change \
+  /opt/observer/deployment-recovery-bpf-state \
+  /opt/observer/deployment-recovery-helper.sh \
+  /opt/observer/bpf_observer_e2e_state.ko \
+  /var/lib/bpf-observer-recovery-abc-001
+```
+
+The final path must not exist. The driver runs five sequential cases:
+complete recovery of the enabled Linux configuration scope
+(`CONSISTENT_WITHIN_SCOPE`), complete recovery with BPF state enabled but
+without an exclusive-actor/quiescence contract (`INCONCLUSIVE`), deliberate
+omission of the fixture file (`INCONSISTENT_WITHIN_SCOPE`), a helper that
+deliberately exits 73 before mutation (`INCONCLUSIVE`), and an invalid first
+control command that produces only `recovery-abort.json` (`INCONCLUSIVE`,
+partial evidence). Each completed A/B/C case requires independent
+offline verification of the exact v3 artifact set; diagnostics and evidence
+remain under the supplied path. The driver cleans only its dedicated fixture
+objects between cases. It never claims that a same-boot Guest helper can
+coordinate a QEMU host-level snapshot restore or prove global exclusivity.
+The consistent case explicitly **does not enable the filesystem or BPF state confirmer**:
+unlinking a newly created file changes the parent directory's ctime, which
+ordinary in-Guest calls cannot restore. Equal BPF endpoint inventories alone
+also cannot establish a negative global BPF claim while unrelated actors may
+run. The file domain is enabled in the deliberate-omission and failing-helper
+cases; BPF remains enabled in the BPF-limited and failing-helper cases. A positive all-domain recovery
+test requires a real filesystem snapshot/restore adapter and must not be
+inferred from this helper fixture.
+
+For completed runs, `recovery.json` contains the configured command, exit
+status, bounded output, and frozen deployment/boot identity evidence both
+before and after the external helper. A boundary failure never synthesizes a
+missing snapshot; `recovery-abort.json` is diagnostic partial evidence and is
+intentionally rejected by the normal closed-set offline verifier.
+
+## Concurrent recording VM acceptance
+
+[`run-concurrency-e2e.sh`](run-concurrency-e2e.sh) boots a new four-vCPU,
+privileged Guest with `snapshot=on` and validates the current recorder under
+real pthread concurrency. It refuses a raw image that is already open, binds
+cleanup to the exact QEMU process identity, and verifies that the base image
+hash is unchanged. Run it against an unused provisioned raw image:
+
+```sh
+bash vm/run-concurrency-e2e.sh \
+  --rootfs /absolute/path/to/unused-trixie.raw \
+  --ssh-key /absolute/path/to/trixie.id_rsa \
+  --ssh-port 10059
+```
+
+The Guest requires two lossless cases: 8 threads x 64 `pwrite64` calls for
+correctness and 64 threads x 64 calls for parallel pressure. It then runs a
+separate unpaced 64 x 512 overload diagnostic. An overload result is accepted
+only if it is either fully verifiable or explicitly `INCOMPLETE` with loss
+accounting and rejection by the strict offline verifier; it is never treated
+as complete evidence. Every worker owns a different regular file/inode. It
+also blocks once on its own full pipe; the fixture reads
+`/proc/self/task/<tid>/syscall` and does not release the pipes until every
+worker is simultaneously inside `SYS_write`. The Host analyzer then requires:
+
+- the exact TID/TGID and attempt/result pair for every worker operation;
+- all blocked-write intervals to overlap;
+- every `pwrite64` result to resolve to that worker's independent statx
+  mount/device/inode truth;
+- one FORK and EXIT lifecycle record per worker;
+- zero drops, pending residue, join ambiguity, userspace failure, or fatal
+  kernel flag; and
+- a successful independent `verify-effects` WAL replay and digest check.
+
+Results are retained under `.output/validation/concurrent-effects-vm/`, with
+the summarized verdict in `concurrency-analysis.json`. The lifecycle status is
+deliberately required to remain `PARTIAL`: this controlled fixture proves all
+of *its* worker threads were recorded, but the general product contract still
+lacks an S0 all-thread ledger and migration/`CLONE_INTO_CGROUP` enrollment
+hooks. It therefore is not a claim of adversarial process-tree completeness.
+
 ## Allox supervisor protocol VM acceptance
 
 [`effects-supervisor-e2e.sh`](effects-supervisor-e2e.sh) exercises the

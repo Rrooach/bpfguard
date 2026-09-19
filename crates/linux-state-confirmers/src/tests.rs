@@ -973,3 +973,45 @@ fn synthetic_process_snapshot(
         }),
     }
 }
+
+#[test]
+fn generic_comparison_binds_all_recovery_phase_pairs() {
+    let scope = synthetic_process_scope();
+
+    for (index, (before_phase, after_phase)) in [
+        (SnapshotPhase::A, SnapshotPhase::B),
+        (SnapshotPhase::B, SnapshotPhase::C),
+        (SnapshotPhase::A, SnapshotPhase::C),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = synthetic_process_snapshot(
+            &scope,
+            &format!("phase-before-{index}"),
+            before_phase,
+            Vec::new(),
+        );
+        let after = synthetic_process_snapshot(
+            &scope,
+            &format!("phase-after-{index}"),
+            after_phase,
+            Vec::new(),
+        );
+
+        let comparison = compare_phases(&before, &after, before_phase, after_phase)
+            .expect("compare recovery phase pair");
+        assert_eq!(comparison.s0_snapshot_id, before.snapshot_id);
+        assert_eq!(comparison.s1_snapshot_id, after.snapshot_id);
+    }
+}
+
+#[test]
+fn generic_comparison_rejects_same_or_misbound_phases() {
+    let scope = synthetic_process_scope();
+    let before = synthetic_process_snapshot(&scope, "invalid-before", SnapshotPhase::A, Vec::new());
+    let after = synthetic_process_snapshot(&scope, "invalid-after", SnapshotPhase::B, Vec::new());
+
+    assert!(compare_phases(&before, &after, SnapshotPhase::A, SnapshotPhase::A,).is_err());
+    assert!(compare_phases(&before, &after, SnapshotPhase::B, SnapshotPhase::C,).is_err());
+}

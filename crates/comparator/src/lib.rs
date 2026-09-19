@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bpf_observer_oracle::validate_snapshot_resource_bounds;
 use bpf_observer_schema::{
     Attribution, ChangeCertainty, ChangeKind, ClaimScope, Completeness, CompletenessStatus,
@@ -20,32 +20,69 @@ pub fn compare(
     health: &EvidenceHealth,
     quiescence: QuiescenceReport,
 ) -> Result<Verdict> {
-    let mut completeness = merge_completeness(&before.completeness, &after.completeness);
+    compare_phases(before, after, "S0", "S1", health, quiescence)
+}
+
+/// Compare two snapshots whose exact, distinct phases are supplied by the
+/// caller.
+///
+/// Phase binding is checked before any state delta is calculated. Higher-level
+/// protocols remain responsible for restricting which phase transitions are
+/// legal in their state machine.
+pub fn compare_phases(
+    before: &Snapshot,
+    after: &Snapshot,
+    expected_before: &str,
+    expected_after: &str,
+    health: &EvidenceHealth,
+    quiescence: QuiescenceReport,
+) -> Result<Verdict> {
+    validate_phase_pair(before, after, expected_before, expected_after)?;
+    let mut completeness = merge_completeness(
+        &before.completeness,
+        &after.completeness,
+        expected_before,
+        expected_after,
+    );
 
     if before.schema_version != SCHEMA_VERSION || after.schema_version != SCHEMA_VERSION {
         completeness.mark_incomplete("snapshot schema version is unsupported");
     }
     if before.boot_id != after.boot_id {
-        completeness.mark_incomplete("S0 and S1 were captured from different boot IDs");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} were captured from different boot IDs"
+        ));
     }
     if before.claim_scope != after.claim_scope {
-        completeness.mark_incomplete("S0 and S1 effective claim scopes differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} effective claim scopes differ"
+        ));
     }
     if before.observer_exclusions != after.observer_exclusions {
-        completeness.mark_incomplete("S0 and S1 observer exclusion sets differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} observer exclusion sets differ"
+        ));
     }
     if before.kernel_release != after.kernel_release {
-        completeness.mark_incomplete("S0 and S1 kernel releases differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} kernel releases differ"
+        ));
     }
     if before.byte_order != after.byte_order {
-        completeness.mark_incomplete("S0 and S1 byte orders differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} byte orders differ"
+        ));
     }
     if before.possible_cpu_ids != after.possible_cpu_ids {
-        completeness.mark_incomplete("S0 and S1 possible CPU topologies differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} possible CPU topologies differ"
+        ));
     }
     let pin_observation_domains_match = before.pin_roots == after.pin_roots;
     if !pin_observation_domains_match {
-        completeness.mark_incomplete("S0 and S1 pin observation roots differ");
+        completeness.mark_incomplete(format!(
+            "{expected_before} and {expected_after} pin observation roots differ"
+        ));
     }
 
     // The public comparator is fail-closed on the same producer contract as
@@ -54,46 +91,57 @@ pub fn compare(
     let before_contract_valid = match validate_snapshot_resource_bounds(before) {
         Ok(()) => true,
         Err(error) => {
-            completeness.mark_incomplete(format!("S0 producer contract is invalid: {error:#}"));
+            completeness.mark_incomplete(format!(
+                "{expected_before} producer contract is invalid: {error:#}"
+            ));
             false
         }
     };
     let after_contract_valid = match validate_snapshot_resource_bounds(after) {
         Ok(()) => true,
         Err(error) => {
-            completeness.mark_incomplete(format!("S1 producer contract is invalid: {error:#}"));
+            completeness.mark_incomplete(format!(
+                "{expected_after} producer contract is invalid: {error:#}"
+            ));
             false
         }
     };
 
-    validate_snapshot_structure(before, "S0", &mut completeness);
-    validate_snapshot_structure(after, "S1", &mut completeness);
-    validate_snapshot_content(before, &before.claim_scope, "S0", &mut completeness);
-    validate_snapshot_content(after, &after.claim_scope, "S1", &mut completeness);
+    validate_snapshot_structure(before, expected_before, &mut completeness);
+    validate_snapshot_structure(after, expected_after, &mut completeness);
+    validate_snapshot_content(
+        before,
+        &before.claim_scope,
+        expected_before,
+        &mut completeness,
+    );
+    validate_snapshot_content(after, &after.claim_scope, expected_after, &mut completeness);
 
     let baseline_scope_supported = baseline_scope_supported(&before.claim_scope)
         && baseline_scope_supported(&after.claim_scope);
     if before.claim_scope.object_types.is_empty() {
-        completeness.mark_incomplete("S0 comparison object scope is empty");
+        completeness.mark_incomplete(format!(
+            "{expected_before} comparison object scope is empty"
+        ));
     }
     if after.claim_scope.object_types.is_empty() {
-        completeness.mark_incomplete("S1 comparison object scope is empty");
+        completeness.mark_incomplete(format!("{expected_after} comparison object scope is empty"));
     }
     if !baseline_event_interface_supported(&before.claim_scope) {
-        completeness.mark_incomplete(
-            "S0 event interfaces are not exactly the supported BPF_USER_SYSCALL baseline",
-        );
+        completeness.mark_incomplete(format!(
+            "{expected_before} event interfaces are not exactly the supported BPF_USER_SYSCALL baseline"
+        ));
     }
     if !baseline_event_interface_supported(&after.claim_scope) {
-        completeness.mark_incomplete(
-            "S1 event interfaces are not exactly the supported BPF_USER_SYSCALL baseline",
-        );
+        completeness.mark_incomplete(format!(
+            "{expected_after} event interfaces are not exactly the supported BPF_USER_SYSCALL baseline"
+        ));
     }
 
     let endpoints_match = before.schema_version == SCHEMA_VERSION
         && after.schema_version == SCHEMA_VERSION
-        && before.phase == "S0"
-        && after.phase == "S1"
+        && before.phase == expected_before
+        && after.phase == expected_after
         && before.boot_id == after.boot_id
         && before.kernel_release == after.kernel_release
         && before.byte_order == after.byte_order
@@ -183,7 +231,9 @@ pub fn compare(
         );
     }
     let mut limitations = vec![
-        "S0/S1 comparison says nothing about transient effects between the two snapshots".into(),
+        format!(
+            "{expected_before}/{expected_after} comparison says nothing about transient effects between the two snapshots"
+        ),
         "BPF object IDs are scoped to one boot and do not provide a permanent generation ID".into(),
     ];
     if !quiescence.supports_unchanged() {
@@ -217,6 +267,30 @@ pub fn compare(
         changes,
         limitations,
     })
+}
+
+fn validate_phase_pair(
+    before: &Snapshot,
+    after: &Snapshot,
+    expected_before: &str,
+    expected_after: &str,
+) -> Result<()> {
+    if expected_before.is_empty() || expected_after.is_empty() {
+        bail!("BPF snapshot comparison phases must be non-empty");
+    }
+    if expected_before == expected_after {
+        bail!(
+            "BPF snapshot comparison phases must differ, got {expected_before} -> {expected_after}"
+        );
+    }
+    if before.phase != expected_before || after.phase != expected_after {
+        bail!(
+            "BPF snapshot comparison requires {expected_before} followed by {expected_after}, got {} followed by {}",
+            before.phase,
+            after.phase
+        );
+    }
+    Ok(())
 }
 
 fn baseline_event_interface_supported(scope: &ClaimScope) -> bool {
@@ -698,18 +772,23 @@ fn strictly_increasing(values: &[u32]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn merge_completeness(left: &Completeness, right: &Completeness) -> Completeness {
+fn merge_completeness(
+    left: &Completeness,
+    right: &Completeness,
+    left_phase: &str,
+    right_phase: &str,
+) -> Completeness {
     let mut merged = Completeness::complete();
     if left.status == CompletenessStatus::Incomplete {
-        merged.mark_incomplete("S0 reported incomplete state coverage");
+        merged.mark_incomplete(format!("{left_phase} reported incomplete state coverage"));
         for reason in &left.reasons {
-            merged.mark_incomplete(format!("S0: {reason}"));
+            merged.mark_incomplete(format!("{left_phase}: {reason}"));
         }
     }
     if right.status == CompletenessStatus::Incomplete {
-        merged.mark_incomplete("S1 reported incomplete state coverage");
+        merged.mark_incomplete(format!("{right_phase} reported incomplete state coverage"));
         for reason in &right.reasons {
-            merged.mark_incomplete(format!("S1: {reason}"));
+            merged.mark_incomplete(format!("{right_phase}: {reason}"));
         }
     }
     merged
@@ -2134,5 +2213,70 @@ mod tests {
         assert_eq!(verdict.state_verdict, StateVerdict::Inconclusive);
         assert_eq!(verdict.changes.len(), 1);
         assert_eq!(verdict.changes[0].certainty, ChangeCertainty::Indeterminate);
+    }
+
+    #[test]
+    fn generic_comparison_binds_all_recovery_phase_pairs() {
+        for (before_phase, after_phase) in [("A", "B"), ("B", "C"), ("A", "C")] {
+            let verdict = compare_phases(
+                &snapshot(before_phase),
+                &snapshot(after_phase),
+                before_phase,
+                after_phase,
+                &EvidenceHealth::default(),
+                unknown_quiescence(),
+            )
+            .expect("compare recovery phase pair");
+            assert!(verdict.limitations.iter().any(|limitation| {
+                limitation.starts_with(&format!("{before_phase}/{after_phase} comparison"))
+            }));
+        }
+    }
+
+    #[test]
+    fn generic_comparison_rejects_same_or_misbound_phases() {
+        assert!(compare_phases(
+            &snapshot("A"),
+            &snapshot("B"),
+            "A",
+            "A",
+            &EvidenceHealth::default(),
+            unknown_quiescence(),
+        )
+        .is_err());
+        assert!(compare_phases(
+            &snapshot("A"),
+            &snapshot("B"),
+            "B",
+            "C",
+            &EvidenceHealth::default(),
+            unknown_quiescence(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn generic_comparison_uses_dynamic_phase_completeness_labels() {
+        let mut before = snapshot("B");
+        before.completeness.mark_incomplete("fixture failure");
+        let verdict = compare_phases(
+            &before,
+            &snapshot("C"),
+            "B",
+            "C",
+            &EvidenceHealth::default(),
+            unknown_quiescence(),
+        )
+        .expect("compare incomplete recovery phase pair");
+        assert!(verdict
+            .state_completeness
+            .reasons
+            .iter()
+            .any(|reason| reason == "B: fixture failure"));
+        assert!(!verdict
+            .state_completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("S0:")));
     }
 }

@@ -20,7 +20,7 @@ mod compare;
 mod schema;
 
 pub use capture::{capture, capture_in_retained_mount_namespace};
-pub use compare::{compare, FILESYSTEM_CONFIRMATION_DOMAIN};
+pub use compare::{compare, compare_phases, FILESYSTEM_CONFIRMATION_DOMAIN};
 pub use schema::*;
 
 #[cfg(test)]

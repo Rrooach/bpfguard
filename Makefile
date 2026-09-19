@@ -53,6 +53,9 @@ EXPANDED_EFFECTS_SYNTHETIC_RUNNER := vm/guest-deployment-live-synthetic-e2e.sh
 EXPANDED_EFFECTS_STATE_WORKLOAD := workloads/system-effects-state-change.sh
 EXPANDED_EFFECTS_RESIDUAL_WORKLOAD := workloads/system-effects-residual-process.sh
 EXPANDED_EFFECTS_OVERHEAD_ANALYZER := experiments/system-effects-overhead/analyze-expanded.js
+CONCURRENCY_HOST_RUNNER := vm/run-concurrency-e2e.sh
+CONCURRENCY_GUEST_RUNNER := vm/guest-concurrency-e2e.sh
+CONCURRENCY_ANALYZER := vm/analyze-concurrency-e2e.js
 STRICT_INIT_CFLAGS ?= -Os -std=c11 -Wall -Wextra -Werror -static
 
 AGENT_LAUNCHER_SOURCE := experiments/codex-deepseek/vm/codex-task-launcher.c
@@ -78,8 +81,8 @@ VM_SSH_PORT ?= 10022
 .PHONY: all release check check-all test fmt-check clippy bpf system-effects-bpf process-lifecycle-bpf workloads \
 	vm-strict vm-strict-check agent-collection-launcher \
 	agent-collection-check overhead-check system-effects-overhead-check \
-	expanded-effects-check \
-	overhead-e2e vm-kernel vm-effects-kernel vm-e2e \
+	expanded-effects-check concurrency-effects-check \
+	overhead-e2e concurrency-effects-e2e vm-kernel vm-effects-kernel vm-e2e \
 	clean help dirs
 
 all: dirs
@@ -91,7 +94,8 @@ release: dirs
 check: fmt-check test
 
 check-all: check clippy bpf workloads vm-strict-check agent-collection-check \
-	overhead-check system-effects-overhead-check expanded-effects-check
+	overhead-check system-effects-overhead-check expanded-effects-check \
+	concurrency-effects-check
 
 test: dirs
 	$(CARGO_ENV) $(CARGO) test --workspace --locked
@@ -152,6 +156,10 @@ expanded-effects-check:
 	node --check $(EXPANDED_EFFECTS_OVERHEAD_ANALYZER)
 	node $(EXPANDED_EFFECTS_OVERHEAD_ANALYZER) --self-test
 
+concurrency-effects-check: $(OUTPUT)/workloads/system-effects-concurrency
+	bash -n $(CONCURRENCY_HOST_RUNNER) $(CONCURRENCY_GUEST_RUNNER)
+	node --check $(CONCURRENCY_ANALYZER)
+
 overhead-e2e: overhead-check release bpf
 	@test -n "$(KERNEL_BZIMAGE)" || { \
 		echo 'KERNEL_BZIMAGE=/absolute/path/to/bzImage is required' >&2; \
@@ -171,6 +179,20 @@ overhead-e2e: overhead-check release bpf
 		--ssh-key "$(VM_SSH_KEY)" \
 		--ssh-port "$(OVERHEAD_SSH_PORT)" \
 		--repetitions "$(OVERHEAD_REPETITIONS)"
+
+concurrency-effects-e2e: concurrency-effects-check release bpf
+	@test -n "$(VM_ROOTFS)" || { \
+		echo 'VM_ROOTFS=/absolute/path/to/raw-image is required' >&2; \
+		exit 2; \
+	}
+	@test -n "$(VM_SSH_KEY)" || { \
+		echo 'VM_SSH_KEY=/absolute/path/to/private-key is required' >&2; \
+		exit 2; \
+	}
+	bash $(CONCURRENCY_HOST_RUNNER) \
+		--kernel-build-dir "$(VM_EFFECTS_KERNEL_OUTPUT)" \
+		--rootfs "$(VM_ROOTFS)" --ssh-key "$(VM_SSH_KEY)" \
+		--ssh-port 10059
 
 vm-kernel:
 	VM_KERNEL_JOBS="$(VM_KERNEL_JOBS)" vm/build-e2e-kernel.sh \
@@ -227,6 +249,10 @@ $(BPF_HELPER_DEFS): $(KERNEL_ROOT)/scripts/bpf_doc.py \
 $(OUTPUT)/workloads/%: workloads/%.c $(WORKLOAD_COMMON_HEADERS) | dirs
 	TMPDIR=$(BUILD_TMPDIR) $(CC) $(WORKLOAD_CFLAGS) $< -o $@
 
+$(OUTPUT)/workloads/system-effects-concurrency: \
+		workloads/system-effects-concurrency.c | dirs
+	TMPDIR=$(BUILD_TMPDIR) $(CC) $(WORKLOAD_CFLAGS) -pthread $< -o $@
+
 $(STRICT_INIT_BINARY): $(STRICT_INIT_SOURCE) | dirs
 	TMPDIR=$(BUILD_TMPDIR) $(CC) $(STRICT_INIT_CFLAGS) $< -o $@
 
@@ -257,7 +283,9 @@ help:
 	@echo '  overhead-check  build/check the overhead benchmark helpers'
 	@echo '  system-effects-overhead-check  check the general effect benchmark helpers'
 	@echo '  expanded-effects-check  syntax-check the expanded object/state VM acceptance assets'
+	@echo '  concurrency-effects-check  build/syntax-check the pthread concurrency gate'
 	@echo '  overhead-e2e  run the paired overhead benchmark in disposable KVM'
+	@echo '  concurrency-effects-e2e  validate concurrent recording in disposable KVM'
 	@echo '  vm-kernel  build the disposable x86 smoke-test kernel'
 	@echo '  vm-effects-kernel  build the BTF+BPF-LSM object-observer test kernel'
 	@echo '  vm-e2e     run the two-boot authenticated exclusive-VM KVM gate'

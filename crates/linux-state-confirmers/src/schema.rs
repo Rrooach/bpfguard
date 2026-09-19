@@ -31,6 +31,9 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 pub enum SnapshotPhase {
     S0,
     S1,
+    A,
+    B,
+    C,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -844,7 +847,11 @@ pub struct StateComparison {
     pub protocol_version: u32,
     pub domain: String,
     pub scope_sha256: String,
+    /// Legacy wire name retained for compatibility. Generic pair comparisons
+    /// store the before-snapshot identifier here.
     pub s0_snapshot_id: String,
+    /// Legacy wire name retained for compatibility. Generic pair comparisons
+    /// store the after-snapshot identifier here.
     pub s1_snapshot_id: String,
     /// Deliberately a vector. It must not be collapsed into a claim about all
     /// Linux state.
