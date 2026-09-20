@@ -34,6 +34,98 @@ const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789a
 const RECOVERY_NONCE_2: &str = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const RECOVERY_NONCE_3: &str = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+fn filesystem_namespace_mode_config(
+    protocol_version: u32,
+    filesystem_state_scope: bool,
+    filesystem_namespace_mode: FilesystemNamespaceMode,
+) -> DeploymentObserverConfig {
+    DeploymentObserverConfig {
+        protocol_version,
+        deployment: bpf_observer_deployment::DeploymentRequest::Direct(
+            bpf_observer_deployment::DirectRequest::new(1234),
+        ),
+        recorder_object_path: "/opt/observer/system_effects.bpf.o".to_owned(),
+        recorder_object_sha256: "a".repeat(64),
+        lifecycle_object_path: "/opt/observer/process_lifecycle.bpf.o".to_owned(),
+        lifecycle_object_sha256: "b".repeat(64),
+        output_directory: "/var/lib/observer/test-artifacts".to_owned(),
+        run_id: "test-run".to_owned(),
+        epoch: 1,
+        profile: PolicyProfile::Full,
+        object_resolution_mode: FileObjectResolutionMode::KernelObjectExpandedPartial,
+        bpf_state_scope: None,
+        filesystem_state_scope: filesystem_state_scope.then(|| {
+            bpf_observer_filesystem_confirmer::FilesystemScope::new(
+                vec![PathBuf::from("/var/lib/allox/workspaces/test/current")],
+                bpf_observer_filesystem_confirmer::FilesystemCapturePolicy::default(),
+                bpf_observer_filesystem_confirmer::FilesystemCaptureLimits::default(),
+            )
+            .expect("filesystem scope")
+        }),
+        filesystem_namespace_mode,
+        linux_state_scope: None,
+        recovery: (protocol_version == DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION).then(|| {
+            RecoveryConfig {
+                checkpoint_id: "checkpoint-1".to_owned(),
+                recovery_id: "recovery-1".to_owned(),
+                executable_path: "/opt/observer/recover".to_owned(),
+                expected_sha256: "c".repeat(64),
+                argv: Vec::new(),
+                timeout_ms: 10_000,
+                max_output_bytes: 65_536,
+            }
+        }),
+        poll_interval_ms: 20,
+        drain_timeout_ms: 5_000,
+    }
+}
+
+#[test]
+fn filesystem_namespace_mode_defaults_to_deployment_and_is_v3_recovery_only() {
+    let deployment = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Deployment,
+    );
+    deployment.validate_schema().expect("v2 deployment mode");
+
+    let mut omitted = serde_json::to_value(&deployment).expect("serialize config");
+    omitted
+        .as_object_mut()
+        .expect("config object")
+        .remove("filesystem_namespace_mode");
+    let decoded: DeploymentObserverConfig =
+        serde_json::from_value(omitted).expect("deserialize omitted namespace mode");
+    assert_eq!(
+        decoded.filesystem_namespace_mode,
+        FilesystemNamespaceMode::Deployment
+    );
+    decoded.validate_schema().expect("default deployment mode");
+
+    let observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Observer,
+    );
+    observer
+        .validate_schema()
+        .expect("v3 recovery observer mode");
+
+    let v2_observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Observer,
+    );
+    assert!(v2_observer.validate_schema().is_err());
+
+    let unscoped_observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
+        false,
+        FilesystemNamespaceMode::Observer,
+    );
+    assert!(unscoped_observer.validate_schema().is_err());
+}
+
 #[test]
 fn initial_ready_failure_exposes_bounded_typed_mismatch_diagnostics() {
     let validation = LiveIdentityValidation {
@@ -551,6 +643,22 @@ fn filesystem_namespace_anchor_is_retained_for_direct_and_docker_but_not_kata() 
             .map(|target| (target.pid, target.expected_namespace_inode));
         assert_eq!(target, expected);
     }
+
+    let manifest = fixture_manifest_for_kind(DeploymentKind::Direct);
+    assert!(crate::session::filesystem_mount_namespace_target_for_mode(
+        &manifest,
+        true,
+        FilesystemNamespaceMode::Deployment,
+    )
+    .expect("deployment namespace mode")
+    .is_some());
+    assert!(crate::session::filesystem_mount_namespace_target_for_mode(
+        &manifest,
+        true,
+        FilesystemNamespaceMode::Observer,
+    )
+    .expect("observer namespace mode")
+    .is_none());
 }
 
 #[test]

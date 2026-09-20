@@ -12,7 +12,7 @@ use bpf_observer_deployment::{
     DEPLOYMENT_PROTOCOL_VERSION,
 };
 use bpf_observer_filesystem_confirmer::{
-    compare_phases as compare_filesystem_phases, FilesystemSnapshot,
+    compare_phases as compare_filesystem_phases, FilesystemSnapshot, MountNamespaceCaptureSource,
     SnapshotPhase as FilesystemPhase, HARD_MAX_SNAPSHOT_JSON_BYTES as MAX_FS_SNAPSHOT_BYTES,
 };
 use bpf_observer_linux_state_confirmers::{
@@ -65,7 +65,9 @@ use crate::report::{
     checked_artifact_total_bytes, ArtifactDigest, IdentityAssessment, SocketStateHealthArtifact,
 };
 use crate::scope::CgroupScopeCapability;
-use crate::session::{DeploymentObserverConfig, RecoveryRecorderFinalization};
+use crate::session::{
+    DeploymentObserverConfig, FilesystemNamespaceMode, RecoveryRecorderFinalization,
+};
 
 pub const RECOVERY_ARTIFACT_MANIFEST_FILE: &str = "recovery-artifact-manifest.json";
 pub const RECOVERY_CONTROL_TRANSCRIPT_FILE: &str = "recovery-control-transcript.json";
@@ -1766,9 +1768,6 @@ fn read_filesystem_triplet(
             || snapshot.snapshot_id != expected_id
             || snapshot.boot_id != envelopes[index].boot_id
             || snapshot.scope != *scope
-            || !envelopes[index]
-                .mount_namespace_ids
-                .contains(&snapshot.mount_namespace_inode)
             || binding.domains != [RecoveryDomain::Filesystem]
         {
             bail!("raw filesystem snapshot does not match phase, mount namespace, or scope");
@@ -1776,9 +1775,83 @@ fn read_filesystem_triplet(
         captured_within_envelope(snapshot.captured_unix_ns, envelopes[index])?;
         raw.push(snapshot);
     }
-    Ok(Some(raw.try_into().map_err(|_| {
-        anyhow::anyhow!("filesystem triplet cardinality")
-    })?))
+    let snapshots: [FilesystemSnapshot; 3] = raw
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("filesystem triplet cardinality"))?;
+    validate_recovery_filesystem_namespace_identities(
+        config.filesystem_namespace_mode,
+        [
+            FilesystemNamespaceIdentity::from(&snapshots[0]),
+            FilesystemNamespaceIdentity::from(&snapshots[1]),
+            FilesystemNamespaceIdentity::from(&snapshots[2]),
+        ],
+        envelopes.map(|envelope| envelope.mount_namespace_ids.as_slice()),
+    )?;
+    Ok(Some(snapshots))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemNamespaceIdentity {
+    capture_source: MountNamespaceCaptureSource,
+    mount_namespace_inode: u64,
+    mount_root_device: u64,
+    mount_root_inode: u64,
+}
+
+impl From<&FilesystemSnapshot> for FilesystemNamespaceIdentity {
+    fn from(snapshot: &FilesystemSnapshot) -> Self {
+        Self {
+            capture_source: snapshot.mount_namespace_capture_source,
+            mount_namespace_inode: snapshot.mount_namespace_inode,
+            mount_root_device: snapshot.mount_root_device,
+            mount_root_inode: snapshot.mount_root_inode,
+        }
+    }
+}
+
+fn validate_recovery_filesystem_namespace_identities(
+    mode: FilesystemNamespaceMode,
+    identities: [FilesystemNamespaceIdentity; 3],
+    deployment_mount_namespace_ids: [&[u64]; 3],
+) -> Result<()> {
+    match mode {
+        FilesystemNamespaceMode::Deployment => {
+            for (identity, namespace_ids) in identities.iter().zip(deployment_mount_namespace_ids) {
+                if !namespace_ids.contains(&identity.mount_namespace_inode) {
+                    bail!("raw filesystem snapshot mount namespace is not part of the deployment");
+                }
+            }
+        }
+        FilesystemNamespaceMode::Observer => {
+            if identities.iter().any(|identity| {
+                identity.capture_source != MountNamespaceCaptureSource::CurrentProcess
+            }) {
+                bail!(
+                    "OBSERVER filesystem namespace mode requires CURRENT_PROCESS capture source for A/B/C"
+                );
+            }
+            if identities.iter().any(|identity| {
+                identity.mount_namespace_inode == 0
+                    || identity.mount_root_device == 0
+                    || identity.mount_root_inode == 0
+            }) {
+                bail!(
+                    "OBSERVER filesystem namespace mode requires nonzero mount namespace/root identity for A/B/C"
+                );
+            }
+            let expected = identities[0];
+            if identities[1..].iter().any(|identity| {
+                identity.mount_namespace_inode != expected.mount_namespace_inode
+                    || identity.mount_root_device != expected.mount_root_device
+                    || identity.mount_root_inode != expected.mount_root_inode
+            }) {
+                bail!(
+                    "OBSERVER filesystem namespace mode requires one stable mount namespace/root identity across A/B/C"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_linux_triplet(
@@ -1984,6 +2057,91 @@ mod tests {
             [20, 30],
             [30, 40]
         ]));
+    }
+
+    fn filesystem_identity(
+        capture_source: MountNamespaceCaptureSource,
+        mount_namespace_inode: u64,
+        mount_root_device: u64,
+        mount_root_inode: u64,
+    ) -> FilesystemNamespaceIdentity {
+        FilesystemNamespaceIdentity {
+            capture_source,
+            mount_namespace_inode,
+            mount_root_device,
+            mount_root_inode,
+        }
+    }
+
+    #[test]
+    fn deployment_filesystem_mode_preserves_manifest_namespace_membership() {
+        let identity = filesystem_identity(
+            MountNamespaceCaptureSource::RetainedFileDescriptor,
+            71,
+            81,
+            91,
+        );
+        let committed = [71];
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Deployment,
+            [identity; 3],
+            [&committed, &committed, &committed],
+        )
+        .is_ok());
+
+        let uncommitted = [72];
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Deployment,
+            [identity; 3],
+            [&committed, &uncommitted, &committed],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn observer_filesystem_mode_requires_stable_current_process_identity() {
+        let stable = filesystem_identity(MountNamespaceCaptureSource::CurrentProcess, 71, 81, 91);
+        let unrelated_deployment_namespace = [999];
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Observer,
+            [stable; 3],
+            [
+                &unrelated_deployment_namespace,
+                &unrelated_deployment_namespace,
+                &unrelated_deployment_namespace,
+            ],
+        )
+        .is_ok());
+
+        let retained = filesystem_identity(
+            MountNamespaceCaptureSource::RetainedFileDescriptor,
+            71,
+            81,
+            91,
+        );
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Observer,
+            [stable, retained, stable],
+            [&[], &[], &[]],
+        )
+        .is_err());
+
+        let zero_root = filesystem_identity(MountNamespaceCaptureSource::CurrentProcess, 71, 0, 91);
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Observer,
+            [stable, zero_root, stable],
+            [&[], &[], &[]],
+        )
+        .is_err());
+
+        let changed_root =
+            filesystem_identity(MountNamespaceCaptureSource::CurrentProcess, 71, 81, 92);
+        assert!(validate_recovery_filesystem_namespace_identities(
+            FilesystemNamespaceMode::Observer,
+            [stable, changed_root, stable],
+            [&[], &[], &[]],
+        )
+        .is_err());
     }
 
     #[test]

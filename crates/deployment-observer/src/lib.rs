@@ -68,7 +68,10 @@ pub use scope::{
     CgroupScopeCapability, CgroupScopeMode, EventCgroupIdSemantics, CGROUP_SCOPE_PROTOCOL_VERSION,
     MAX_ANCESTOR_ROOTS,
 };
-pub use session::{run_stdio, DeploymentObserverConfig, DeploymentSession, RegistrationPlan};
+pub use session::{
+    run_stdio, DeploymentObserverConfig, DeploymentSession, FilesystemNamespaceMode,
+    RegistrationPlan,
+};
 pub use verify::{verify_artifacts, OfflineVerification, VerificationExpectation};
 
 #[cfg(test)]

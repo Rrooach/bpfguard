@@ -60,6 +60,7 @@ is:
   "object_resolution_mode": "KERNEL_OBJECT_EXPANDED_PARTIAL",
   "bpf_state_scope": null,
   "filesystem_state_scope": null,
+  "filesystem_namespace_mode": "DEPLOYMENT",
   "linux_state_scope": {
     "protocol_version": 1,
     "sysctl": {
@@ -92,6 +93,15 @@ to recursively scan an image. A host path must be supplied as an explicit,
 bounded scope whose stable identity was established externally. The evidence
 directory must be outside every filesystem root, both lexically and after
 symlink resolution.
+
+`filesystem_namespace_mode` defaults to `DEPLOYMENT`, which retains the
+authoritative target mount namespace for every filesystem capture. The
+`OBSERVER` mode is accepted only by protocol v3 with both recovery and a
+filesystem scope enabled. It captures A/B/C through the Observer's current
+mount namespace so a host-visible Btrfs `current` subvolume replacement can be
+seen at C. Offline verification then requires all three snapshots to use the
+`CURRENT_PROCESS` capture source and the same nonzero mount namespace/root
+identity; it does not relabel that host view as a deployment mount namespace.
 
 For example, a bounded BPF inventory and one explicit filesystem tree can be
 enabled with:

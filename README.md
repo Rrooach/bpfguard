@@ -1,5 +1,8 @@
 # BPF State Observer
 
+Chinese project specification and usage guide:
+[Linux System Effects Observer 项目规格说明](docs/specification.zh-CN.md).
+
 `bpf-state-observer` is a conservative eBPF observability baseline for a
 cooperative Agent workload in a controlled Linux VM. It combines:
 

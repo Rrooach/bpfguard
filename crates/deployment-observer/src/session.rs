@@ -72,6 +72,35 @@ const CLOSURE_BARRIER_FILE: &str = "closure-barrier.json";
 const CLOSURE_VALIDATION_FILE: &str = "closure-validation.json";
 const MAX_IDENTITY_MISMATCH_DIAGNOSTICS: usize = 16;
 
+/// Selects the mount namespace used to resolve an explicit filesystem state
+/// scope.
+///
+/// `Deployment` preserves the protocol-v2 behavior: retain the authoritative
+/// deployment mount namespace capability while the target is frozen and use
+/// it for every endpoint capture. `Observer` is an opt-in protocol-v3 recovery
+/// mode for host-visible paths whose mount objects may be replaced by the
+/// recovery mechanism between B and C (for example an Allox Btrfs `current`
+/// subvolume replacement). In that mode each endpoint is resolved from the
+/// Observer's current mount namespace instead of a retained target namespace.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FilesystemNamespaceMode {
+    #[default]
+    Deployment,
+    Observer,
+}
+
+pub(crate) fn filesystem_mount_namespace_target_for_mode(
+    manifest: &DeploymentManifest,
+    filesystem_scope_enabled: bool,
+    mode: FilesystemNamespaceMode,
+) -> Result<Option<bpf_observer_linux_state_confirmers::NamespaceTarget>> {
+    match (filesystem_scope_enabled, mode) {
+        (true, FilesystemNamespaceMode::Deployment) => filesystem_mount_namespace_target(manifest),
+        (true, FilesystemNamespaceMode::Observer) | (false, _) => Ok(None),
+    }
+}
+
 pub(crate) fn identity_mismatch_diagnostic(
     stage: &str,
     validation: &LiveIdentityValidation,
@@ -119,6 +148,10 @@ pub struct DeploymentObserverConfig {
     /// images are never recursively scanned or auto-bound.
     #[serde(default)]
     pub filesystem_state_scope: Option<FilesystemScope>,
+    /// Mount namespace used for filesystem endpoint capture. The default
+    /// retains the deployment namespace and preserves protocol-v2 behavior.
+    #[serde(default)]
+    pub filesystem_namespace_mode: FilesystemNamespaceMode,
     #[serde(default)]
     pub linux_state_scope: Option<StateScope>,
     /// Protocol v3 only: a content-bound, synchronous external recovery helper.
@@ -157,6 +190,15 @@ impl DeploymentObserverConfig {
         }
         if let Some(scope) = &self.filesystem_state_scope {
             scope.validate()?;
+        }
+        if self.filesystem_namespace_mode == FilesystemNamespaceMode::Observer
+            && (self.protocol_version != DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION
+                || self.recovery.is_none()
+                || self.filesystem_state_scope.is_none())
+        {
+            bail!(
+                "OBSERVER filesystem namespace mode requires protocol v3 recovery with a filesystem state scope"
+            );
         }
         validate_path(&self.recorder_object_path, "recorder object")?;
         validate_path(&self.lifecycle_object_path, "lifecycle object")?;
@@ -379,12 +421,11 @@ impl DeploymentSession {
             })
             .transpose()
             .context("retain deployment Linux-state namespaces")?;
-        let filesystem_namespace_target = config
-            .filesystem_state_scope
-            .as_ref()
-            .map(|_| filesystem_mount_namespace_target(&manifest))
-            .transpose()?
-            .flatten();
+        let filesystem_namespace_target = filesystem_mount_namespace_target_for_mode(
+            &manifest,
+            config.filesystem_state_scope.is_some(),
+            config.filesystem_namespace_mode,
+        )?;
         let filesystem_mount_namespace = filesystem_namespace_target
             .as_ref()
             .map(|target| RetainedNamespace::open(target, LinuxNamespaceKind::Mount))
