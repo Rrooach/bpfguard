@@ -27,3 +27,7 @@ path = "src/bin/deployment-observe.rs"
 [[bin]]
 name = "deployment-observe-verify"
 path = "src/bin/deployment-observe-verify.rs"
+
+[[bin]]
+name = "deployment-observe-recovery-verify"
+path = "src/bin/deployment-observe-recovery-verify.rs"

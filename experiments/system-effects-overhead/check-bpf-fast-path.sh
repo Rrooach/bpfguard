@@ -26,8 +26,14 @@ command -v "$NM" >/dev/null || {
 	exit 2
 }
 
-permission="$($OBJDUMP -d --no-show-raw-insn \
+permission_section="$($OBJDUMP -d --no-show-raw-insn \
 	--section=lsm/file_permission "$OBJECT")"
+# Two separately autoloaded programs now share this ELF section. Inspect the
+# complete original symbol including its LBB return labels, not both programs
+# together and not --disassemble-symbols (which drops those local blocks).
+permission="$(awk '/<trace_effect_file_permission>:/ { selected=1 }
+	selected && /<trace_effect_file_permission_read>:/ { exit }
+	selected { print }' <<< "$permission_section")"
 permission_count="$(awk '/^[[:space:]]+[0-9]+:/ { count++ } END { print count + 0 }' \
 	<<< "$permission")"
 [[ "$permission_count" == 12 ]] || {
@@ -133,6 +139,16 @@ file_post_open_first_two=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen+
 	exit 1
 }
 require_symbol_instruction_cap "$OBJECT" record_file_permission 230
+require_symbol_instruction_cap "$OBJECT" trace_effect_file_permission_read 12
+require_symbol_instruction_cap "$OBJECT" record_file_permission_read 230
+read_permission_resolver=$($OBJDUMP -d --no-show-raw-insn \
+	--disassemble-symbols=record_file_permission_read "$OBJECT")
+read_permission_first_two=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 2 { exit }' \
+	<<< "$read_permission_resolver")
+[[ "$read_permission_first_two" == $'14\n1' ]] || {
+	echo "read permission resolver no longer gates on PID/pending-map before file reads" >&2
+	exit 1
+}
 permission_resolver=$($OBJDUMP -d --no-show-raw-insn \
 	--disassemble-symbols=record_file_permission "$OBJECT")
 permission_resolver_first_two=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 2 { exit }' \
@@ -158,10 +174,48 @@ for symbol in record_path_object record_inode_xattr_object record_socket_object;
 done
 
 # accept/accept4 resolution occurs at fexit/do_accept because the accepted
-# struct file does not exist at syscall entry. The wrapper must remain thin,
-# and the resolver must still reject by selected pending syscall before reading
+# struct file does not exist at syscall entry. Snapshot publication now runs
+# after the large resolver frame returns, keeping cumulative BPF stack use
+# within 512 bytes. Pin clang-14's rejected-task return before further helpers,
+# as well as the larger successful-publication wrapper budget.
+require_instruction_cap "$OBJECT" fexit/do_accept 43
+accept_wrapper=$($OBJDUMP -dr --no-show-raw-insn \
+	--section=fexit/do_accept "$OBJECT")
+accept_resolver_address=$($NM -n "$OBJECT" \
+	| awk '$3 == "record_accepted_socket" { print $1 }')
+[[ $accept_resolver_address =~ ^[0-9a-fA-F]+$ ]] || {
+	echo "record_accepted_socket has no unique compiled address" >&2
+	exit 1
+}
+accept_resolver_bytes=$((16#$accept_resolver_address))
+(( accept_resolver_bytes % 8 == 0 )) || {
+	echo "record_accepted_socket has a non-instruction-aligned BPF address" >&2
+	exit 1
+}
+# A call relocated against .text encodes the target's instruction offset - 1.
+accept_resolver_call=$((accept_resolver_bytes / 8 - 1))
+accept_first_three_calls=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 3 { exit }' \
+	<<< "$accept_wrapper")
+[[ "$accept_first_three_calls" == "$accept_resolver_call"$'\n14\n1' ]] || {
+	echo "do_accept no longer enters its resolver before PID/pending-map helpers" >&2
+	exit 1
+}
+if ! {
+	grep -Eq "^[[:space:]]+7:.*call $accept_resolver_call$" <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+0*38:[[:space:]]+R_BPF_64_32[[:space:]]+\.text$' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+8:[[:space:]]+r6 = r0$' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+9:[[:space:]]+if r6 == 0 goto \+33 ' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+0*70:[[:space:]]+R_BPF_64_64[[:space:]]+effect_pending$' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+17:[[:space:]]+r7 = r0$' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+18:[[:space:]]+if r7 == 0 goto \+24 ' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+43:[[:space:]]+r0 = 0$' <<< "$accept_wrapper" &&
+	grep -Eq '^[[:space:]]+44:[[:space:]]+exit$' <<< "$accept_wrapper"
+}; then
+	echo "do_accept lost its resolver/pending-miss return before socket publication work" >&2
+	exit 1
+fi
+# The resolver must still reject by selected pending syscall before reading
 # the returned file/socket.
-require_instruction_cap "$OBJECT" fexit/do_accept 8
 accept_resolver=$($OBJDUMP -d --no-show-raw-insn \
 	--disassemble-symbols=record_accepted_socket "$OBJECT")
 accept_first_two_calls=$(awk '/^[[:space:]]+[0-9]+:.*call / { print $NF; seen++ } seen == 2 { exit }' \

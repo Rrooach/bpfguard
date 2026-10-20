@@ -1,5 +1,25 @@
 # BPF State Observer
 
+Chinese project specification and usage guide:
+[Linux System Effects Observer 项目规格说明](docs/specification.zh-CN.md).
+
+Task-level performance experiments (separate from audit/recovery evidence):
+[多 Agent 并发搜索：运行、资源时间线与对照分析](experiments/search-profile/README.md).
+
+Explain a tool's wall-clock delay, rather than adding parallel thread times:
+[Agent → 工具 → 进程／线程多泳道时间线](experiments/execution-timeline/README.md).
+This opt-in diagnostic records same-run scheduler transitions, selected VFS
+reads, kernel object paths and wake/join evidence. It is not enabled in the
+default profiles and is not a universal causal or whole-kernel verifier.
+
+Latest implementation and repeated VM validation:
+[本轮完成项、实验收益、开销与剩余硬件条件](experiments/profile-validation/ACCEPTANCE.md),
+[共享推理/线程关联](experiments/execution-profile/README.md), and
+[工具级文件访问诊断](experiments/file-profile/README.md).
+
+Pinned task pilots with PSI sampling and independently verified audit evidence:
+[SWE-bench Verified、AgentBench、Terminal-Bench 接入与结果](experiments/agent-benchmarks/README.md).
+
 `bpf-state-observer` is a conservative eBPF observability baseline for a
 cooperative Agent workload in a controlled Linux VM. It combines:
 
@@ -108,6 +128,80 @@ Workspace crates separate schema, BPF/filesystem/Linux endpoint capture,
 system-effect and lifecycle recording, comparison, deployment discovery, and
 authenticated harness protocols. `crates/observerd` coordinates standalone
 runs, while `crates/deployment-observer` coordinates already-running targets.
+
+## File access counts, bytes and latency
+
+The opt-in `file-access` profile adds ordinary read-only opens and native
+`read`/`pread64`/`readv`/`preadv`/`preadv2` to the existing `full` syscall
+selection. Existing profiles retain their selection and default behavior.
+Rebuild the observer and BPF object together; this profile rejects older objects.
+
+From this directory inside the Linux source tree:
+
+```sh
+make release system-effects-bpf workloads
+RECORDER_SHA256=$(sha256sum .output/system_effects.bpf.o | cut -d ' ' -f1)
+
+sudo .output/cargo-target/release/bpf-state-observer observe-effects \
+  --recorder-object .output/system_effects.bpf.o \
+  --expected-recorder-sha256 "$RECORDER_SHA256" \
+  --output-dir /tmp/file-access-run \
+  --profile file-access \
+  --object-resolution kernel-file-open-write-partial \
+  -- /path/to/workload arg1
+
+.output/cargo-target/release/bpf-state-observer verify-effects \
+  --run-dir /tmp/file-access-run \
+  --expected-recorder-sha256 "$RECORDER_SHA256" \
+  --expected-profile file-access \
+  --expected-object-resolution kernel-file-open-write-partial
+
+.output/cargo-target/release/bpf-state-observer file-access-report \
+  --wal /tmp/file-access-run/system-effects.raw.bin > /tmp/file-access-report.json
+```
+
+The output directory must be new. The report contains per-call requested and
+returned bytes, syscall entry/exit timestamps and elapsed time, plus per-object
+counts and byte totals. Scalar requested bytes use the count argument; vector
+requested bytes remain unknown because iovec arrays are not copied. EOF returns
+zero bytes. Failed or unmatched calls and unresolved successful operations are
+explicit, not silently converted to successful zero-byte file accesses.
+
+File identities use mount/device/inode/generation, not FD numbers or path text.
+`unique_files` excludes anonymous pipefs/socketfs/anon_inodefs objects, which are
+counted separately, but includes directories, devices and named proc/sysfs files;
+it is **not** a count of regular source files. Hard-link aliases within one mount
+deduplicate; reused FDs do not merge different objects. Paths are observations
+and can change. Generation-less identities cannot exclude inode reuse.
+
+`kernel-file-open-write-partial` and `kernel-object-expanded-partial` resolve
+selected positive-byte reads through file-permission hooks only for the new
+profile; `user-input` cannot supply resolved file counts. Open-only mode resolves
+opens only. Unsupported operations and missing joins retain their declared
+quality limits. The projection does not replace `verify-effects`, which checks
+the finalized artifact and transport bindings.
+
+Elapsed syscall durations include scheduling and blocking and can overlap;
+their sum is not task wall time or device service time. Returned bytes can come
+from page cache and are not physical disk traffic. This report does not account
+for mmap page access, stat/getdents, io_uring or range-transfer bytes. Old WALs
+can use an explicit old `--profile`, but omitted reads cannot be recovered.
+
+This is a bounded diagnostic recorder, not the large-search collector. The
+existing WAL limits still apply, so exhaustive multi-agent large-repository
+experiments use the separate [file-access collector](experiments/file-profile/README.md)
+and [2/4/6/8 experiment](experiments/search-profile/FILE_ACCESS_2468.md).
+
+A disposable live-kernel smoke test checks exact byte counts, per-call timing,
+hard-link deduplication and FD reuse, using a BTF+BPF-LSM test kernel:
+
+```sh
+python3 vm/run-file-access-e2e.py --kernel /path/to/bzImage \
+  --output-dir .output/file-access-check
+```
+
+It requires QEMU, cpio, BusyBox and the built binaries, but no Host root, KVM,
+SSH or disk image. Keep the console, verification and report outputs together.
 
 ## Deliberately not implemented yet
 

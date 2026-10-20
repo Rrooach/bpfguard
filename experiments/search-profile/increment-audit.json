@@ -1,0 +1,257 @@
+{
+  "schema_version": 2,
+  "audit_date": "2026-10-14",
+  "basis": "Implemented source and repeated privileged target-Linux VM experiments; offline replay, runtime validation and fixture-only coverage are distinguished.",
+  "source_document_sha256": "358a7937a06392ec554e50bf198f27a3fda8fc3438184aead422700630b49203",
+  "repository_head": "8a085c5c865bbe6f94d5815f988b745ee17ea7c6",
+  "branch": "profile-master",
+  "working_tree_has_uncommitted_changes": true,
+  "previous_audit": ".output/profile-validation-20261014/increment-audit-before-iteration.json",
+  "all_requested_increments_complete": false,
+  "summary": "上一轮未完成的 CPU/文件/共享服务实现和两组实测已补齐。GPU 导入与关联接口有测试，但目标 Linux 没有可用计算 GPU，真实 GPU 排队/执行/显存实验未验收；不能用 CPU 模型或 fixture 替代。",
+  "human_report": "experiments/profile-validation/ACCEPTANCE.md",
+  "increments": [
+    {
+      "id": "P0_TASK_ASSOCIATION",
+      "status": "IMPLEMENTED_VALIDATED_WITHIN_DECLARED_SCOPE",
+      "implemented": [
+        "run/task/agent/attempt/epoch/tool/request、parent/dependencies、priority/effective version、phase 与单调时钟事件",
+        "boot、PID/process birth、TID/thread birth、cgroup 与 namespace 绑定，不以裸 PID/TID 作为永久身份",
+        "搜索→输入准备→真实本地推理依赖链，两个 Agent 使用共享长期服务",
+        "实际 dispatch 和 GGML worker 处理区间，共享线程不永久绑定某个 Agent",
+        "request 接收/入队/调度/首 token/完成/取消，优先级更新与独立重放",
+        "native decode 批次成员格式，LIGHT 的所采单次 decode 与 FORENSIC 的全量选定事件分别声明",
+        "离线从原始 admission 事件重建 request 上下文，不相信 expected-requests 派生 JSON",
+        "额外真实2-slot CPU校准：35个实际decode、32个双请求batch、70个实际worker区间，原始admission/native/member/slot关联独立重放"
+      ],
+      "evidence": [
+        "experiments/execution-profile/README.md",
+        "experiments/execution-profile/VALIDATION.md",
+        ".output/execution-profile/evidence/campaign-summary-final.json",
+        ".output/execution-profile/evidence/campaign-validation-bound-admission.json",
+        ".output/execution-profile/evidence/multibatch-kv-v4-host-replay-strict-worker-binding.json",
+        ".output/execution-profile/evidence/multibatch-kv-v4-host-replay-final.json",
+        ".output/execution-profile/evidence/campaign-validation-v4-parser-worker-binding-78.json"
+      ],
+      "limits": [
+        "合作型 runtime 声明建立应用关联，不建立跨 daemon 的内核因果证明",
+        "主性能矩阵使用单slot/singleton batch；真实多成员另有2-slot校准，不混入20轮性能矩阵的收益统计",
+        "procfs 轮询的完整线程生命周期仍为 PARTIAL，未采到短线程不补造",
+        "未修改或声称接入生产 V8，安全 supervisor/WAL 合同没有被性能字段放宽"
+      ]
+    },
+    {
+      "id": "P0_OFFLINE_ANALYSIS_AND_CALIBRATION",
+      "status": "IMPLEMENTED_VALIDATED_WITHIN_DECLARED_SCOPE",
+      "implemented": [
+        "复用 load-sampler：实际间隔差分、CPU速率、独立PSI和逐 major:minor 设备I/O",
+        "阶段包围窗口与误差，缺字段/首次设备计数/回退/读错误/截断分项保留",
+        "HTML/JSON/Chrome Trace与推理阶段关联，首成功样本和metadata持久化后READY",
+        "CPU忙循环、单核排队、sleep、Guest冷读、内存压力、缺页/回收/锁等待受控实测",
+        "冷/热×共享/独立×1/2/4/8并发×查询复用，160 trials/1280 tasks",
+        "固定8×320MiB、相同memory.max的pressure校准，20 trials/160 tasks",
+        "真实baseline/Observer/Observer+sampler，50/100/500/1000ms，120 trials/960 tasks",
+        "同工作量随机配对、原始输出独立比对、collector CPU/RSS/证据大小与边界成本单列"
+      ],
+      "evidence": [
+        "crates/load-sampler/src/main.rs",
+        "crates/load-sampler/src/lib.rs",
+        "crates/load-sampler/tests/README.md",
+        "experiments/search-profile/analyze.py",
+        "experiments/profile-validation/campaign.py",
+        ".output/profile-validation-20261014/matrix-basic-20261014/validation-campaign.json",
+        ".output/profile-validation-20261014/matrix-basic-replay.json",
+        ".output/kernel-hist-p1-calibration/receipt.json",
+        ".output/profile-validation-20261014/kernel-calibration-host-replay.json",
+        ".output/profile-validation-20261014/campaign-summary.json",
+        ".output/profile-validation-20261014/host-wal-replay-root-independent/summary.json"
+      ],
+      "limits": [
+        "PSI、累计完成span、逐线程CPU不是可相加的墙钟占比",
+        "Guest冷缓存不意味着物理服务器/SSD缓存冷",
+        "内存校准证明信号有效，不自动证明真实Agent任务瓶颈",
+        "仅5个独立重复块，不报告生产SLA/p99",
+        "性能重放通过不会把审计INCOMPLETE改成COMPLETE"
+      ]
+    },
+    {
+      "id": "P1_FINE_ATTRIBUTION_AND_DIAGNOSTICS",
+      "status": "CPU_FILE_IMPLEMENTED_VALIDATED_GPU_NOT_VALIDATED",
+      "implemented": [
+        "kernel_hist ABI2 一套探针最多16域，父/子包含关系明确；system block/softirq不分摊给Agent",
+        "有界TID采样与boot/process birth/thread birth绑定，缺调度计数保留null",
+        "read/pread/readv、iterate_dir、解析成功的文件mmap尝试及成功/错误分类、实际对象和时长聚合，mount/dev/inode/generation与metadata version hint",
+        "工具处理区间唯一匹配才关联，重叠共享域/缺完整区间返回UNRESOLVED",
+        "固定只读inventory绑定路径/内容SHA，raw ctime queried位保留而不伪装成版本变化",
+        "独立perf CPU-clock诊断、原始perf.data，未知/stripped符号保留未知",
+        "block有界HASH、nr_bytes部分完成、requeue/error/collision/容量统计，实际BPF源状态机重放",
+        "syscall kprobe ABI门禁与40万次getpid精确校准，旧raw-btf失败保留",
+        "内存tracefs kprobe/kretprobe的hit/miss/profile与独占事件清理，旧fentry失败不静默忽略",
+        "NVTX/Nsight SQLite kernel/memcpy导入、显式进程实例与三点时钟映射，fixture验证",
+        "精确Debian grep build-id调试信息补齐后，额外442个CPU-clock样本、0lost，用户匹配bmexec_trans与内核复制/目录热点可区分；诊断单列",
+        "独立审查后file profile schema2：metadata先持久化再enable，真实TS_COMPAT/x32过滤，固定健康/hook表与程序/域/窗口强校验；实际mmap EACCES和ABI负对照通过",
+        "block v8保持ABI2旧hist布局，独立有界opcode/flags/地址hash诊断与零字节FLUSH service；真实fdatasync控制和Host重放，缺queue/生命周期仍UNKNOWN"
+      ],
+      "not_validated": [
+        "实际GPU API/kernel/memcpy时间线与GPU请求关联",
+        "所有硬件块设备合并/写回/重排/requeue情形的实际设备E2E"
+      ],
+      "evidence": [
+        "bpf/kernel_hist.bpf.c",
+        "crates/load-sampler/src/khist.rs",
+        "crates/load-sampler/tests/README.md",
+        "bpf/file_profile.bpf.c",
+        "crates/file-profiler/src/main.rs",
+        "experiments/file-profile/README.md",
+        "experiments/file-profile/VALIDATION.md",
+        ".output/profile-validation-20261014/file-search-004/validation.json",
+        ".output/profile-validation-20261014/file-search-004/file-report-host-final.json",
+        "experiments/execution-profile/gpu_adapter.py",
+        ".output/profile-validation-20261014/file-final/file-object-final/validation.json",
+        ".output/profile-validation-20261014/file-final/perf-long-symbolized-report.txt",
+        ".output/profile-validation-20261014/file-v2/positive/validation.json",
+        ".output/profile-validation-20261014/file-v2/search/file-report-host-bound.json",
+        ".output/profile-validation-20261014/file-v2/unsupported-abi/file-report-host-bound.json",
+        ".output/kernel-hist-p1-calibration/receipt-v8-block.json",
+        ".output/profile-validation-20261014/kernel-block-root-replay.json",
+        ".output/profile-validation-20261014/block-v8-review-receipt.json"
+      ],
+      "limits": [
+        "mmap建映射不是访问字节，io_uring/splice/sendfile不在文件profiler覆盖内",
+        "returned_bytes不是磁盘字节，重复访问不是证明无效工作",
+        "generation=0为未知，metadata hint不是内容版本或权限缓存授权",
+        "长服务/共享线程总成本不能猜测平均分摊给请求",
+        "新backend需目标BTF/ABI/tracefs支持，不满足就拒绝READY",
+        "缺页hook完成计数不是rusage.minflt同义词",
+        "GPU fixture/CPU模型/利用率不能替代GPU硬件验收",
+        "host-view cgroup层级为前提，不是容器namespace enforcement；private cgroup namespace内不能从零记录证明没有读取",
+        "v7真实搜索19项block边界未知保留；v8实际flush仍有queue18/untracked9未知和37个有界样本截断，不猜请求生命周期或宣称完整存储分账"
+      ]
+    },
+    {
+      "id": "P1_INFERENCE_ADAPTER_AND_EXPERIMENT_REPORT",
+      "status": "REAL_CPU_IMPLEMENTED_VALIDATED_GPU_NOT_VALIDATED",
+      "implemented": [
+        "固定真实llama.cpp b4514源commit、CPU binary SHA与官方stories15M GGUF SHA",
+        "真实请求排队/调度/首token/完成、输入输出token、native batch与shared worker区间",
+        "G0 solo、G1 mixed、G2静态CPU预留、G3已知阶段CPU调整，相同B编译/模型总工作量",
+        "最终LIGHT G0-G3各5轮：A延迟/等待、B吞吐/总完成时间、总体makespan配对报告",
+        "实际两Agent优先级/取消控制，不声称抢占已运行请求",
+        "原FORENSIC/优化FORENSIC/LIGHT on/off配对成本，高频诊断默认OFF",
+        "78个矩阵/诊断/开销/队列trial Host独立重放，20对跨版本输入/输出/编译产物精确匹配",
+        "动态未胜过静态预留的阴性结果与B编译吞吐代价保留",
+        "v4在ENGINE_COMPLETE低频采集官方KV逻辑cells/token-sequence associations与容量，起止采集时间保留；不估算显存或把RSS称作框架allocation"
+      ],
+      "not_validated": [
+        "计算GPU实际执行/memcpy/显存峰值、framework allocated/reserved与GPU调度收益"
+      ],
+      "evidence": [
+        "experiments/execution-profile/README.md",
+        "experiments/execution-profile/VALIDATION.md",
+        "experiments/execution-profile/verify_campaigns.py",
+        ".output/execution-profile/evidence/mixed-light-v3-20261014/analysis-host.json",
+        ".output/execution-profile/evidence/campaign-summary-final.json",
+        ".output/execution-profile/evidence/multibatch-kv-v4-host-replay-strict-worker-binding.json",
+        ".output/execution-profile/evidence/campaign-validation-v4-parser-legacy-78.json",
+        ".output/profile-validation-20261014/multibatch-kv-independent-root-replay.json"
+      ],
+      "limits": [
+        "真实模型使用CPU，不是生产大模型或GPU服务",
+        "LIGHT只记录所选单次真实decode，不承诺完整batch/worker历史",
+        "全机显存、框架allocated/reserved、KV逻辑占用与RSS必须分开，不可估算替代",
+        "CPU/data/memory联合调度只在实际出现相应瓶颈后扩展，不凭空实现搬运优化"
+      ]
+    }
+  ],
+  "experiment_requirements": [
+    {
+      "id": "SEARCH_FIXED_WORK",
+      "status": "VALIDATED",
+      "detail": "固定内容/权限/参数和64次逻辑查询，1280份stdout Host独立比对"
+    },
+    {
+      "id": "SEARCH_CONCURRENCY",
+      "status": "VALIDATED",
+      "detail": "真实1/2/4/8并发，5个随机重复块"
+    },
+    {
+      "id": "SEARCH_WARM_CACHE",
+      "status": "VALIDATED",
+      "detail": "固定准备顺序，不保证任意工作集全程驻留"
+    },
+    {
+      "id": "SEARCH_GUEST_COLD",
+      "status": "VALIDATED",
+      "detail": "仅owned QEMU Guest drop-caches，Host缓存未知"
+    },
+    {
+      "id": "SEARCH_INDEPENDENT_WORKSPACES",
+      "status": "VALIDATED",
+      "detail": "实际独立副本，前后内容/权限一致"
+    },
+    {
+      "id": "SEARCH_MEMORY_PRESSURE",
+      "status": "VALIDATED",
+      "detail": "相同8×320MiB读取量、512MiB hard limit，只改memory.high"
+    },
+    {
+      "id": "SEARCH_QUERY_REUSE",
+      "status": "VALIDATED",
+      "detail": "内容/权限/查询/选项/二进制/身份绑定新缓存，首次grep在窗口"
+    },
+    {
+      "id": "SEARCH_PROVEN_OPTIMIZATION",
+      "status": "VALIDATED_WITHIN_EXPERIMENT",
+      "detail": "16条件配对CI支持收益，warm/shared/c8中位−79.30%，不推出通用重复率"
+    },
+    {
+      "id": "MIXED_COMPILE_LOCAL_INFERENCE",
+      "status": "CPU_VALIDATED_GPU_NOT_AVAILABLE",
+      "detail": "LIGHT G1→G2 A约−47.57%、全局−15.50%，保留B代价和G3阴性"
+    },
+    {
+      "id": "OBSERVER_OVERHEAD_THREE_GROUPS",
+      "status": "VALIDATED_WITHIN_SELECTED_PROFILE",
+      "detail": "同布局同工作量三组，120 trials，50/100/500/1000ms；未开状态confirmers/详细khist"
+    },
+    {
+      "id": "GPU_TIMELINE_AND_MEMORY",
+      "status": "HARDWARE_E2E_NOT_RUN",
+      "detail": "服务器只有BMC显示控制器，Guest无计算GPU；adapter有测试，实际硬件实验缺失"
+    },
+    {
+      "id": "REAL_MULTI_MEMBER_BATCH_AND_LOGICAL_KV",
+      "status": "CPU_VALIDATED",
+      "detail": "额外2请求/2-slot，32真实双成员batch；KV占用508/510 cells of1024。序列ID容量不是并行slot数量，不把此校准当开销对比。"
+    },
+    {
+      "id": "FILE_OBJECT_POSITIVE_NEGATIVE",
+      "status": "VALIDATED_WITHIN_NATIVE_X86_64_SCOPE",
+      "detail": "schema2同内核真实正例1600bytes、目录及mmap成功/已解析EACCES；两域共4次compat/x32跳过使INCOMPLETE，健康缺字段不能被接受。"
+    },
+    {
+      "id": "BLOCK_FLUSH_DIAGNOSTIC",
+      "status": "VALIDATED_LIMITED_DIAGNOSTIC",
+      "detail": "真实8write+8fdatasync、内容262144bytes一致，18个zero-byte FLUSH service被捕获；queue/untracked与样本截断仍明确UNKNOWN，不将故障输出改绿。"
+    }
+  ],
+  "continuation_requirements": {
+    "compute_gpu": "目标Linux可用的计算GPU（Guest需受支持直通或其他明确部署），匹配驱动/引擎/CUDA/Nsight能力与profiler权限",
+    "gpu_acceptance": "同固定工作G0-G3，验证请求/批次/提交/kernel/memcpy时钟和身份、实际显存各口径，诊断成本单列；保留阴性结果，不要求机制必定胜过静态基线"
+  },
+  "budget": {
+    "paid_api_calls_this_iteration": 0,
+    "full_named_benchmark_rerun_claimed": false,
+    "previous_small_pilots": "experiments/agent-benchmarks/README.md"
+  },
+  "finalized_date": "2026-10-15",
+  "final_evidence_index": ".output/profile-validation-20261014/iteration-summary-final.json",
+  "verification": {
+    "make_check_all": "PASS",
+    "rust_passed": 376,
+    "python_passed": 175,
+    "log": ".output/profile-validation-20261014/check-all-final-frozen.log",
+    "cleanup": ".output/profile-validation-20261014/cleanup-final.json",
+    "remaining_external_requirement": "compute GPU hardware/driver/profiler access; no rental or paid model API calls made"
+  }
+}

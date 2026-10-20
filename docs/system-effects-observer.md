@@ -367,13 +367,22 @@ mount/device/inode/generation/superblock identity but deliberately does not
 call `bpf_d_path`; write results therefore carry `path.quality=NOT_REQUESTED`.
 Coverage is limited to positive-byte results from the selected native `write`,
 `pwrite64`, `writev`, `pwritev`, and `pwritev2` syscalls whose VFS `struct file`
-reaches `file_permission`, so it requires the `balanced` or `full` profile.
+reaches `file_permission`, so it requires the `balanced`, `full` or `file-access` profile.
 Pipefs/socketfs pseudo-files reached through that hook receive `FILE_OBJECT`
-identity, but not a socket endpoint or persistence claim. Every positive-byte
-result in this selected native write family requires a `file_permission` join;
-a missing hook is a transport-integrity failure, not a partial-coverage
-success. Zero-byte and failed writes do not attempt object resolution. No userspace `/proc/<pid>/fd` or
+identity, but not a socket endpoint or persistence claim. Positive-byte results
+in this selected native write family are expected to join `file_permission`.
+An explicitly flagged resolution failure remains `UNRESOLVED`, not a resolved
+object or fabricated evidence-corruption failure; undeclared/malformed joins
+are still rejected. Zero-byte and failed writes do not attempt object resolution. No userspace `/proc/<pid>/fd` or
 post-event FD lookup is used as authoritative evidence.
+
+With `--profile file-access`, a separately enabled read-permission program
+resolves selected positive-byte `read`, `pread64`, `readv`, `preadv` and
+`preadv2` results checked with `MAY_READ`. Read results have the same
+mount/device/inode identity and `NOT_REQUESTED` path quality. Zero-byte and
+failed reads retain syscall results without file identities. Both this mode
+and expanded mode support this read resolver; existing profiles do not attach
+the additional read program. This profile requires a rebuilt recorder object.
 
 `--object-resolution kernel-object-expanded-partial` preserves both earlier
 contracts and adds these operation-specific joins:
@@ -546,10 +555,14 @@ Profiles are cumulative:
 |---|---|---|
 | `control` | File/path metadata changes; socket creation/connect/bind/listen; mount and namespace controls; BPF/module/perf/ptrace and other kernel controls; credentials, keys, seccomp, quota, Landlock, and async-I/O setup | CLI default; lowest event volume; omits write/send data paths |
 | `balanced` | Everything in `control`, plus write/pwrite/writev, allocation and FD-range transfer, and send/sendmsg operations | Appropriate for ordinary Agent effect collection when data-path events are required |
-| `full` | Everything in `balanced`, plus fsync/fdatasync, write-direction mmap/mprotect, setsockopt, ioctl, and prctl | Highest and workload-sensitive volume; mmap/mprotect without `PROT_WRITE` are rejected before cgroup/event work |
+| `full` | Everything in `balanced`, plus fsync/fdatasync, write-direction mmap/mprotect, setsockopt, ioctl, and prctl | High and workload-sensitive volume; mmap/mprotect without `PROT_WRITE` are rejected before cgroup/event work |
+| `file-access` | Everything in `full`, plus read/pread/readv/preadv/preadv2 and ordinary open/openat requests, including read-only opens | Highest event volume; opt-in diagnostic report, subject to the existing WAL limits |
 
-The generated `system-effects.policy.json` is authoritative. In particular,
-`openat` is filtered in the kernel to create/truncate/tmpfile flags, while
+See [file-access report usage](../README.md#file-access-counts-bytes-and-latency)
+for per-object counts, returned bytes and syscall wall-time observations.
+
+The generated `system-effects.policy.json` is authoritative. In the original
+three profiles, `openat` is filtered in the kernel to create/truncate/tmpfile flags, while
 `openat2` is recorded as an open request because its `open_how` pointer is not
 decoded.
 
@@ -559,10 +572,10 @@ call state, bounded user-memory capture, and ring-buffer publication occur only
 for selected calls; calls outside a registered run stop after the cgroup
 lookup. Result records and attempts without captured arguments use the compact
 record format. Path and sockaddr attempts capture at most 96 bytes per slot;
-write buffers are never copied.
+read/write buffers and iovec arrays are never copied.
 
 Choose the narrowest profile that answers the experiment question. The CLI
-defaults to `control`; `balanced` and `full` are explicit opt-ins. Do not
+defaults to `control`; `balanced`, `full` and `file-access` are explicit opt-ins. Do not
 compare profile timings as though they observed the same event set, and do not
 enable `full` merely to maximize nominal coverage.
 

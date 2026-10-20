@@ -31,6 +31,100 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RECOVERY_NONCE_2: &str = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RECOVERY_NONCE_3: &str = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn filesystem_namespace_mode_config(
+    protocol_version: u32,
+    filesystem_state_scope: bool,
+    filesystem_namespace_mode: FilesystemNamespaceMode,
+) -> DeploymentObserverConfig {
+    DeploymentObserverConfig {
+        protocol_version,
+        deployment: bpf_observer_deployment::DeploymentRequest::Direct(
+            bpf_observer_deployment::DirectRequest::new(1234),
+        ),
+        recorder_object_path: "/opt/observer/system_effects.bpf.o".to_owned(),
+        recorder_object_sha256: "a".repeat(64),
+        lifecycle_object_path: "/opt/observer/process_lifecycle.bpf.o".to_owned(),
+        lifecycle_object_sha256: "b".repeat(64),
+        output_directory: "/var/lib/observer/test-artifacts".to_owned(),
+        run_id: "test-run".to_owned(),
+        epoch: 1,
+        profile: PolicyProfile::Full,
+        object_resolution_mode: FileObjectResolutionMode::KernelObjectExpandedPartial,
+        bpf_state_scope: None,
+        filesystem_state_scope: filesystem_state_scope.then(|| {
+            bpf_observer_filesystem_confirmer::FilesystemScope::new(
+                vec![PathBuf::from("/var/lib/allox/workspaces/test/current")],
+                bpf_observer_filesystem_confirmer::FilesystemCapturePolicy::default(),
+                bpf_observer_filesystem_confirmer::FilesystemCaptureLimits::default(),
+            )
+            .expect("filesystem scope")
+        }),
+        filesystem_namespace_mode,
+        linux_state_scope: None,
+        recovery: (protocol_version == DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION).then(|| {
+            RecoveryConfig {
+                checkpoint_id: "checkpoint-1".to_owned(),
+                recovery_id: "recovery-1".to_owned(),
+                executable_path: "/opt/observer/recover".to_owned(),
+                expected_sha256: "c".repeat(64),
+                argv: Vec::new(),
+                timeout_ms: 10_000,
+                max_output_bytes: 65_536,
+            }
+        }),
+        poll_interval_ms: 20,
+        drain_timeout_ms: 5_000,
+    }
+}
+
+#[test]
+fn filesystem_namespace_mode_defaults_to_deployment_and_is_v3_recovery_only() {
+    let deployment = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Deployment,
+    );
+    deployment.validate_schema().expect("v2 deployment mode");
+
+    let mut omitted = serde_json::to_value(&deployment).expect("serialize config");
+    omitted
+        .as_object_mut()
+        .expect("config object")
+        .remove("filesystem_namespace_mode");
+    let decoded: DeploymentObserverConfig =
+        serde_json::from_value(omitted).expect("deserialize omitted namespace mode");
+    assert_eq!(
+        decoded.filesystem_namespace_mode,
+        FilesystemNamespaceMode::Deployment
+    );
+    decoded.validate_schema().expect("default deployment mode");
+
+    let observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Observer,
+    );
+    observer
+        .validate_schema()
+        .expect("v3 recovery observer mode");
+
+    let v2_observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_PROTOCOL_VERSION,
+        true,
+        FilesystemNamespaceMode::Observer,
+    );
+    assert!(v2_observer.validate_schema().is_err());
+
+    let unscoped_observer = filesystem_namespace_mode_config(
+        DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
+        false,
+        FilesystemNamespaceMode::Observer,
+    );
+    assert!(unscoped_observer.validate_schema().is_err());
+}
 
 #[test]
 fn initial_ready_failure_exposes_bounded_typed_mismatch_diagnostics() {
@@ -85,6 +179,228 @@ fn protocol_rejects_wrong_nonce_without_advancing() {
     };
     assert!(machine.accept_finish(&command).is_err());
     assert_eq!(machine.state(), ProtocolState::Ready);
+}
+
+fn recovery_command(
+    kind: RecoveryCommandKind,
+    run_id: &str,
+    checkpoint_id: &str,
+    recovery_id: &str,
+    command_seq: u32,
+    nonce: &str,
+) -> RecoveryControlCommand {
+    let protocol_version = DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION;
+    let run_id = run_id.to_owned();
+    let checkpoint_id = checkpoint_id.to_owned();
+    let recovery_id = recovery_id.to_owned();
+    let nonce = nonce.to_owned();
+    match kind {
+        RecoveryCommandKind::AgentStarted => RecoveryControlCommand::AgentStarted {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+        RecoveryCommandKind::PreRestore => RecoveryControlCommand::PreRestore {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+        RecoveryCommandKind::Finish => RecoveryControlCommand::Finish {
+            protocol_version,
+            run_id,
+            epoch: 7,
+            checkpoint_id,
+            recovery_id,
+            command_seq,
+            nonce,
+        },
+    }
+}
+
+fn recovery_machine() -> RecoveryProtocolMachine {
+    RecoveryProtocolMachine::new("run-abc", 7, "checkpoint-1", "recovery-1", NONCE).unwrap()
+}
+
+#[test]
+fn recovery_protocol_accepts_only_complete_abc_sequence() {
+    let mut machine = recovery_machine();
+    assert_eq!(machine.state(), RecoveryProtocolState::Initialized);
+    machine.mark_ready_a_committed().unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+
+    let agent_started = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+    assert_eq!(machine.expected_command_seq(), 2);
+    assert_eq!(machine.nonce(), RECOVERY_NONCE_2);
+
+    let pre_restore = recovery_command(
+        RecoveryCommandKind::PreRestore,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        2,
+        RECOVERY_NONCE_2,
+    );
+    machine
+        .accept_pre_restore(&pre_restore, RECOVERY_NONCE_3)
+        .unwrap();
+    machine.mark_b_committed().unwrap();
+    machine.mark_restoring().unwrap();
+    machine.mark_restore_complete().unwrap();
+    machine.mark_c_committed().unwrap();
+
+    let finish = recovery_command(
+        RecoveryCommandKind::Finish,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        3,
+        RECOVERY_NONCE_3,
+    );
+    machine.accept_finish(&finish).unwrap();
+    machine.mark_finished().unwrap();
+    assert_eq!(machine.state(), RecoveryProtocolState::Finished);
+}
+
+#[test]
+fn recovery_protocol_rejects_out_of_order_and_duplicate_commands() {
+    let mut machine = recovery_machine();
+    let pre_restore = recovery_command(
+        RecoveryCommandKind::PreRestore,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        2,
+        RECOVERY_NONCE_2,
+    );
+    assert!(machine
+        .accept_pre_restore(&pre_restore, RECOVERY_NONCE_3)
+        .is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::Initialized);
+
+    machine.mark_ready_a_committed().unwrap();
+    let agent_started = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .unwrap();
+    assert!(machine
+        .accept_agent_started(&agent_started, RECOVERY_NONCE_2)
+        .is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+
+    assert!(machine.mark_b_committed().is_err());
+    let finish = recovery_command(
+        RecoveryCommandKind::Finish,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        3,
+        RECOVERY_NONCE_3,
+    );
+    assert!(machine.accept_finish(&finish).is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::AgentRunning);
+}
+
+#[test]
+fn recovery_protocol_rejects_wrong_nonce_ids_and_sequence_without_advancing() {
+    let mut machine = recovery_machine();
+    machine.mark_ready_a_committed().unwrap();
+
+    for command in [
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "wrong-run",
+            "checkpoint-1",
+            "recovery-1",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "wrong-checkpoint",
+            "recovery-1",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "wrong-recovery",
+            1,
+            NONCE,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "recovery-1",
+            1,
+            RECOVERY_NONCE_2,
+        ),
+        recovery_command(
+            RecoveryCommandKind::AgentStarted,
+            "run-abc",
+            "checkpoint-1",
+            "recovery-1",
+            2,
+            NONCE,
+        ),
+    ] {
+        assert!(machine
+            .accept_agent_started(&command, RECOVERY_NONCE_2)
+            .is_err());
+        assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+        assert_eq!(machine.expected_command_seq(), 1);
+        assert_eq!(machine.nonce(), NONCE);
+    }
+}
+
+#[test]
+fn recovery_protocol_requires_fresh_next_nonce_and_rejects_unknown_fields() {
+    let mut machine = recovery_machine();
+    machine.mark_ready_a_committed().unwrap();
+    let command = recovery_command(
+        RecoveryCommandKind::AgentStarted,
+        "run-abc",
+        "checkpoint-1",
+        "recovery-1",
+        1,
+        NONCE,
+    );
+    assert!(machine.accept_agent_started(&command, NONCE).is_err());
+    assert_eq!(machine.state(), RecoveryProtocolState::ReadyACommitted);
+
+    let encoded = format!(
+        "{{\"command\":\"AGENT_STARTED\",\"protocol_version\":3,\"run_id\":\"run-abc\",\"epoch\":7,\"checkpoint_id\":\"checkpoint-1\",\"recovery_id\":\"recovery-1\",\"command_seq\":1,\"nonce\":\"{NONCE}\",\"unexpected\":true}}"
+    );
+    assert!(serde_json::from_str::<RecoveryControlCommand>(&encoded).is_err());
 }
 
 #[test]
@@ -327,6 +643,22 @@ fn filesystem_namespace_anchor_is_retained_for_direct_and_docker_but_not_kata() 
             .map(|target| (target.pid, target.expected_namespace_inode));
         assert_eq!(target, expected);
     }
+
+    let manifest = fixture_manifest_for_kind(DeploymentKind::Direct);
+    assert!(crate::session::filesystem_mount_namespace_target_for_mode(
+        &manifest,
+        true,
+        FilesystemNamespaceMode::Deployment,
+    )
+    .expect("deployment namespace mode")
+    .is_some());
+    assert!(crate::session::filesystem_mount_namespace_target_for_mode(
+        &manifest,
+        true,
+        FilesystemNamespaceMode::Observer,
+    )
+    .expect("observer namespace mode")
+    .is_none());
 }
 
 #[test]

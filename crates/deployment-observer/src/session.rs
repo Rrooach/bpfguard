@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use bpf_observer_deployment::{
     discover, validate_against_live_procfs_for_phase, DeploymentManifest, DeploymentRequest,
-    LiveIdentityValidation, RevalidationPhase,
+    LiveIdentityValidation, RevalidationPhase, ValidationMismatch,
 };
 use bpf_observer_filesystem_confirmer::{
     FilesystemScope, FilesystemSnapshot, SnapshotPhase as FilesystemSnapshotPhase,
@@ -44,8 +44,9 @@ use crate::linux_state::{
 };
 use crate::protocol::{
     FinishCommand, ProtocolMachine, ReadyMessage, TerminalMessage,
-    DEPLOYMENT_OBSERVER_PROTOCOL_VERSION,
+    DEPLOYMENT_OBSERVER_PROTOCOL_VERSION, DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
 };
+use crate::recovery::RecoveryConfig;
 use crate::report::{
     aggregate_health, aggregate_lifecycle_health, checked_artifact_total_bytes,
     overall_evidence_status, AggregateEvidenceStatus, ArtifactDigest, ArtifactManifest,
@@ -70,6 +71,35 @@ const PRE_FINISH_VALIDATION_FILE: &str = "pre-finish-validation.json";
 const CLOSURE_BARRIER_FILE: &str = "closure-barrier.json";
 const CLOSURE_VALIDATION_FILE: &str = "closure-validation.json";
 const MAX_IDENTITY_MISMATCH_DIAGNOSTICS: usize = 16;
+
+/// Selects the mount namespace used to resolve an explicit filesystem state
+/// scope.
+///
+/// `Deployment` preserves the protocol-v2 behavior: retain the authoritative
+/// deployment mount namespace capability while the target is frozen and use
+/// it for every endpoint capture. `Observer` is an opt-in protocol-v3 recovery
+/// mode for host-visible paths whose mount objects may be replaced by the
+/// recovery mechanism between B and C (for example an Allox Btrfs `current`
+/// subvolume replacement). In that mode each endpoint is resolved from the
+/// Observer's current mount namespace instead of a retained target namespace.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FilesystemNamespaceMode {
+    #[default]
+    Deployment,
+    Observer,
+}
+
+pub(crate) fn filesystem_mount_namespace_target_for_mode(
+    manifest: &DeploymentManifest,
+    filesystem_scope_enabled: bool,
+    mode: FilesystemNamespaceMode,
+) -> Result<Option<bpf_observer_linux_state_confirmers::NamespaceTarget>> {
+    match (filesystem_scope_enabled, mode) {
+        (true, FilesystemNamespaceMode::Deployment) => filesystem_mount_namespace_target(manifest),
+        (true, FilesystemNamespaceMode::Observer) | (false, _) => Ok(None),
+    }
+}
 
 pub(crate) fn identity_mismatch_diagnostic(
     stage: &str,
@@ -118,8 +148,15 @@ pub struct DeploymentObserverConfig {
     /// images are never recursively scanned or auto-bound.
     #[serde(default)]
     pub filesystem_state_scope: Option<FilesystemScope>,
+    /// Mount namespace used for filesystem endpoint capture. The default
+    /// retains the deployment namespace and preserves protocol-v2 behavior.
+    #[serde(default)]
+    pub filesystem_namespace_mode: FilesystemNamespaceMode,
     #[serde(default)]
     pub linux_state_scope: Option<StateScope>,
+    /// Protocol v3 only: a content-bound, synchronous external recovery helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryConfig>,
     pub poll_interval_ms: u64,
     pub drain_timeout_ms: u64,
 }
@@ -137,8 +174,12 @@ impl DeploymentObserverConfig {
     }
 
     pub fn validate_schema(&self) -> Result<()> {
-        if self.protocol_version != DEPLOYMENT_OBSERVER_PROTOCOL_VERSION {
-            bail!("unsupported deployment-observer configuration protocol version");
+        match (self.protocol_version, self.recovery.as_ref()) {
+            (DEPLOYMENT_OBSERVER_PROTOCOL_VERSION, None) => {}
+            (DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION, Some(recovery)) => {
+                recovery.validate_schema()?;
+            }
+            _ => bail!("deployment-observer protocol and recovery contract disagree"),
         }
         self.deployment.validate()?;
         if let Some(scope) = &self.linux_state_scope {
@@ -149,6 +190,15 @@ impl DeploymentObserverConfig {
         }
         if let Some(scope) = &self.filesystem_state_scope {
             scope.validate()?;
+        }
+        if self.filesystem_namespace_mode == FilesystemNamespaceMode::Observer
+            && (self.protocol_version != DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION
+                || self.recovery.is_none()
+                || self.filesystem_state_scope.is_none())
+        {
+            bail!(
+                "OBSERVER filesystem namespace mode requires protocol v3 recovery with a filesystem state scope"
+            );
         }
         validate_path(&self.recorder_object_path, "recorder object")?;
         validate_path(&self.lifecycle_object_path, "lifecycle object")?;
@@ -285,6 +335,35 @@ pub struct DeploymentSession {
     cgroup_scope_capability_sha256: String,
 }
 
+/// One sequential endpoint capture used by the opt-in recovery coordinator.
+/// The three domain collectors are intentionally not represented as an atomic
+/// whole-Linux snapshot; `captured_started_unix_ns` and
+/// `captured_completed_unix_ns` expose the collection window explicitly.
+#[derive(Clone, Debug)]
+pub(crate) struct RecoveryEndpointSnapshots {
+    pub captured_started_unix_ns: u128,
+    pub captured_completed_unix_ns: u128,
+    pub raw_phase: String,
+    pub bpf: Option<BpfSnapshot>,
+    pub filesystem: Option<FilesystemSnapshot>,
+    pub linux: Option<StateSnapshot>,
+    pub telemetry: EndpointCaptureTelemetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRecorderFinalization {
+    pub protocol_version: u32,
+    pub run_id: String,
+    pub epoch: u64,
+    pub root_cgroup_ids: Vec<u64>,
+    pub system_effects: Vec<CgroupRecorderOutcome>,
+    pub process_lifecycle: Vec<CgroupLifecycleOutcome>,
+    pub endpoint_capture_telemetry: Vec<EndpointCaptureTelemetry>,
+    pub complete: bool,
+    pub reasons: Vec<String>,
+}
+
 impl DeploymentSession {
     pub fn prepare(config: DeploymentObserverConfig) -> Result<(Self, ReadyMessage)> {
         config.validate()?;
@@ -342,12 +421,11 @@ impl DeploymentSession {
             })
             .transpose()
             .context("retain deployment Linux-state namespaces")?;
-        let filesystem_namespace_target = config
-            .filesystem_state_scope
-            .as_ref()
-            .map(|_| filesystem_mount_namespace_target(&manifest))
-            .transpose()?
-            .flatten();
+        let filesystem_namespace_target = filesystem_mount_namespace_target_for_mode(
+            &manifest,
+            config.filesystem_state_scope.is_some(),
+            config.filesystem_namespace_mode,
+        )?;
         let filesystem_mount_namespace = filesystem_namespace_target
             .as_ref()
             .map(|target| RetainedNamespace::open(target, LinuxNamespaceKind::Mount))
@@ -617,6 +695,352 @@ impl DeploymentSession {
         effects
             .checked_add(lifecycle)
             .context("combined recorder poll count overflow")
+    }
+
+    pub(crate) fn manifest(&self) -> &DeploymentManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn config(&self) -> &DeploymentObserverConfig {
+        &self.config
+    }
+
+    pub(crate) fn cgroup_scope_capability(&self) -> &CgroupScopeCapability {
+        &self.cgroup_scope_capability
+    }
+
+    pub(crate) fn baseline_endpoint_snapshots(&self) -> RecoveryEndpointSnapshots {
+        let mut captured = self
+            .bpf_state_s0
+            .as_ref()
+            .map(|snapshot| snapshot.captured_unix_ns)
+            .into_iter()
+            .chain(
+                self.filesystem_state_s0
+                    .as_ref()
+                    .map(|snapshot| snapshot.captured_unix_ns),
+            )
+            .chain(
+                self.linux_state_s0
+                    .as_ref()
+                    .map(|snapshot| snapshot.captured_unix_ns),
+            )
+            .collect::<Vec<_>>();
+        captured.sort_unstable();
+        let start = captured
+            .first()
+            .copied()
+            .unwrap_or(self.ready_barrier.checked_unix_ns);
+        let end = self.ready_barrier.checked_unix_ns;
+        RecoveryEndpointSnapshots {
+            captured_started_unix_ns: start,
+            captured_completed_unix_ns: end,
+            raw_phase: "S0".to_owned(),
+            bpf: self.bpf_state_s0.clone(),
+            filesystem: self.filesystem_state_s0.clone(),
+            linux: self.linux_state_s0.clone(),
+            telemetry: self.s0_endpoint_capture_telemetry.clone(),
+        }
+    }
+
+    /// Drain currently available ring-buffer records without sealing any BPF
+    /// producer or unregistering the target roots. This keeps the Observer's
+    /// Program/Map/Link exclusion set stable through snapshots B and C.
+    pub(crate) fn drain_open_recorders_at_boundary(&mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.drain_timeout_ms);
+        let mut consecutive_empty_polls = 0_u8;
+        while Instant::now() < deadline {
+            let effects = self.recorder.poll(Duration::from_millis(0))?;
+            let lifecycle = self.lifecycle_recorder.poll(Duration::from_millis(0))?;
+            if effects == 0 && lifecycle == 0 {
+                consecutive_empty_polls = consecutive_empty_polls.saturating_add(1);
+                if consecutive_empty_polls == 2 {
+                    return Ok(());
+                }
+            } else {
+                consecutive_empty_polls = 0;
+            }
+            std::thread::yield_now();
+        }
+        bail!("open recorder boundary drain did not reach two empty polls before timeout")
+    }
+
+    pub(crate) fn validate_recovery_boundary(
+        &self,
+        stage: &str,
+    ) -> Result<(RootFreezeBarrier, IdentityAssessment)> {
+        let barrier = assess_barrier(&self.manifest);
+        require_barrier(&barrier, stage)?;
+        let mut validation = IdentityAssessment::from_result(
+            validate_against_live_procfs_for_phase(&self.manifest, RevalidationPhase::Closure),
+        );
+        // The v2 final closure legitimately treats every newly added process
+        // as a residual mismatch. At B/C, however, Agent descendants may
+        // still exist inside the frozen registered root. Their presence is
+        // state to confirm, not a replacement of the deployment anchor.
+        // Only that precise mismatch is tolerated; PID reuse, namespace or
+        // cgroup identity drift, missing backends, and all other mismatches
+        // still prevent an endpoint from being committed.
+        if let Some(live) = validation.validation.as_ref() {
+            validation.stable = live.phase == RevalidationPhase::Closure
+                && live.mismatches.iter().all(|mismatch| {
+                    matches!(mismatch, ValidationMismatch::ProcessSetChanged {
+                        added,
+                        removed_unexpected,
+                    } if !added.is_empty() && removed_unexpected.is_empty())
+                });
+        }
+        if !validation.stable {
+            bail!("deployment identity changed at recovery boundary {stage}: {validation:?}");
+        }
+        self.recorder.verify_ancestor_roots()?;
+        self.lifecycle_recorder.verify_ancestor_roots()?;
+        if read_boot_id()? != self.manifest.boot_id {
+            bail!("target Linux boot identity changed at recovery boundary {stage}");
+        }
+        Ok((barrier, validation))
+    }
+
+    pub(crate) fn capture_recovery_endpoint_snapshots(
+        &mut self,
+        phase: &str,
+    ) -> Result<RecoveryEndpointSnapshots> {
+        let (filesystem_phase, linux_phase) = match phase {
+            "B" => (FilesystemSnapshotPhase::B, SnapshotPhase::B),
+            "C" => (FilesystemSnapshotPhase::C, SnapshotPhase::C),
+            _ => bail!("recovery endpoint capture supports only B or C after READY"),
+        };
+        let captured_started_unix_ns = now_unix_ns();
+        let (bpf, bpf_duration_ns) = match self.config.bpf_state_scope.as_ref() {
+            Some(scope) => {
+                let started = Instant::now();
+                let snapshot = capture_bpf_endpoint(
+                    scope,
+                    &self.bpf_state_exclusions,
+                    &self.config.run_id,
+                    self.config.epoch,
+                    phase,
+                )
+                .with_context(|| format!("capture deployment BPF endpoint state {phase}"))?;
+                (
+                    Some(snapshot),
+                    Some(duration_ns(
+                        started.elapsed(),
+                        &format!("BPF {phase} capture"),
+                    )?),
+                )
+            }
+            None => (None, None),
+        };
+        let (filesystem, filesystem_duration_ns) = match self.config.filesystem_state_scope.as_ref()
+        {
+            Some(scope) => {
+                validate_filesystem_output_separation(scope, &self.output_directory).with_context(
+                    || format!("revalidate filesystem/evidence separation at {phase}"),
+                )?;
+                let started = Instant::now();
+                let snapshot = capture_filesystem_endpoint(
+                    scope,
+                    &self.config.run_id,
+                    self.config.epoch,
+                    filesystem_phase,
+                    self.filesystem_mount_namespace.as_ref(),
+                )
+                .with_context(|| format!("capture deployment filesystem endpoint state {phase}"))?;
+                (
+                    Some(snapshot),
+                    Some(duration_ns(
+                        started.elapsed(),
+                        &format!("filesystem {phase} capture"),
+                    )?),
+                )
+            }
+            None => (None, None),
+        };
+        let (linux, linux_duration_ns) = match &mut self.linux_state {
+            Some(bound) => {
+                let retained = self
+                    .linux_state_namespaces
+                    .as_ref()
+                    .context("enabled Linux state confirmation has no retained namespaces")?;
+                let started = Instant::now();
+                let snapshot = capture_linux_state(
+                    &bound.scope,
+                    &CaptureRequest {
+                        snapshot_id: format!(
+                            "{}:linux-state:{}",
+                            self.config.run_id,
+                            phase.to_ascii_lowercase()
+                        ),
+                        phase: linux_phase,
+                    },
+                    retained,
+                )?;
+                (
+                    Some(snapshot),
+                    Some(duration_ns(
+                        started.elapsed(),
+                        &format!("Linux {phase} capture"),
+                    )?),
+                )
+            }
+            None => (None, None),
+        };
+        let telemetry = EndpointCaptureTelemetry::new(
+            bpf_duration_ns,
+            filesystem_duration_ns,
+            linux_duration_ns,
+        )?;
+        Ok(RecoveryEndpointSnapshots {
+            captured_started_unix_ns,
+            captured_completed_unix_ns: now_unix_ns(),
+            raw_phase: phase.to_owned(),
+            bpf,
+            filesystem,
+            linux,
+            telemetry,
+        })
+    }
+
+    /// Close Agent operation streams after C has been durably captured. The
+    /// Observer's BPF Links therefore remain present in all A/B/C inventories.
+    pub(crate) fn finalize_recovery_recorders(&mut self) -> Result<RecoveryRecorderFinalization> {
+        self.validate_recovery_boundary("pre-recovery-recorder-finalization")?;
+        self.recorder
+            .seal_socket_state_producers()
+            .context("seal deployment TCP-state producers after snapshot C")?;
+        let mut system_effects = Vec::with_capacity(self.plan.root_cgroup_ids.len());
+        let mut process_lifecycle = Vec::with_capacity(self.plan.root_cgroup_ids.len());
+        let mut reasons = Vec::new();
+        for cgroup_id in &self.plan.root_cgroup_ids {
+            let outcome = match self.recorder.finish_run(
+                *cgroup_id,
+                self.config.epoch,
+                Duration::from_millis(self.config.drain_timeout_ms),
+                true,
+            ) {
+                Ok(health) => CgroupRecorderOutcome {
+                    cgroup_id: *cgroup_id,
+                    health: Some(health),
+                    finalization_error: None,
+                    unregistered: false,
+                },
+                Err(error) => CgroupRecorderOutcome {
+                    cgroup_id: *cgroup_id,
+                    health: None,
+                    finalization_error: Some(format!("{error:#}")),
+                    unregistered: false,
+                },
+            };
+            system_effects.push(outcome);
+            let outcome = match self.lifecycle_recorder.finish_run(
+                *cgroup_id,
+                self.config.epoch,
+                Duration::from_millis(self.config.drain_timeout_ms),
+                true,
+            ) {
+                Ok(health) => CgroupLifecycleOutcome {
+                    cgroup_id: *cgroup_id,
+                    health: Some(health),
+                    finalization_error: None,
+                    unregistered: false,
+                },
+                Err(error) => CgroupLifecycleOutcome {
+                    cgroup_id: *cgroup_id,
+                    health: None,
+                    finalization_error: Some(format!("{error:#}")),
+                    unregistered: false,
+                },
+            };
+            process_lifecycle.push(outcome);
+        }
+        for outcome in &mut system_effects {
+            if let Err(error) = self
+                .recorder
+                .unregister_ancestor_root(outcome.cgroup_id, self.config.epoch)
+            {
+                append_error(
+                    &mut outcome.finalization_error,
+                    format!("unregister: {error:#}"),
+                );
+            } else {
+                outcome.unregistered = true;
+            }
+            let healthy = outcome.health.as_ref().map_or(false, |health| {
+                health.producer_barrier_complete
+                    && health.drain_completed
+                    && health.wal_durable
+                    && health.event_dropped == 0
+                    && health.userspace_failures == 0
+                    && health.fatal_kernel_flags == 0
+                    && health.pending_remaining == 0
+                    && health.object_pending_remaining == 0
+                    && health.reasons.is_empty()
+            });
+            if !healthy || !outcome.unregistered || outcome.finalization_error.is_some() {
+                reasons.push(format!(
+                    "system-effect recorder cgroup {} did not finalize without loss or error",
+                    outcome.cgroup_id
+                ));
+            }
+        }
+        for outcome in &mut process_lifecycle {
+            if let Err(error) = self
+                .lifecycle_recorder
+                .unregister_ancestor_root(outcome.cgroup_id, self.config.epoch)
+            {
+                append_error(
+                    &mut outcome.finalization_error,
+                    format!("unregister: {error:#}"),
+                );
+            } else {
+                outcome.unregistered = true;
+            }
+            let healthy = outcome.health.as_ref().map_or(false, |health| {
+                health.producer_barrier_complete
+                    && health.drain_completed
+                    && health.wal_durable
+                    && health.event_dropped == 0
+                    && health.userspace_failures == 0
+                    && health.reasons.is_empty()
+            });
+            if !healthy || !outcome.unregistered || outcome.finalization_error.is_some() {
+                reasons.push(format!(
+                    "process-lifecycle recorder cgroup {} did not finalize without loss or error",
+                    outcome.cgroup_id
+                ));
+            }
+        }
+        reasons.sort();
+        reasons.dedup();
+        let result = RecoveryRecorderFinalization {
+            protocol_version: DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION,
+            run_id: self.config.run_id.clone(),
+            epoch: self.config.epoch,
+            root_cgroup_ids: self.plan.root_cgroup_ids.clone(),
+            system_effects,
+            process_lifecycle,
+            endpoint_capture_telemetry: Vec::new(),
+            complete: reasons.is_empty(),
+            reasons,
+        };
+        if self.config.object_resolution_mode
+            == FileObjectResolutionMode::KernelObjectExpandedPartial
+        {
+            let health = SocketStateHealthArtifact::from_outcomes(
+                &self.config.run_id,
+                &self.manifest.boot_id,
+                self.config.epoch,
+                &self.plan.root_cgroup_ids,
+                &result.system_effects,
+            )?;
+            write_json_compact_new(
+                &self.output_directory.join(SOCKET_STATE_HEALTH_NAME),
+                &health,
+            )?;
+        }
+        sync_directory(&self.output_directory)?;
+        Ok(result)
     }
 
     pub fn finish(
@@ -1259,6 +1683,9 @@ impl DeploymentSession {
 }
 
 pub fn run_stdio(config: DeploymentObserverConfig) -> Result<()> {
+    if config.protocol_version == DEPLOYMENT_OBSERVER_RECOVERY_PROTOCOL_VERSION {
+        return crate::recovery_session::run_recovery_stdio(config);
+    }
     let (mut session, ready) = DeploymentSession::prepare(config)?;
     emit_line(&ready)?;
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -1330,14 +1757,14 @@ fn assess_barrier(manifest: &DeploymentManifest) -> RootFreezeBarrier {
     }
 }
 
-fn now_unix_ns() -> u128 {
+pub(crate) fn now_unix_ns() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
 }
 
-fn random_nonce() -> Result<String> {
+pub(crate) fn random_nonce() -> Result<String> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -1390,16 +1817,26 @@ fn duration_ns(duration: Duration, label: &str) -> Result<u64> {
         .with_context(|| format!("{label} exceeds the u64 nanosecond telemetry range"))
 }
 
-fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<ArtifactDigest> {
+pub(crate) fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<ArtifactDigest> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     write_bytes_new(path, &bytes)
 }
 
-fn write_json_compact_new<T: Serialize>(path: &Path, value: &T) -> Result<ArtifactDigest> {
+pub(crate) fn write_json_compact_new<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<ArtifactDigest> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     write_bytes_new(path, &bytes)
+}
+
+pub(crate) fn write_json_canonical_new<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<ArtifactDigest> {
+    write_bytes_new(path, &serde_json::to_vec(value)?)
 }
 
 fn write_bytes_new(path: &Path, bytes: &[u8]) -> Result<ArtifactDigest> {
@@ -1423,7 +1860,7 @@ fn write_bytes_new(path: &Path, bytes: &[u8]) -> Result<ArtifactDigest> {
     })
 }
 
-fn digest_file(path: &Path, relative_path: &str) -> Result<ArtifactDigest> {
+pub(crate) fn digest_file(path: &Path, relative_path: &str) -> Result<ArtifactDigest> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -1465,7 +1902,7 @@ fn digest_file(path: &Path, relative_path: &str) -> Result<ArtifactDigest> {
     })
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -1493,7 +1930,7 @@ fn evidence_status_name(status: crate::AggregateEvidenceStatus) -> &'static str 
     }
 }
 
-fn emit_line<T: Serialize>(message: &T) -> Result<()> {
+pub(crate) fn emit_line<T: Serialize>(message: &T) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     serde_json::to_writer(&mut lock, message)?;
@@ -1502,7 +1939,7 @@ fn emit_line<T: Serialize>(message: &T) -> Result<()> {
     Ok(())
 }
 
-fn read_protocol_line<R: BufRead>(mut reader: R) -> Result<Vec<u8>> {
+pub(crate) fn read_protocol_line<R: BufRead>(mut reader: R) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf()?;

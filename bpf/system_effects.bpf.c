@@ -7,7 +7,11 @@
 
 #include "system_effects.h"
 
+#define EFFECT_MAY_READ 0x4
 #define EFFECT_MAY_WRITE 0x2
+
+/* Userspace rejects pre-access recorder objects for the file-access profile. */
+const volatile __u32 effect_file_access_abi_v1 = 1;
 #define EFFECT_PROT_WRITE 0x2
 #define EFFECT_MAP_SHARED 0x1
 #define EFFECT_MAP_ANONYMOUS 0x20
@@ -646,6 +650,21 @@ static __always_inline int is_file_permission_write_resolver(
 	       pending->domain == 7 && pending->operation == 3;
 }
 
+static __always_inline int is_file_permission_read_resolver(
+	const struct effect_pending_call *pending)
+{
+	return pending->object_resolver ==
+		       EFFECT_OBJECT_RESOLVER_FILE_PERMISSION_READ &&
+	       pending->domain == 7 && pending->operation == 21;
+}
+
+static __always_inline int is_file_permission_resolver(
+	const struct effect_pending_call *pending)
+{
+	return is_file_permission_write_resolver(pending) ||
+	       is_file_permission_read_resolver(pending);
+}
+
 static __always_inline int is_file_resolver(
 	const struct effect_pending_call *pending, __u32 resolver)
 {
@@ -667,6 +686,9 @@ static __always_inline int object_resolver_enabled(
 	if (is_file_permission_write_resolver(pending))
 		return config->resolver_mask &
 		       EFFECT_OBJECT_RESOLVE_FILE_PERMISSION_WRITE;
+	if (is_file_permission_read_resolver(pending))
+		return config->resolver_mask &
+		       EFFECT_OBJECT_RESOLVE_FILE_PERMISSION_READ;
 	if (is_file_resolver(pending,
 			     EFFECT_OBJECT_RESOLVER_PATH_CREATE_PARENT))
 		return config->resolver_mask &
@@ -878,7 +900,7 @@ static __attribute__((noinline)) int record_selected_enter(
 	pending.domain = policy->domain;
 	pending.operation = policy->operation;
 	pending.object_resolver = policy->object_resolver;
-	if (pending.object_resolver > EFFECT_OBJECT_RESOLVER_MPROTECT_FILE_WRITE)
+	if (pending.object_resolver > EFFECT_OBJECT_RESOLVER_FILE_PERMISSION_READ)
 		pending.flags |= EFFECT_F_POLICY_INVALID;
 	pending.args[0] = ctx->arg0;
 	pending.args[1] = ctx->arg1;
@@ -1098,14 +1120,15 @@ int BPF_PROG(trace_effect_file_post_open_object, struct file *file, int mask,
 	return ret;
 }
 
-/* This hook resolves the struct file actually checked by the VFS write path.
- * It is loaded only for the explicit open+write mode. file_permission is not
+/* Resolve the struct file actually checked by the selected VFS read/write path.
+ * The read hook is separately enabled only for the opt-in file-access profile.
+ * file_permission is not
  * a sleepable LSM hook, so this program deliberately records the stable
  * mount/device/inode identity without calling bpf_d_path. Operation and exact
  * cgroup selection precede every object field read.
  */
-static __attribute__((noinline)) int record_file_permission(
-	struct file *file, int ret)
+static __always_inline int record_file_permission_object(
+	struct file *file, int ret, int read_side)
 {
 	struct effect_object_config *config;
 	struct effect_pending_call *pending;
@@ -1123,15 +1146,16 @@ static __attribute__((noinline)) int record_file_permission(
 
 	pid_tgid = bpf_get_current_pid_tgid();
 	pending = bpf_map_lookup_elem(&effect_pending, &pid_tgid);
-	if (!pending || !is_file_permission_write_resolver(pending))
+	if (!pending || !(read_side ? is_file_permission_read_resolver(pending) :
+			 is_file_permission_write_resolver(pending)))
 		return ret;
 	run = bpf_map_lookup_elem(&effect_runs, &pending->cgroup_id);
 	if (!run || !run->epoch || pending->epoch != run->epoch)
 		return ret;
 	config = bpf_map_lookup_elem(&effect_object_config, &config_key);
-	if (!config ||
-	    !(config->resolver_mask &
-	      EFFECT_OBJECT_RESOLVE_FILE_PERMISSION_WRITE))
+	if (!config || !(config->resolver_mask &
+			 (read_side ? EFFECT_OBJECT_RESOLVE_FILE_PERMISSION_READ :
+			  EFFECT_OBJECT_RESOLVE_FILE_PERMISSION_WRITE)))
 		return ret;
 	existing = bpf_map_lookup_elem(&effect_file_objects, &pid_tgid);
 	if (existing) {
@@ -1195,6 +1219,18 @@ static __attribute__((noinline)) int record_file_permission(
 	return ret;
 }
 
+static __attribute__((noinline)) int record_file_permission(
+	struct file *file, int ret)
+{
+	return record_file_permission_object(file, ret, 0);
+}
+
+static __attribute__((noinline)) int record_file_permission_read(
+	struct file *file, int ret)
+{
+	return record_file_permission_object(file, ret, 1);
+}
+
 SEC("lsm/file_permission")
 int BPF_PROG(trace_effect_file_permission, struct file *file, int mask, int ret)
 {
@@ -1202,6 +1238,19 @@ int BPF_PROG(trace_effect_file_permission, struct file *file, int mask, int ret)
 	if (ret || !(mask & EFFECT_MAY_WRITE))
 		return ret;
 	return record_file_permission(file, ret);
+}
+
+/* Keep read-side object work out of legacy profiles, including their global
+ * LSM fast path. Userspace disables autoload and attachment unless both the
+ * file-access profile and a read-capable object-resolution mode are selected.
+ */
+SEC("lsm/file_permission")
+int BPF_PROG(trace_effect_file_permission_read, struct file *file, int mask, int ret)
+{
+	(void)ctx;
+	if (ret || !(mask & EFFECT_MAY_READ))
+		return ret;
+	return record_file_permission_read(file, ret);
 }
 
 static __attribute__((noinline)) int record_path_object(
@@ -1831,17 +1880,13 @@ int BPF_PROG(trace_effect_socket_bind, struct socket *socket, void *address,
 	return ret;
 }
 
-static __attribute__((noinline)) int record_accepted_socket(
+static __attribute__((noinline)) struct sock *record_accepted_socket(
 	struct file *accepted_file)
 {
 	struct effect_pending_call *pending;
 	struct effect_socket_pending *existing;
 	struct effect_socket_pending resolved;
 	struct effect_socket_state_run *state;
-	struct effect_socket_owner *owner;
-	struct effect_socket_state_spec snapshot = {
-		.kind = EFFECT_SOCKET_STATE_ACCEPT_SNAPSHOT,
-	};
 	struct effect_run_state *run = 0;
 	struct effect_sockaddr_in endpoint4 = {};
 	struct effect_sockaddr_in6 endpoint6 = {};
@@ -1955,14 +2000,7 @@ static __attribute__((noinline)) int record_accepted_socket(
 	}
 	__sync_fetch_and_add(&run->object_pending_remaining, 1);
 	register_socket_owner(pending, &resolved.object, 0);
-	owner = bpf_map_lookup_elem(&effect_socket_owners,
-				    &resolved.object.socket_cookie);
-	if (owner && owner->epoch == pending->epoch &&
-	    owner->cgroup_id == pending->cgroup_id &&
-	    owner->origin_attempt_seq == pending->attempt_seq)
-		publish_socket_state(sk, owner, resolved.object.socket_cookie,
-				     &snapshot);
-	return 0;
+	return sk;
 }
 
 SEC("fexit/do_accept")
@@ -1970,13 +2008,38 @@ int BPF_PROG(trace_effect_do_accept_exit, struct file *listener,
 	     struct proto_accept_arg *arg, void *peer_address,
 	     int *peer_address_length, int flags, struct file *accepted_file)
 {
+	struct effect_socket_state_spec snapshot = {
+		.kind = EFFECT_SOCKET_STATE_ACCEPT_SNAPSHOT,
+	};
+	struct effect_pending_call *pending;
+	struct effect_socket_owner *owner;
+	struct sock *sk;
+	__u64 pid_tgid, cookie;
+
 	(void)ctx;
 	(void)listener;
 	(void)arg;
 	(void)peer_address;
 	(void)peer_address_length;
 	(void)flags;
-	return record_accepted_socket(accepted_file);
+	/* Publish after the large object-resolution stack frame has returned.
+	 * Nesting publication and its reader under that frame exceeds the BPF
+	 * cumulative 512-byte stack limit with the supported clang toolchain.
+	 */
+	sk = record_accepted_socket(accepted_file);
+	if (!sk)
+		return 0;
+	pid_tgid = bpf_get_current_pid_tgid();
+	pending = bpf_map_lookup_elem(&effect_pending, &pid_tgid);
+	if (!pending)
+		return 0;
+	cookie = bpf_get_socket_cookie(sk);
+	owner = bpf_map_lookup_elem(&effect_socket_owners, &cookie);
+	if (owner && owner->epoch == pending->epoch &&
+	    owner->cgroup_id == pending->cgroup_id &&
+	    owner->origin_attempt_seq == pending->attempt_seq)
+		publish_socket_state(sk, owner, cookie, &snapshot);
+	return 0;
 }
 
 SEC("tp_btf/inet_sock_set_state")
@@ -2164,7 +2227,7 @@ int trace_effect_file_exit(struct effect_sys_exit *ctx)
 		}
 	}
 
-	if (is_file_permission_write_resolver(&pending) && ctx->ret <= 0) {
+	if (is_file_permission_resolver(&pending) && ctx->ret <= 0) {
 		event_seq = next_sequence(run);
 		publish_result(run, &pending, event_seq, pid_tgid, ctx->ret);
 		return 0;
@@ -2400,12 +2463,12 @@ int trace_effect_expanded_exit(struct effect_sys_exit *ctx)
 		}
 	}
 
-	/* A zero-byte or failed FD write is outside the positive-byte object-
+	/* A zero-byte or failed FD read/write is outside the positive-byte object-
 	 * resolution contract. The hook may have run for scalar zero-length writes,
 	 * so its temporary join is still removed above, but no FILE_OBJECT identity
 	 * is claimed and no statement about other side effects is made.
 	 */
-	if (is_file_permission_write_resolver(&pending) && ctx->ret <= 0) {
+	if (is_file_permission_resolver(&pending) && ctx->ret <= 0) {
 		event_seq = next_sequence(run);
 		publish_result(run, &pending, event_seq, pid_tgid, ctx->ret);
 		return 0;
@@ -2420,7 +2483,7 @@ int trace_effect_expanded_exit(struct effect_sys_exit *ctx)
 	/* Socket resolvers returned above; among the remaining file resolvers only
 	 * file_mprotect can deliberately report UNSUPPORTED.
 	 */
-	/* File-permission writes with nonpositive returns and ineligible mmap calls
+	/* File-permission reads/writes with nonpositive returns and ineligible mmap calls
 	 * already returned before object accounting. Every remaining file resolver
 	 * treats a negative syscall result as an unresolved failed operation. Share
 	 * the unresolved publication tail with deliberate mprotect UNSUPPORTED.

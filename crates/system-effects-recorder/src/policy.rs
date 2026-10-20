@@ -34,6 +34,7 @@ pub enum KernelObjectResolver {
     PathLinkSource = 11,
     SocketAccept = 12,
     MprotectFileWrite = 13,
+    FilePermissionRead = 14,
 }
 
 impl KernelObjectResolver {
@@ -43,6 +44,7 @@ impl KernelObjectResolver {
                 Self::FileOpen
             }
             EffectOperation::FdWrite => Self::FilePermissionWrite,
+            EffectOperation::FdRead => Self::FilePermissionRead,
             EffectOperation::DirectoryCreate
             | EffectOperation::SymlinkCreate
             | EffectOperation::DeviceNodeCreate => Self::PathCreateParent,
@@ -121,6 +123,7 @@ pub enum EffectOperation {
     /// removed directory entry names a non-directory or a directory, and the
     /// fixed ARRAY policy ABI deliberately does not fabricate one answer.
     PathEntryRemove = 20,
+    FdRead = 21,
     SocketCreate = 100,
     SocketConnect = 101,
     SocketBind = 102,
@@ -180,6 +183,7 @@ impl EffectOperation {
             18 => Self::FileSync,
             19 => Self::MemoryWriteChannel,
             20 => Self::PathEntryRemove,
+            21 => Self::FdRead,
             100 => Self::SocketCreate,
             101 => Self::SocketConnect,
             102 => Self::SocketBind,
@@ -225,6 +229,7 @@ pub enum PolicyProfile {
     Control,
     Balanced,
     Full,
+    FileAccess,
 }
 
 impl PolicyProfile {
@@ -233,6 +238,7 @@ impl PolicyProfile {
             Self::Control => "control",
             Self::Balanced => "balanced",
             Self::Full => "full",
+            Self::FileAccess => "file-access",
         }
     }
 }
@@ -251,7 +257,8 @@ impl FromStr for PolicyProfile {
             "control" => Ok(Self::Control),
             "balanced" => Ok(Self::Balanced),
             "full" => Ok(Self::Full),
-            _ => bail!("unknown system-effect profile {value:?}; use control, balanced, or full"),
+            "file-access" => Ok(Self::FileAccess),
+            _ => bail!("unknown system-effect profile {value:?}; use control, balanced, full, or file-access"),
         }
     }
 }
@@ -460,11 +467,12 @@ const fn rank(profile: PolicyProfile) -> u8 {
         PolicyProfile::Control => 0,
         PolicyProfile::Balanced => 1,
         PolicyProfile::Full => 2,
+        PolicyProfile::FileAccess => 3,
     }
 }
 
 pub(crate) fn kernel_policies(profile: PolicyProfile) -> Result<Vec<(u32, KernelPolicy)>> {
-    let specs = specs();
+    let specs = specs_for(profile);
     let mut seen = BTreeSet::new();
     let mut output = Vec::new();
     for spec in specs.into_iter().filter(|spec| spec.enabled_for(profile)) {
@@ -478,7 +486,7 @@ pub(crate) fn kernel_policies(profile: PolicyProfile) -> Result<Vec<(u32, Kernel
 }
 
 pub fn describe_policy(profile: PolicyProfile) -> Result<Vec<PolicyDescription>> {
-    specs()
+    specs_for(profile)
         .into_iter()
         .filter(|spec| spec.enabled_for(profile))
         .map(Spec::describe)
@@ -504,7 +512,10 @@ pub(crate) fn event_policy_identities(
     profile: PolicyProfile,
 ) -> Result<HashMap<i32, EventPolicyIdentity>> {
     let mut identities = HashMap::new();
-    for spec in specs().into_iter().filter(|spec| spec.enabled_for(profile)) {
+    for spec in specs_for(profile)
+        .into_iter()
+        .filter(|spec| spec.enabled_for(profile))
+    {
         let (number, _) = spec.kernel()?;
         let identity = EventPolicyIdentity {
             syscall_name: spec.name,
@@ -519,6 +530,19 @@ pub(crate) fn event_policy_identities(
         }
     }
     Ok(identities)
+}
+
+fn specs_for(profile: PolicyProfile) -> Vec<Spec> {
+    let mut list = specs();
+    if profile == PolicyProfile::FileAccess {
+        for spec in &mut list {
+            if matches!(spec.name, "open" | "openat") {
+                spec.filter = None;
+                spec.operation = EffectOperation::FileOpenRequest;
+            }
+        }
+    }
+    list
 }
 
 fn specs() -> Vec<Spec> {
@@ -560,6 +584,11 @@ fn specs() -> Vec<Spec> {
             Control,
         )
         .paths(1, None),
+        Spec::new(libc::SYS_read, "read", Io, FdRead, FileAccess),
+        Spec::new(libc::SYS_pread64, "pread64", Io, FdRead, FileAccess),
+        Spec::new(libc::SYS_readv, "readv", Io, FdRead, FileAccess),
+        Spec::new(libc::SYS_preadv, "preadv", Io, FdRead, FileAccess),
+        Spec::new(libc::SYS_preadv2, "preadv2", Io, FdRead, FileAccess),
         Spec::new(libc::SYS_write, "write", Io, FdWrite, Balanced),
         Spec::new(libc::SYS_pwrite64, "pwrite64", Io, FdWrite, Balanced),
         Spec::new(libc::SYS_writev, "writev", Io, FdWrite, Balanced),
@@ -1194,6 +1223,71 @@ fn specs() -> Vec<Spec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_profile_preserves_existing_operation_and_policy_map_abi() {
+        assert_eq!(EffectOperation::FdWrite as u32, 3);
+        assert_eq!(EffectOperation::FdRead as u32, 21);
+        assert_eq!(KernelObjectResolver::MprotectFileWrite as u8, 13);
+        assert_eq!(KernelObjectResolver::FilePermissionRead as u8, 14);
+        assert_eq!(std::mem::size_of::<KernelPolicy>(), 32);
+        assert_eq!(
+            PolicyProfile::from_str("file-access").unwrap(),
+            PolicyProfile::FileAccess
+        );
+        assert!(PolicyProfile::from_str("file_access").is_err());
+        for profile in [
+            PolicyProfile::Control,
+            PolicyProfile::Balanced,
+            PolicyProfile::Full,
+        ] {
+            let direct = specs()
+                .into_iter()
+                .filter(|spec| spec.enabled_for(profile))
+                .map(Spec::describe)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(describe_policy(profile).unwrap(), direct);
+            assert!(!direct
+                .iter()
+                .any(|policy| policy.operation == EffectOperation::FdRead));
+        }
+    }
+
+    #[test]
+    fn file_access_captures_ordinary_opens_and_all_read_variants() {
+        let access = describe_policy(PolicyProfile::FileAccess).unwrap();
+        for name in ["openat", "openat2"] {
+            let open = access
+                .iter()
+                .find(|policy| policy.syscall_name == name)
+                .unwrap();
+            assert_eq!(open.operation, EffectOperation::FileOpenRequest);
+            assert_eq!(open.kernel_filter, None);
+        }
+        for name in ["read", "pread64", "readv", "preadv", "preadv2"] {
+            let read = access
+                .iter()
+                .find(|policy| policy.syscall_name == name)
+                .unwrap();
+            assert_eq!(read.operation, EffectOperation::FdRead);
+            assert_eq!(
+                read.object_resolver,
+                KernelObjectResolver::FilePermissionRead
+            );
+        }
+        let full = describe_policy(PolicyProfile::Full).unwrap();
+        assert!(!full
+            .iter()
+            .any(|policy| policy.operation == EffectOperation::FdRead));
+        assert!(full
+            .iter()
+            .find(|policy| policy.syscall_name == "openat")
+            .unwrap()
+            .kernel_filter
+            .is_some());
+        kernel_policies(PolicyProfile::FileAccess).unwrap();
+    }
 
     #[test]
     fn profiles_are_ordered_and_have_unique_native_numbers() {

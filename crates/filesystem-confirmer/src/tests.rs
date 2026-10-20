@@ -620,3 +620,47 @@ fn a_cross_environment_pair_is_inconclusive() {
     );
     assert_eq!(result.verdict, FilesystemVerdict::Inconclusive);
 }
+
+#[test]
+fn generic_comparison_binds_all_recovery_phase_pairs() {
+    let directory = TestDirectory::new("phase-pairs");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    fs::write(root.join("file"), b"same").expect("write file");
+    let scope = default_scope(&root);
+    let template = snapshot(&scope, "phase-template", SnapshotPhase::A);
+
+    for (index, (before_phase, after_phase)) in [
+        (SnapshotPhase::A, SnapshotPhase::B),
+        (SnapshotPhase::B, SnapshotPhase::C),
+        (SnapshotPhase::A, SnapshotPhase::C),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut before = template.clone();
+        before.phase = before_phase;
+        before.snapshot_id = format!("phase-before-{index}");
+        let mut after = template.clone();
+        after.phase = after_phase;
+        after.snapshot_id = format!("phase-after-{index}");
+
+        let comparison = compare_phases(&before, &after, before_phase, after_phase, None)
+            .expect("compare recovery phase pair");
+        assert_eq!(comparison.s0_snapshot_id, before.snapshot_id);
+        assert_eq!(comparison.s1_snapshot_id, after.snapshot_id);
+    }
+}
+
+#[test]
+fn generic_comparison_rejects_same_or_misbound_phases() {
+    let directory = TestDirectory::new("invalid-phase-pair");
+    let root = directory.path.join("scope");
+    fs::create_dir(&root).expect("create scope root");
+    let scope = default_scope(&root);
+    let before = snapshot(&scope, "invalid-before", SnapshotPhase::A);
+    let after = snapshot(&scope, "invalid-after", SnapshotPhase::B);
+
+    assert!(compare_phases(&before, &after, SnapshotPhase::A, SnapshotPhase::A, None,).is_err());
+    assert!(compare_phases(&before, &after, SnapshotPhase::B, SnapshotPhase::C, None,).is_err());
+}

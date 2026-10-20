@@ -47,6 +47,36 @@ Oracle `solution/solve.sh`. The selection is pinned to Terminal-Bench tag
 The bridge currently targets Harbor `0.23.0`; record and pin the exact installed
 Harbor package/source revision for every experiment. It requires Python 3.12+.
 
+Harbor's Dockerfile-only default now uses `docker run`. The bridge explicitly
+passes an empty `main` Compose overlay using `EnvironmentConfig.extra_docker_compose`
+so its exact Compose-label identity contract applies. This overlay is stored in
+the campaign directory, leaves the pinned task inputs unchanged, and is not
+propagated to the separate verifier environment.
+
+Operation collection and performance profiling are separate: the optional
+`allox-load-sampler` records measurement data, not Observer WAL/manifest evidence.
+Build its optional latency probes with `make kernel-hist-bpf` from the Observer
+project root. The upstream development-VM notes are not bundled in this checkout.
+
+The imported sampler is an experimental profiling tool. Basic sampling does not
+load BPF; `--kernel-hist-object` explicitly enables the additional probes. Keep
+these measurement limitations in mind:
+
+- `blk` and `irq` metrics describe the whole target Linux, not one Agent.
+- Optional `--kernel-hist-runtime-stats` enables BPF runtime accounting globally
+  while it holds its stats descriptor; the default is off. That accounting also
+  adds cost to other BPF programs, including Observer; sampler program runtime
+  alone is not the total added overhead.
+- `blk_service` currently ends at the first completion notification, which may
+  be a partial completion. Do not interpret it as full-request service latency.
+- Kernel-hist cgroup matching assumes a canonical path below the full host
+  `/sys/fs/cgroup` mount, in the host cgroup namespace, with depth at most 31.
+- `mean_sample_cost_ns` covers counter collection, not all JSON writing,
+  flushing, or process scanning. Use paired task timing, sampler CPU/RSS, and
+  missed ticks to assess overall overhead.
+
+These measurements are not inputs to the recovery verdict or evidence verifier.
+
 ## Preconditions
 
 - Run inside the disposable target Linux VM, not against remote Docker or

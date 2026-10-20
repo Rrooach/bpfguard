@@ -60,6 +60,7 @@ is:
   "object_resolution_mode": "KERNEL_OBJECT_EXPANDED_PARTIAL",
   "bpf_state_scope": null,
   "filesystem_state_scope": null,
+  "filesystem_namespace_mode": "DEPLOYMENT",
   "linux_state_scope": {
     "protocol_version": 1,
     "sysctl": {
@@ -83,6 +84,15 @@ is:
 }
 ```
 
+For file access accounting, set `profile` to `"file-access"` and rebuild the
+observer and system-effect BPF object together. Expanded mode additionally
+resolves selected positive-byte reads. After deployment verification,
+`bpf-state-observer file-access-report --wal <run>/system-effects.raw.bin`
+provides object counts, returned bytes and per-call syscall elapsed time.
+See [usage and accounting boundaries](../../README.md#file-access-counts-bytes-and-latency).
+This is a bounded diagnostic projection, not the separate high-volume
+large-repository file-access collector.
+
 All three state scopes are optional; use `null` or omit one to disable that
 domain. `bpf_state_scope` is the existing state-oracle `ClaimScope`, and
 `filesystem_state_scope` is the existing filesystem-confirmer scope. The
@@ -92,6 +102,15 @@ to recursively scan an image. A host path must be supplied as an explicit,
 bounded scope whose stable identity was established externally. The evidence
 directory must be outside every filesystem root, both lexically and after
 symlink resolution.
+
+`filesystem_namespace_mode` defaults to `DEPLOYMENT`, which retains the
+authoritative target mount namespace for every filesystem capture. The
+`OBSERVER` mode is accepted only by protocol v3 with both recovery and a
+filesystem scope enabled. It captures A/B/C through the Observer's current
+mount namespace so a host-visible Btrfs `current` subvolume replacement can be
+seen at C. Offline verification then requires all three snapshots to use the
+`CURRENT_PROCESS` capture source and the same nonzero mount namespace/root
+identity; it does not relabel that host view as a deployment mount namespace.
 
 For example, a bounded BPF inventory and one explicit filesystem tree can be
 enabled with:

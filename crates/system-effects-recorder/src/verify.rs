@@ -27,6 +27,11 @@ const OBJECT_FLAGS: u32 = FLAG_OBJECT_JOIN_MISSING
     | FLAG_OBJECT_PATH_UNAVAILABLE
     | FLAG_OBJECT_UNSUPPORTED;
 
+const OBJECT_FAILURE_FLAGS: u32 = FLAG_OBJECT_JOIN_MISSING
+    | FLAG_OBJECT_JOIN_AMBIGUOUS
+    | FLAG_OBJECT_READ_FAILED
+    | FLAG_OBJECT_DELETE_FAILED;
+
 const FATAL_CORRELATION_FLAGS: u32 = FLAG_PENDING_INSERT_FAILED
     | FLAG_PENDING_MISSING
     | FLAG_PENDING_POISONED
@@ -292,7 +297,10 @@ pub fn verify_system_effect_artifacts(
     })
 }
 
-fn validate_policy_selection(event: &KernelEvent, policy: EventPolicyIdentity) -> Result<()> {
+pub(crate) fn validate_policy_selection(
+    event: &KernelEvent,
+    policy: EventPolicyIdentity,
+) -> Result<()> {
     if event.domain != policy.domain as u16 || event.operation != policy.operation as u32 {
         bail!("system-effect event identity disagrees with frozen policy");
     }
@@ -317,7 +325,9 @@ fn validate_object_mode(
         }
         FileObjectResolutionMode::KernelFileOpenWritePartial => matches!(
             resolver,
-            KernelObjectResolver::FileOpen | KernelObjectResolver::FilePermissionWrite
+            KernelObjectResolver::FileOpen
+                | KernelObjectResolver::FilePermissionWrite
+                | KernelObjectResolver::FilePermissionRead
         ),
         FileObjectResolutionMode::KernelObjectExpandedPartial => {
             resolver != KernelObjectResolver::None
@@ -328,7 +338,8 @@ fn validate_object_mode(
         && is_result
         && match resolver {
             KernelObjectResolver::None => false,
-            KernelObjectResolver::FilePermissionWrite => event.return_value > 0,
+            KernelObjectResolver::FilePermissionWrite
+            | KernelObjectResolver::FilePermissionRead => event.return_value > 0,
             KernelObjectResolver::MmapFileWrite => mmap_object_eligible(event),
             KernelObjectResolver::FileOpen
             | KernelObjectResolver::PathCreateParent
@@ -374,6 +385,17 @@ fn validate_object_mode(
             || event.socket_object.is_some()
         {
             bail!("unsupported object result has an impossible resolver or retained identity");
+        }
+        return Ok(());
+    }
+
+    // An explicitly disclosed resolver failure is valid incomplete evidence.
+    // Verify its canonical UNRESOLVED projection and count the raw fatal flag;
+    // the enclosing report must retain the same failure count and health.
+    // Missing identities without such a flag remain an invalid downgrade.
+    if event.flags & OBJECT_FAILURE_FLAGS != 0 {
+        if event.file_object.is_some() || event.socket_object.is_some() {
+            bail!("failed object resolution retained kernel object evidence");
         }
         return Ok(());
     }
@@ -532,6 +554,48 @@ mod tests {
 
     const BOOT_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn read_permission_identity_requires_positive_result_and_enabled_mode() {
+        let mut result = event(EVENT_OPERATION_RESULT, 2);
+        result.domain = crate::EffectDomain::Io as u16;
+        result.operation = crate::EffectOperation::FdRead as u32;
+        result.syscall_nr = libc::SYS_read as i32;
+        result.return_value = 5;
+        result.args[2] = 5;
+        result.file_object = Some(file_object(100));
+        result.validate().unwrap();
+        let resolver = KernelObjectResolver::FilePermissionRead;
+        for mode in [
+            FileObjectResolutionMode::KernelFileOpenWritePartial,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        ] {
+            validate_object_mode(&result, resolver, mode).unwrap();
+        }
+        for mode in [
+            FileObjectResolutionMode::UserInput,
+            FileObjectResolutionMode::KernelFileOpenPartial,
+        ] {
+            assert!(validate_object_mode(&result, resolver, mode).is_err());
+        }
+        for value in [0, -libc::EACCES as i64] {
+            result.return_value = value;
+            assert!(result.validate().is_err());
+        }
+        result.file_object = None;
+        result.return_value = 5;
+        result.flags = FLAG_OBJECT_JOIN_MISSING;
+        result.validate().unwrap();
+        validate_object_mode(
+            &result,
+            resolver,
+            FileObjectResolutionMode::KernelFileOpenWritePartial,
+        )
+        .unwrap();
+        assert!(
+            validate_object_mode(&result, resolver, FileObjectResolutionMode::UserInput).is_err()
+        );
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -803,15 +867,106 @@ mod tests {
         assert!(verify_system_effect_artifacts(&wal, &jsonl, &binding).is_err());
 
         pair[1].socket_object = None;
-        pair[1].flags = FLAG_OBJECT_JOIN_MISSING;
-        let directory = TestDirectory::new();
-        let (wal, jsonl, binding, _) = write_artifacts(&directory, &pair);
-        assert!(verify_system_effect_artifacts(&wal, &jsonl, &binding).is_err());
+        pair[1].flags = FLAG_OBJECT_PATH_UNAVAILABLE;
+        assert!(validate_object_mode(
+            &pair[1],
+            KernelObjectResolver::PathCreateParent,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        )
+        .is_err());
+    }
 
+    #[test]
+    fn disclosed_object_failures_replay_as_unresolved_and_count_once_per_event() {
+        for syscall in [libc::SYS_setxattr as i32, libc::SYS_openat as i32] {
+            for flags in [
+                FLAG_OBJECT_JOIN_MISSING,
+                FLAG_OBJECT_JOIN_AMBIGUOUS,
+                FLAG_OBJECT_READ_FAILED,
+                FLAG_OBJECT_DELETE_FAILED,
+                FLAG_OBJECT_JOIN_MISSING | FLAG_OBJECT_JOIN_AMBIGUOUS,
+            ] {
+                let mut pair = selected_pair(syscall, 1);
+                pair[1].flags = flags;
+                if syscall == libc::SYS_openat as i32 {
+                    pair[1].return_value = 6;
+                }
+                let directory = TestDirectory::new();
+                let (wal, jsonl, binding, projected) = write_artifacts(&directory, &pair);
+                let verified = verify_system_effect_artifacts(&wal, &jsonl, &binding).unwrap();
+                assert!(verified.jsonl_projection_verified);
+                assert!(verified.runs[0].pairing_complete);
+                assert_eq!(verified.runs[0].fatal_correlation_events, 1);
+                let resolution = serde_json::to_value(&projected[1].object_resolution).unwrap();
+                assert_eq!(resolution["quality"], "UNRESOLVED");
+                assert_eq!(resolution["objects"], serde_json::json!([]));
+            }
+        }
+    }
+
+    #[test]
+    fn disclosed_failure_cannot_be_promoted_in_json_or_keep_an_object_identity() {
+        let mut pair = selected_pair(libc::SYS_setxattr as i32, 1);
         pair[1].flags = FLAG_OBJECT_JOIN_AMBIGUOUS;
         let directory = TestDirectory::new();
-        let (wal, jsonl, binding, _) = write_artifacts(&directory, &pair);
+        let (wal, jsonl, binding, projected) = write_artifacts(&directory, &pair);
+        let mut forged = projected
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
+        forged[1]["object_resolution"]["quality"] = serde_json::json!("KERNEL_RESOLVED");
+        let mut json = Vec::new();
+        for value in forged {
+            json.extend_from_slice(&serde_json::to_vec(&value).unwrap());
+            json.push(b'\n');
+        }
+        std::fs::write(&jsonl, json).unwrap();
         assert!(verify_system_effect_artifacts(&wal, &jsonl, &binding).is_err());
+
+        pair[1].file_object = Some(file_object(101));
+        assert!(pair[1].validate().is_err());
+        assert!(validate_object_mode(
+            &pair[1],
+            KernelObjectResolver::InodeXattr,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        )
+        .is_err());
+
+        pair[1].file_object = None;
+        assert!(validate_object_mode(
+            &pair[1],
+            KernelObjectResolver::InodeXattr,
+            FileObjectResolutionMode::UserInput,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn failed_socket_disclosed_resolution_failure_stays_unresolved_and_mode_bound() {
+        let mut pair = selected_pair(libc::SYS_connect as i32, 1);
+        pair[1].return_value = -i64::from(libc::EACCES);
+        pair[1].flags = FLAG_OBJECT_JOIN_MISSING;
+        let directory = TestDirectory::new();
+        let (wal, jsonl, binding, projected) = write_artifacts(&directory, &pair);
+        let verified = verify_system_effect_artifacts(&wal, &jsonl, &binding).unwrap();
+        assert_eq!(verified.runs[0].fatal_correlation_events, 1);
+        let resolution = serde_json::to_value(&projected[1].object_resolution).unwrap();
+        assert_eq!(resolution["quality"], "UNRESOLVED");
+        assert_eq!(resolution["objects"], serde_json::json!([]));
+        assert!(validate_object_mode(
+            &pair[1],
+            KernelObjectResolver::SocketConnect,
+            FileObjectResolutionMode::KernelFileOpenPartial,
+        )
+        .is_err());
+        pair[1].socket_object = Some(socket_object(crate::EffectOperation::SocketConnect));
+        assert!(pair[1].validate().is_err());
+        assert!(validate_object_mode(
+            &pair[1],
+            KernelObjectResolver::SocketConnect,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,0 +1,10 @@
+{
+  "html-js-filter": {
+    "agent": "sha256:56882dcd9c6a66c1e6674720ed45811426fc9679bf92ecb5f5fb1df1e1991cd1",
+    "verifier": "sha256:16e76e859b1230f8dcb52d399550f08bdf35f0496d631065f4c7117c410990ab"
+  },
+  "bun-sourcemap-leak": {
+    "agent": "sha256:03e02d75aba49f5044140a71996d81ca1ea114a510157702f9ee5cc0daaa9887",
+    "verifier": "sha256:d3febf4981a62eb032832b848e0333c03255b75c54a5fd448e0f8d0e36ebbdf8"
+  }
+}

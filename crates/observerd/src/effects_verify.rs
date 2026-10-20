@@ -1873,7 +1873,9 @@ fn replay_object_resolution(
         ObjectResolutionMode::KernelFileOpenPartial => resolver == KernelObjectResolver::FileOpen,
         ObjectResolutionMode::KernelFileOpenWritePartial => matches!(
             resolver,
-            KernelObjectResolver::FileOpen | KernelObjectResolver::FilePermissionWrite
+            KernelObjectResolver::FileOpen
+                | KernelObjectResolver::FilePermissionWrite
+                | KernelObjectResolver::FilePermissionRead
         ),
         ObjectResolutionMode::KernelObjectExpandedPartial => resolver != KernelObjectResolver::None,
     };
@@ -1881,7 +1883,8 @@ fn replay_object_resolution(
         && enabled
         && match resolver {
             KernelObjectResolver::None => false,
-            KernelObjectResolver::FilePermissionWrite => raw.return_value > 0,
+            KernelObjectResolver::FilePermissionWrite
+            | KernelObjectResolver::FilePermissionRead => raw.return_value > 0,
             KernelObjectResolver::MmapFileWrite => mmap_object_eligible(raw),
             KernelObjectResolver::FileOpen
             | KernelObjectResolver::PathCreateParent

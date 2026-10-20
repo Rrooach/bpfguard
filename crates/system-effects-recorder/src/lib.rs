@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+pub mod access;
 mod ancestor;
 pub mod delegation;
 pub mod lifecycle;
@@ -88,6 +89,7 @@ const PROGRAM_FILE_EXIT: &str = "trace_effect_file_exit";
 const PROGRAM_EXPANDED_EXIT: &str = "trace_effect_expanded_exit";
 const PROGRAM_FILE_OBJECT: &str = "trace_effect_file_post_open_object";
 const PROGRAM_FILE_PERMISSION: &str = "trace_effect_file_permission";
+const PROGRAM_FILE_PERMISSION_READ: &str = "trace_effect_file_permission_read";
 const PROGRAM_ACCEPT_EXIT: &str = "trace_effect_do_accept_exit";
 const PROGRAM_INET_STATE: &str = "trace_effect_inet_sock_set_state";
 const PROGRAM_TCP_DESTROY: &str = "trace_effect_tcp_destroy_sock";
@@ -133,6 +135,7 @@ const PROGRAM_EXPANDED_OBJECT_HOOKS: &[&str] = &[
 
 const OBJECT_RESOLVE_FILE_OPEN: u32 = 1 << 0;
 const OBJECT_RESOLVE_FILE_PERMISSION_WRITE: u32 = 1 << 1;
+const OBJECT_RESOLVE_FILE_PERMISSION_READ: u32 = 1 << 13;
 const OBJECT_RESOLVE_EXPANDED: u32 = ((1 << 13) - 1) & !((1 << 2) - 1);
 
 const MAX_RUNS: u32 = 1024;
@@ -228,6 +231,19 @@ impl FileObjectResolutionMode {
                     | OBJECT_RESOLVE_EXPANDED
             }
         }
+    }
+
+    fn read_permission_enabled(self, profile: PolicyProfile) -> bool {
+        profile == PolicyProfile::FileAccess && self.kernel_file_write_enabled()
+    }
+
+    fn resolver_mask_for_profile(self, profile: PolicyProfile) -> u32 {
+        self.resolver_mask()
+            | if self.read_permission_enabled(profile) {
+                OBJECT_RESOLVE_FILE_PERMISSION_READ
+            } else {
+                0
+            }
     }
 }
 
@@ -508,6 +524,7 @@ impl SystemEffectRecorder {
 
         let (object_bytes, object_sha256) = read_object(object_path)?;
         verify_digest(&object_sha256, expected_object_sha256)?;
+        require_profile_object_support(&object_bytes, profile)?;
         let object = unsafe {
             libbpf::bpf_object__open_mem(
                 object_bytes.as_ptr().cast(),
@@ -517,7 +534,7 @@ impl SystemEffectRecorder {
         };
         check_pointer(object.cast(), "open system-effect BPF object")?;
         let mut resources = KernelResources::new(object);
-        configure_object_autoload(resources.object, object_resolution_mode)?;
+        configure_object_autoload(resources.object, object_resolution_mode, profile)?;
         check_rc(
             unsafe { libbpf::bpf_object__load(resources.object) },
             "load system-effect BPF object",
@@ -639,7 +656,7 @@ impl SystemEffectRecorder {
                 .with_flags(0),
             )?;
             let config = ObjectConfig {
-                resolver_mask: object_resolution_mode.resolver_mask(),
+                resolver_mask: object_resolution_mode.resolver_mask_for_profile(profile),
                 capture_path: 1,
             };
             map_update(config_fd, &0u32, &config, libbpf::BPF_ANY as u64)
@@ -718,6 +735,9 @@ impl SystemEffectRecorder {
             attach_lsm(&mut resources, PROGRAM_FILE_OBJECT)?;
             if object_resolution_mode.kernel_file_write_enabled() {
                 attach_lsm(&mut resources, PROGRAM_FILE_PERMISSION)?;
+            }
+            if object_resolution_mode.read_permission_enabled(profile) {
+                attach_lsm(&mut resources, PROGRAM_FILE_PERMISSION_READ)?;
             }
             if object_resolution_mode.expanded_object_enabled() {
                 for program in PROGRAM_EXPANDED_OBJECT_HOOKS {
@@ -1865,6 +1885,9 @@ pub fn coverage_gaps_for(
                 .to_owned(),
         );
     }
+    if profile == PolicyProfile::FileAccess {
+        gaps.push("file-access resolves positive-byte read/pread64/readv/preadv/preadv2 via file_permission in open-write or expanded modes; it covers native open and read/write families; mmap loads, access/stat, getdents, io_uring and transfer source/destination bytes are not file-access records; zero-byte and failed I/O have no resolved file identity".to_owned());
+    }
     match profile {
         PolicyProfile::Control => gaps.push(
             "control profile omits write/send data-path syscalls and noisy generic interfaces"
@@ -1874,7 +1897,7 @@ pub fn coverage_gaps_for(
             "balanced profile omits mmap/mprotect, fsync, ioctl, prctl, and setsockopt events"
                 .to_owned(),
         ),
-        PolicyProfile::Full => {}
+        PolicyProfile::Full | PolicyProfile::FileAccess => {}
     }
     gaps
 }
@@ -2062,6 +2085,7 @@ fn set_map_autocreate(object: *mut libbpf::bpf_object, name: &str, autocreate: b
 fn configure_object_autoload(
     object: *mut libbpf::bpf_object,
     mode: FileObjectResolutionMode,
+    profile: PolicyProfile,
 ) -> Result<()> {
     let kernel_file_object = mode.kernel_file_object_enabled();
     set_program_autoload(object, PROGRAM_EXIT, !kernel_file_object)?;
@@ -2081,6 +2105,20 @@ fn configure_object_autoload(
         PROGRAM_FILE_PERMISSION,
         mode.kernel_file_write_enabled(),
     )?;
+    // Old BPF objects remain usable for the unchanged legacy profiles. New
+    // objects must never attach the extra global read hook by default.
+    let read_name = CString::new(PROGRAM_FILE_PERMISSION_READ).unwrap();
+    let read_program =
+        unsafe { libbpf::bpf_object__find_program_by_name(object, read_name.as_ptr()) };
+    let read_enabled = mode.read_permission_enabled(profile);
+    if !read_program.is_null() {
+        check_rc(
+            unsafe { libbpf::bpf_program__set_autoload(read_program, read_enabled) },
+            "set opt-in read-permission object hook autoload",
+        )?;
+    } else if read_enabled {
+        bail!("file-access object resolution requires the read-permission BPF hook");
+    }
     for program in PROGRAM_EXPANDED_OBJECT_HOOKS {
         set_program_autoload(object, program, mode.expanded_object_enabled())?;
     }
@@ -2102,6 +2140,20 @@ fn configure_object_autoload(
     if !kernel_file_object {
         set_map_autocreate(object, MAP_OBJECT_CONFIG, false)?;
         set_map_autocreate(object, MAP_FILE_OBJECTS, false)?;
+    }
+    Ok(())
+}
+
+fn require_profile_object_support(object_bytes: &[u8], profile: PolicyProfile) -> Result<()> {
+    // Compatibility marker only, not authentication. Expected object SHA and
+    // actual libbpf map/program ABI validation remain independently required.
+    const MARKER: &[u8] = b"effect_file_access_abi_v1\0";
+    if profile == PolicyProfile::FileAccess
+        && !object_bytes
+            .windows(MARKER.len())
+            .any(|part| part == MARKER)
+    {
+        bail!("file-access requires a rebuilt recorder with effect_file_access_abi_v1");
     }
     Ok(())
 }
@@ -2345,6 +2397,71 @@ fn libbpf_error(rc: c_int) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_are_opt_in_and_legacy_object_masks_remain_unchanged() {
+        for mode in [
+            FileObjectResolutionMode::UserInput,
+            FileObjectResolutionMode::KernelFileOpenPartial,
+            FileObjectResolutionMode::KernelFileOpenWritePartial,
+            FileObjectResolutionMode::KernelObjectExpandedPartial,
+        ] {
+            for profile in [
+                PolicyProfile::Control,
+                PolicyProfile::Balanced,
+                PolicyProfile::Full,
+            ] {
+                assert!(!mode.read_permission_enabled(profile));
+                assert_eq!(
+                    mode.resolver_mask_for_profile(profile),
+                    mode.resolver_mask()
+                );
+                assert_eq!(
+                    mode.resolver_mask_for_profile(profile) & OBJECT_RESOLVE_FILE_PERMISSION_READ,
+                    0
+                );
+            }
+            assert_eq!(
+                mode.read_permission_enabled(PolicyProfile::FileAccess),
+                mode.kernel_file_write_enabled()
+            );
+            assert_eq!(
+                mode.resolver_mask_for_profile(PolicyProfile::FileAccess)
+                    & OBJECT_RESOLVE_FILE_PERMISSION_READ
+                    != 0,
+                mode.kernel_file_write_enabled()
+            );
+        }
+        assert_eq!(OBJECT_RESOLVE_FILE_PERMISSION_READ, 1 << 13);
+        assert_eq!(
+            OBJECT_RESOLVE_EXPANDED & OBJECT_RESOLVE_FILE_PERMISSION_READ,
+            0
+        );
+        assert_eq!(std::mem::size_of::<ObjectConfig>(), 8);
+    }
+
+    #[test]
+    fn legacy_objects_are_rejected_only_for_explicit_new_profile() {
+        let old = b"ELF_without_the_new_optional_program";
+        for profile in [
+            PolicyProfile::Control,
+            PolicyProfile::Balanced,
+            PolicyProfile::Full,
+        ] {
+            require_profile_object_support(old, profile).unwrap();
+        }
+        for bytes in [
+            old.as_slice(),
+            b"effect_file_access_abi\0",
+            b"effect_file_access_abi_v2\0",
+            b"effect_file_access_abi_v1_suffix\0",
+            b"effect_file_access_abi_v1",
+        ] {
+            assert!(require_profile_object_support(bytes, PolicyProfile::FileAccess).is_err());
+        }
+        require_profile_object_support(b"effect_file_access_abi_v1\0", PolicyProfile::FileAccess)
+            .unwrap();
+    }
 
     fn callback_fixture() -> KernelEvent {
         KernelEvent {

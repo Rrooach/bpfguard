@@ -5,9 +5,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import bridge
 
@@ -21,6 +25,84 @@ class ComposeNameTests(unittest.TestCase):
         self.assertEqual(bridge.sanitize_compose_project_name("Trial.Name"), "trial-name")
         self.assertEqual(bridge.sanitize_compose_project_name("_Trial"), "0_trial")
         self.assertEqual(bridge.sanitize_compose_project_name("A/B:C"), "a-b-c")
+
+
+class ComposeOverlayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_trials_passes_campaign_overlay_to_harbor(self) -> None:
+        modules = {
+            name: ModuleType(name)
+            for name in (
+                "harbor", "harbor.models", "harbor.models.environment_type",
+                "harbor.models.trial", "harbor.models.trial.config",
+                "harbor.trial", "harbor.trial.hooks", "harbor.trial.trial",
+            )
+        }
+        modules["harbor.models.environment_type"].EnvironmentType = SimpleNamespace(
+            DOCKER="docker"
+        )
+        for name in ("AgentConfig", "EnvironmentConfig", "TaskConfig", "TrialConfig"):
+            setattr(modules["harbor.models.trial.config"], name, SimpleNamespace)
+        modules["harbor.trial.hooks"].TrialEvent = SimpleNamespace()
+        # Stop at Harbor's creation boundary: this test only exercises config
+        # preparation, and must never launch a container or observer process.
+        create = AsyncMock(side_effect=RuntimeError("stop after configuration"))
+        modules["harbor.trial.trial"].Trial = SimpleNamespace(create=create)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = root / "task"
+            task.mkdir()
+            arguments = SimpleNamespace(
+                expected_harbor_version=bridge.SUPPORTED_HARBOR_VERSION,
+                harbor_source_revision=bridge.SUPPORTED_HARBOR_SOURCE_REVISION,
+                selection_manifest=root / "selection.json",
+                selection_manifest_sha256=HEX_A,
+                task=[task],
+                evidence_root=root / "campaign",
+                trials_dir=root / "trials",
+                run_label="compose-test",
+                expected_reward=1.0,
+                ready_timeout=1.0,
+                finish_timeout=1.0,
+                docker_timeout=1.0,
+                fail_fast=True,
+            )
+            for name in ("observer", "verifier", "recorder", "lifecycle", "ip", "tc", "nft"):
+                suffix = "object" if name in ("recorder", "lifecycle") else "binary"
+                setattr(arguments, f"{name}_{suffix}", root / name)
+                setattr(arguments, f"{name}_sha256", HEX_A)
+            docker = AsyncMock(return_value={"OSType": "linux"})
+            mocks = (
+                patch.dict(sys.modules, modules),
+                patch.object(bridge.os, "geteuid", return_value=0),
+                patch.object(
+                    bridge, "version", return_value=bridge.SUPPORTED_HARBOR_VERSION
+                ),
+                patch.object(bridge, "validate_selection_manifest", return_value={}),
+                patch.object(
+                    bridge, "validate_trusted_file", side_effect=lambda path, *_: path
+                ),
+                patch.object(
+                    bridge, "validate_network_collector", side_effect=lambda path, *_: path
+                ),
+                patch.object(bridge, "docker_json", new=docker),
+                patch("builtins.print"),
+            )
+            with ExitStack() as stack:
+                for mocked in mocks:
+                    stack.enter_context(mocked)
+                self.assertEqual(await bridge.run_trials(arguments), 1)
+
+            create.assert_awaited_once()
+            config = create.await_args.args[0]
+            overlay = arguments.evidence_root / "observer-compose.yaml"
+            self.assertEqual(config.environment.extra_docker_compose, [overlay])
+            self.assertEqual(config.environment.type, "docker")
+            self.assertTrue(config.environment.delete)
+            self.assertEqual(overlay.read_bytes(), b"services:\n  main: {}\n")
+            self.assertEqual(config.task.path, task)
+            self.assertEqual(list(task.iterdir()), [])
+            docker.assert_awaited_once_with("info", "--format", "{{json .}}", timeout=30)
 
 
 class CgroupTests(unittest.TestCase):

@@ -348,6 +348,9 @@ fn validate_absolute_path(bytes: &[u8]) -> Result<()> {
 pub enum SnapshotPhase {
     S0,
     S1,
+    A,
+    B,
+    C,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1180,7 +1183,11 @@ pub struct FilesystemComparison {
     pub protocol_version: u32,
     pub domain: String,
     pub scope_sha256: String,
+    /// Legacy wire name retained for compatibility. Generic pair comparisons
+    /// store the before-snapshot identifier here.
     pub s0_snapshot_id: String,
+    /// Legacy wire name retained for compatibility. Generic pair comparisons
+    /// store the after-snapshot identifier here.
     pub s1_snapshot_id: String,
     pub endpoint_difference: EndpointDifferenceStatus,
     pub verdict: FilesystemVerdict,
