@@ -1024,15 +1024,22 @@ pub fn verify_socket_state_artifacts(
         })
         .collect();
     let mut origin_links_verified = 0u64;
+    let mut sequences: BTreeMap<(u64, u64), BTreeSet<u64>> = BTreeMap::new();
     for event in &recovery.events {
         let key = (event.cgroup_id, event.run_epoch);
         let run = replay
             .get_mut(&key)
             .context("socket-state WAL event is outside the bound run set")?;
-        if event.event_seq != run.final_sequence + 1 {
-            bail!("socket-state WAL sequence is not contiguous from one");
+        // Producers allocate the sequence before reserving a ring-buffer slot.
+        // Concurrent CPUs may therefore publish in a different order. Preserve
+        // WAL/JSONL delivery order, but prove the same complete, unique sequence
+        // set used by the live recorder's sequence_complete() check.
+        if event.event_seq > run.published
+            || !sequences.entry(key).or_default().insert(event.event_seq)
+        {
+            bail!("socket-state WAL sequence is duplicate or outside bound accounting");
         }
-        run.final_sequence = event.event_seq;
+        run.final_sequence = run.final_sequence.max(event.event_seq);
         run.recovered = run.recovered.saturating_add(1);
         if event.kind == SOCKET_STATE_DESTROY {
             run.destroy_events_verified = run.destroy_events_verified.saturating_add(1);
@@ -1476,6 +1483,69 @@ mod tests {
         .unwrap();
         assert_eq!(verified.events_verified, 1);
         assert_eq!(verified.origin_links_verified, 1);
+    }
+
+    fn replay_sequences(
+        sequences: &[u64],
+        published: u64,
+    ) -> Result<SocketStateArtifactVerification> {
+        let directory = TestDirectory::create();
+        let socket_wal = directory.path().join(SOCKET_STATE_WAL_NAME);
+        let socket_jsonl = directory.path().join(SOCKET_STATE_JSONL_NAME);
+        let system_wal = directory.path().join("system-effects.raw.bin");
+        let mut writer = SocketStateWalWriter::create(&socket_wal)?;
+        let mut jsonl = Vec::new();
+        for sequence in sequences {
+            let event = state_event(*sequence);
+            writer.append(&event)?;
+            jsonl.extend(serde_json::to_vec(&event.to_schema(
+                "run",
+                BOOT_ID,
+                CgroupMatchMode::ExactCurrent,
+            )?)?);
+            jsonl.push(b'\n');
+        }
+        writer.sync()?;
+        std::fs::write(&socket_jsonl, jsonl)?;
+        let mut system_writer = crate::wal::WalWriter::create(&system_wal)?;
+        system_writer.append(&system_attempt())?;
+        system_writer.sync()?;
+        let mut health = complete_health();
+        health.event_attempted = published;
+        health.event_published = published;
+        health.events_persisted = published;
+        health.final_event_seq = published;
+        verify_socket_state_artifacts(
+            &socket_wal,
+            &socket_jsonl,
+            &system_wal,
+            &SocketStateVerificationBinding {
+                run_id: "run".to_owned(),
+                boot_id: BOOT_ID.to_owned(),
+                cgroup_match_mode: CgroupMatchMode::ExactCurrent,
+                runs: vec![SocketStateRunVerification {
+                    cgroup_id: 9,
+                    run_epoch: 7,
+                    published,
+                    dropped: 0,
+                }],
+            },
+            &[health],
+        )
+    }
+
+    #[test]
+    fn strict_replay_accepts_complete_concurrent_delivery_order() {
+        let verified = replay_sequences(&[2, 1, 4, 3], 4).unwrap();
+        assert_eq!(verified.events_verified, 4);
+        assert_eq!(verified.runs[0].final_sequence, 4);
+    }
+
+    #[test]
+    fn strict_replay_still_rejects_duplicate_missing_and_out_of_range_sequences() {
+        assert!(replay_sequences(&[1, 1, 3], 3).is_err());
+        assert!(replay_sequences(&[3, 1], 3).is_err());
+        assert!(replay_sequences(&[1, 3], 2).is_err());
     }
 
     #[test]

@@ -3,6 +3,30 @@
 version = 3
 
 [[package]]
+name = "allox-file-profiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libbpf-sys",
+ "libc",
+ "serde_json",
+ "sha2 0.10.6",
+]
+
+[[package]]
+name = "allox-load-sampler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libbpf-sys",
+ "libc",
+ "serde_json",
+ "sha2 0.10.6",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"

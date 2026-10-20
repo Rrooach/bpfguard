@@ -426,9 +426,23 @@ impl KernelEvent {
                 EffectOperation::from_raw(self.operation),
                 Some(EffectOperation::FileCreateOrTruncate | EffectOperation::FileOpenRequest)
             );
-        let is_file_write_result = self.kind == EVENT_OPERATION_RESULT
+        let is_file_io_result = self.kind == EVENT_OPERATION_RESULT
             && self.domain == EffectDomain::Io as u16
-            && EffectOperation::from_raw(self.operation) == Some(EffectOperation::FdWrite);
+            && matches!(
+                EffectOperation::from_raw(self.operation),
+                Some(EffectOperation::FdWrite | EffectOperation::FdRead)
+            );
+        if is_file_io_result
+            && self.operation == EffectOperation::FdRead as u32
+            && matches!(
+                self.syscall_nr as libc::c_long,
+                libc::SYS_read | libc::SYS_pread64
+            )
+            && self.return_value >= 0
+            && self.return_value as u64 > self.args[2]
+        {
+            bail!("scalar read result exceeds the requested byte count");
+        }
         let operation = EffectOperation::from_raw(self.operation).expect("validated operation");
         let is_extended_file_result = self.kind == EVENT_OPERATION_RESULT
             && matches!(
@@ -456,14 +470,16 @@ impl KernelEvent {
             );
         if self.flags & OBJECT_FLAGS != 0
             && !(is_file_open_result
-                || is_file_write_result
+                || is_file_io_result
                 || is_extended_file_result
                 || is_socket_result)
         {
             bail!("kernel object flags are present on an unsupported operation result");
         }
-        if is_file_write_result && self.flags & FLAG_OBJECT_PATH_UNAVAILABLE != 0 {
-            bail!("file_permission write result unexpectedly reports path resolution activity");
+        if is_file_io_result && self.flags & FLAG_OBJECT_PATH_UNAVAILABLE != 0 {
+            bail!(
+                "file_permission read/write result unexpectedly reports path resolution activity"
+            );
         }
         if is_file_open_result
             && self.return_value >= 0
@@ -484,7 +500,7 @@ impl KernelEvent {
         }
         if let Some(object) = &self.file_object {
             if !((is_file_open_result && self.return_value >= 0)
-                || (is_file_write_result && self.return_value > 0)
+                || (is_file_io_result && self.return_value > 0)
                 || (is_extended_file_result && self.return_value >= 0))
                 || self.flags
                     & (FLAG_PENDING_MISSING
@@ -496,11 +512,13 @@ impl KernelEvent {
                         | FLAG_OBJECT_DELETE_FAILED)
                     != 0
             {
-                bail!("kernel file-object evidence is not an eligible successful open or positive-byte write result");
+                bail!("kernel file-object evidence is not an eligible successful open or positive-byte read/write result");
             }
             object.validate(operation)?;
-            if is_file_write_result && object.path_quality != FILE_PATH_NOT_REQUESTED {
-                bail!("file_permission write object unexpectedly claims a kernel path snapshot");
+            if is_file_io_result && object.path_quality != FILE_PATH_NOT_REQUESTED {
+                bail!(
+                    "file_permission read/write object unexpectedly claims a kernel path snapshot"
+                );
             }
             if is_file_open_result
                 && !matches!(
@@ -1471,6 +1489,7 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
                     EffectOperation::FileCreateOrTruncate
                         | EffectOperation::FileOpenRequest
                         | EffectOperation::FdWrite
+                        | EffectOperation::FdRead
                         | EffectOperation::DirectoryCreate
                         | EffectOperation::SymlinkCreate
                         | EffectOperation::DeviceNodeCreate
@@ -1488,8 +1507,10 @@ fn validate_object_reference(object: &ObjectReference, event: &SystemEffectEvent
             }
             validate_file_path_observation(path)?;
             match event.operation {
-                EffectOperation::FdWrite if *path != FilePathObservation::default() => {
-                    bail!("file_permission write object unexpectedly claims a kernel path snapshot")
+                EffectOperation::FdWrite | EffectOperation::FdRead
+                    if *path != FilePathObservation::default() =>
+                {
+                    bail!("file_permission read/write object unexpectedly claims a kernel path snapshot")
                 }
                 EffectOperation::FileCreateOrTruncate | EffectOperation::FileOpenRequest
                     if !matches!(
@@ -1587,7 +1608,7 @@ fn filesystem_class_matches(class: FilesystemClass, magic: u64) -> bool {
 fn filesystem_class(magic: u64) -> FilesystemClass {
     const PROC_SUPER_MAGIC: u64 = 0x9fa0;
     const SYSFS_MAGIC: u64 = 0x6265_6572;
-    const CGROUP_SUPER_MAGIC: u64 = 0x27e0_eb;
+    const CGROUP_SUPER_MAGIC: u64 = 0x0027_e0eb;
     const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
     match magic {
         PROC_SUPER_MAGIC => FilesystemClass::Procfs,

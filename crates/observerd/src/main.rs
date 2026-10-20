@@ -304,6 +304,21 @@ enum Commands {
         drain_timeout_ms: u64,
     },
 
+    /// Summarize recorded file opens, bytes and per-call latency from a WAL.
+    FileAccessReport {
+        /// Existing system-effects.raw.bin (standalone or deployment run).
+        #[clap(long, parse(from_os_str))]
+        wal: PathBuf,
+
+        /// Exact profile used during collection.
+        #[clap(long, default_value = "file-access")]
+        profile: PolicyProfile,
+
+        /// Omit per-call rows, retaining totals and per-file accounting.
+        #[clap(long)]
+        summary_only: bool,
+    },
+
     /// Verify a finalized system-effect run and its complete artifact set.
     VerifyEffects {
         #[clap(long, parse(from_os_str))]
@@ -572,6 +587,18 @@ fn main() -> Result<()> {
             recorder_object,
             drain_timeout_ms,
         }),
+        Commands::FileAccessReport {
+            wal,
+            profile,
+            summary_only,
+        } => {
+            let recovery = bpf_observer_system_effects::recover_wal(&wal)?;
+            print_json(&bpf_observer_system_effects::access::report(
+                &recovery,
+                profile,
+                !summary_only,
+            )?)
+        }
         Commands::VerifyEffects {
             run_dir,
             expected_recorder_sha256,

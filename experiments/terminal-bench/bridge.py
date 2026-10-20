@@ -1429,6 +1429,11 @@ async def run_trials(arguments: argparse.Namespace) -> int:
     )
     evidence_root = require_empty_directory_target(arguments.evidence_root, "evidence root")
     trials_dir = require_empty_directory_target(arguments.trials_dir, "Harbor trials directory")
+    # Harbor 0.23 uses `docker run` for Dockerfile-only tasks. The bridge's
+    # identity contract requires Compose labels; select Harbor's public Compose
+    # path without modifying any pinned task input or adding another service.
+    compose_overlay = evidence_root / "observer-compose.yaml"
+    write_new_bytes(compose_overlay, b"services:\n  main: {}\n")
     options = BridgeOptions(
         observer_binary=observer_binary,
         verifier_binary=verifier_binary,
@@ -1469,7 +1474,11 @@ async def run_trials(arguments: argparse.Namespace) -> int:
                 trial_name=trial_name,
                 trials_dir=trials_dir,
                 agent=AgentConfig(name="oracle"),
-                environment=EnvironmentConfig(type=EnvironmentType.DOCKER, delete=True),
+                environment=EnvironmentConfig(
+                    type=EnvironmentType.DOCKER,
+                    delete=True,
+                    extra_docker_compose=[compose_overlay],
+                ),
             )
             trial = await Trial.create(config)
             if getattr(trial.task, "has_steps", False):

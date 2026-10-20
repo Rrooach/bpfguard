@@ -1,0 +1,142 @@
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -11,6 +11,7 @@
+ // Change JSON_ASSERT from assert() to GGML_ASSERT:
+ #define JSON_ASSERT GGML_ASSERT
+ #include "json.hpp"
++#include "native_events.hpp"
+ // mime type for sending response
+ #define MIMETYPE_JSON "application/json; charset=utf-8"
+ 
+@@ -176,6 +177,7 @@
+ };
+ 
+ struct server_task {
++    json observer_context = json::object();
+     int id    = -1; // to be filled by server_queue
+     int index = -1; // used when there are multiple prompts (batch request)
+ 
+@@ -1123,6 +1125,7 @@
+ };
+ 
+ struct server_slot {
++    json observer_context = json::object();
+     int id;
+     int id_task = -1;
+ 
+@@ -1422,6 +1425,7 @@
+     int post(server_task task, bool front = false) {
+         std::unique_lock<std::mutex> lock(mutex_tasks);
+         GGML_ASSERT(task.id != -1);
++        if (!task.observer_context.empty()) observer_native("ENGINE_QUEUED", task.observer_context, {{"native_task_id", task.id}});
+         QUE_DBG("new task, id = %d, front = %d\n", task.id, front);
+         if (front) {
+             queue_tasks.push_front(std::move(task));
+@@ -1439,6 +1443,7 @@
+             if (task.id == -1) {
+                 task.id = id++;
+             }
++            if (!task.observer_context.empty()) observer_native("ENGINE_QUEUED", task.observer_context, {{"native_task_id", task.id}});
+             QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
+             if (front) {
+                 queue_tasks.push_front(std::move(task));
+@@ -1904,6 +1909,8 @@
+ 
+     bool launch_slot_with_task(server_slot & slot, const server_task & task) {
+         slot.reset();
++        slot.observer_context = task.observer_context;
++        if (!task.observer_context.empty()) observer_native("ENGINE_SCHEDULED", task.observer_context, {{"native_task_id", task.id}, {"slot_id", slot.id}});
+         slot.id_task       = task.id;
+         slot.index         = task.index;
+         slot.task_type     = task.type;
+@@ -2175,6 +2182,7 @@
+     }
+ 
+     void send_partial_response(server_slot & slot, const completion_token_output & tkn) {
++        if (slot.n_decoded == 1 && !slot.observer_context.empty()) observer_native("ENGINE_FIRST_TOKEN", slot.observer_context, {{"native_task_id", slot.id_task}, {"slot_id", slot.id}, {"token_id", tkn.tok}});
+         auto res = std::make_unique<server_task_result_cmpl_partial>();
+ 
+         res->id      = slot.id_task;
+@@ -2205,6 +2213,7 @@
+     }
+ 
+     void send_final_response(server_slot & slot) {
++        if (!slot.observer_context.empty() && observer_native_enabled()) observer_native("ENGINE_COMPLETE", slot.observer_context, {{"native_task_id", slot.id_task}, {"slot_id", slot.id}, {"input_tokens", slot.n_prompt_tokens}, {"output_tokens", slot.n_decoded}, {"timings", slot.get_timings().to_json()}, {"logical_kv", observer_logical_kv(ctx, model)}});
+         auto res = std::make_unique<server_task_result_cmpl_final>();
+         res->id              = slot.id_task;
+         res->id_slot         = slot.id;
+@@ -2999,7 +3008,28 @@
+                 batch.logits   + i,
+             };
+ 
++            static uint64_t observer_batch_seq = 0;
++            const std::string observer_batch_id = "native-batch-" + std::to_string(++observer_batch_seq);
++            json observer_members = json::array();
++            std::unordered_set<int> observer_seq_ids;
++            for (int j = 0; j < batch_view.n_tokens; ++j) {
++                for (int k = 0; k < batch_view.n_seq_id[j]; ++k) observer_seq_ids.insert(batch_view.seq_id[j][k]);
++            }
++            for (const auto & observer_slot : slots) {
++                if (observer_seq_ids.count(observer_slot.id) && !observer_slot.observer_context.empty()) {
++                    observer_members.push_back({{"context", observer_slot.observer_context}, {"native_task_id", observer_slot.id_task}, {"slot_id", observer_slot.id}});
++                }
++            }
++            const json observer_batch_details = {{"batch_id", observer_batch_id}, {"members", observer_members}, {"tokens", n_tokens}};
++            const bool observer_selected_batch = !observer_members.empty() && observer_select_batch(observer_batch_details);
++            if (observer_selected_batch) {
++                observer_set_batch(observer_batch_details);
++                observer_native("ENGINE_BATCH_BEGIN", json::object(), observer_batch_details);
++            }
+             const int ret = llama_decode(ctx, batch_view);
++            if (observer_native_enabled()) llama_synchronize(ctx);
++            if (observer_selected_batch) observer_finish_batch_workers();
++            if (observer_selected_batch) observer_native("ENGINE_BATCH_END", json::object(), {{"batch_id", observer_batch_id}, {"members", observer_members}, {"tokens", n_tokens}, {"return_code", ret}});
+             metrics.on_decoded(slots);
+ 
+             if (ret != 0) {
+@@ -3702,6 +3732,8 @@
+ 
+                 task.id    = ctx_server.queue_tasks.get_new_id();
+                 task.index = i;
++                task.observer_context = json_value(data, "observer_context", json::object());
++                if (!task.observer_context.empty()) observer_native("ENGINE_ACCEPTED", task.observer_context, {{"native_task_id", task.id}});
+ 
+                 task.prompt_tokens    = std::move(tokenized_prompts[i]);
+                 task.params           = server_task::params_from_json_cmpl(
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -13,6 +13,12 @@
+ #include "amx/amx.h"
+ #include "ggml.h"
+ 
++// Optional executable-provided diagnostic hooks; absent in normal tools.
++#if defined(__GNUC__) && defined(__linux__)
++extern void observer_ggml_worker_begin(int worker_index) __attribute__((weak));
++extern void observer_ggml_worker_end(int worker_index) __attribute__((weak));
++#endif
++
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+ #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
+@@ -13841,6 +13847,10 @@
+     const struct ggml_cgraph * cgraph = tp->cgraph;
+     const struct ggml_cplan  * cplan  = tp->cplan;
+ 
++#if defined(__GNUC__) && defined(__linux__)
++    if (observer_ggml_worker_begin) observer_ggml_worker_begin(state->ith);
++#endif
++
+     set_numa_thread_affinity(state->ith);
+ 
+     struct ggml_compute_params params = {
+@@ -13865,6 +13875,10 @@
+         ggml_barrier(state->threadpool);
+     }
+ 
++#if defined(__GNUC__) && defined(__linux__)
++    if (observer_ggml_worker_end) observer_ggml_worker_end(state->ith);
++#endif
++
+     return 0;
+ }
+ 

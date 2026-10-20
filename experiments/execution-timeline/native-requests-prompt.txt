@@ -1,0 +1,18 @@
+Fix the Requests Content-Length issue in this historical repository.
+
+GET and HEAD requests with no body currently acquire an automatic
+Content-Length: 0 header. They should not acquire it. Keep explicit caller
+Content-Length headers, correct lengths for nonempty bodies, and existing
+zero-length behavior for POST/PUT. The relevant code is PreparedRequest in
+requests/models.py. Inspect the narrow source region, reproduce the issue,
+make a focused change, add offline regression tests, and run them.
+
+Use your normal native Codex tools, including Code Mode when appropriate.
+Use ./run-python for Python commands; its compatibility directory supplies
+removed Python APIs for this old codebase. Do not change this launcher or its
+compatibility files. Do not use network services, reference patches or hidden
+tests. Keep tool output small: at most 80 source lines per read and 1500 output
+tokens per command. Avoid printing whole files or binary/__pycache__ contents.
+Finish in about three to five focused tool invocations, then summarize the
+actual change and exact tests, including any failures. This is a real task,
+not a request to pretend success.

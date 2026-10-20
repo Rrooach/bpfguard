@@ -84,6 +84,15 @@ is:
 }
 ```
 
+For file access accounting, set `profile` to `"file-access"` and rebuild the
+observer and system-effect BPF object together. Expanded mode additionally
+resolves selected positive-byte reads. After deployment verification,
+`bpf-state-observer file-access-report --wal <run>/system-effects.raw.bin`
+provides object counts, returned bytes and per-call syscall elapsed time.
+See [usage and accounting boundaries](../../README.md#file-access-counts-bytes-and-latency).
+This is a bounded diagnostic projection, not the separate high-volume
+large-repository file-access collector.
+
 All three state scopes are optional; use `null` or omit one to disable that
 domain. `bpf_state_scope` is the existing state-oracle `ClaimScope`, and
 `filesystem_state_scope` is the existing filesystem-confirmer scope. The

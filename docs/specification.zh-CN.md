@@ -92,9 +92,28 @@ profile 是累计的事件选择策略，不是覆盖完整度声明：
 |---|---|---|
 | `control` | 控制面、元数据和高风险接口 | 默认，事件量最低；不含普通 write/send 数据路径 |
 | `balanced` | 在 `control` 上加入 write/pwrite/writev、send 等 | 适合一般 Agent 效果收集 |
-| `full` | 再加入 fsync、写方向 mmap/mprotect、setsockopt、ioctl、prctl | 事件量最高，随 workload 变化 |
+| `full` | 再加入 fsync、写方向 mmap/mprotect、setsockopt、ioctl、prctl | 事件量较高，随 workload 变化 |
+| `file-access` | 在 `full` 上加入普通只读 open、read/pread/readv 等 | 按需启用，生成文件访问次数、返回字节数及逐调用耗时报告；仍有事件预算上限 |
 
 `full` 不表示完整覆盖所有内核修改。compat/x32、完整 ioctl/netlink payload、`io_uring` 对象语义、`SCM_RIGHTS`、委托 daemon 和延迟 kernel worker 等仍在合同之外。
+
+想知道“哪个对象读了多少字节、每次读取用了多久”，可在启动时显式使用
+`--profile file-access --object-resolution kernel-file-open-write-partial`。
+运行结束并通过原有 `verify-effects` 后，再执行：
+
+```bash
+.output/cargo-target/release/bpf-state-observer file-access-report \
+  --wal /你的运行目录/system-effects.raw.bin > /tmp/file-access-report.json
+```
+
+`calls` 是逐次记录，`files` 是按内核对象去重后的汇总。字节数来自 syscall 返回值，
+不是磁盘实际读取量；读取耗时包含等待，不可跨线程累加当墙钟时间。
+`unique_files` 还可能包含目录、设备及 proc/sysfs 对象，不等于访问过的普通源码文件数。
+缺失、EOF、失败和未解析对象会分别保留；不能用最后一次看到的 FD 或路径猜对象。
+默认档位不变，旧日志中没采过的读取不能事后补出来。
+
+此入口与大仓库实验的独立逐次文件/缺页采集器不同：穷举大仓库并发访问请使用
+[2/4/6/8 实验入口](../experiments/search-profile/FILE_ACCESS_2468.md)，避免超出普通 WAL 的预算。
 
 ### 4.3 对象级语义
 

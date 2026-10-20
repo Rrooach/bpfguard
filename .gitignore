@@ -2,3 +2,11 @@
 /build/
 /target/
 /bpf/*.o
+__pycache__/
+*.pyc
+/experiments/search-profile/__pycache__/
+/experiments/agent-benchmarks/**/__pycache__/
+/experiments/agent-benchmarks/__pycache__/
+/experiments/file-profile/__pycache__/
+/experiments/profile-validation/__pycache__/
+/experiments/execution-profile/__pycache__/

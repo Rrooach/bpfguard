@@ -11,6 +11,8 @@ members = [
     "crates/comparator",
     "crates/observerd",
     "crates/harness-auth",
+    "crates/load-sampler",
+    "crates/file-profiler",
 ]
 resolver = "2"
 

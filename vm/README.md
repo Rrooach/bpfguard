@@ -1,5 +1,39 @@
 # Target VM requirements
 
+## PSI-enabled search profiling kernel
+
+The search sampler already reads CPU, memory and I/O pressure from Linux PSI.
+Those files require a kernel built with `CONFIG_PSI=y`. The historical
+`vm-kernel-allox-plugin-btf` configuration compiled PSI out, so its missing
+pressure values cannot be recovered by changing sampler settings.
+
+Build a separate experiment kernel from that existing measured configuration:
+
+```sh
+bash vm/build-profile-kernel.sh --jobs 16
+
+bash vm/run-search-profile-e2e.sh \
+  --rootfs /absolute/path/to/unused-test.raw \
+  --ssh-key /absolute/path/to/test.id_rsa \
+  --queries-file experiments/search-profile/queries.example.json \
+  --kernel-build-dir .output/vm-kernel-profile-psi \
+  --require-psi --concurrency 1,2,4,8 --passes 50
+```
+
+The builder only accepts a new or empty project output directory. It preserves
+the original configuration, applies [`profile-x86.config`](profile-x86.config),
+enables PSI by default, and verifies that BTF, cgroup resource controllers and
+SCHEDSTATS remain enabled. It records configuration, kernel and tool hashes.
+Select another fresh output with `--output-dir` for rebuilding.
+
+The test starts a new disposable VM, enables `psi=1` at boot, and verifies all
+three system and cgroup PSI sources before launching work. CPU/sleep calibration
+can be selected with `--calibration-kind cpu` or `sleep`. Optional scheduler
+histograms can use `--modes sampler,kernel-hist --kernel-hist-groups sched`.
+Baseline and sampled timing trials use the same PSI-enabled kernel; this
+comparison does not measure the cost of enabling PSI in the kernel itself.
+Guest PSI describes delays inside that Guest, not the physical server's delays.
+
 The default recorder mode uses fixed raw-syscall tracepoint layouts and does
 not consume BTF. The explicit `kernel-file-open-partial`,
 `kernel-file-open-write-partial`, and `kernel-object-expanded-partial` modes
